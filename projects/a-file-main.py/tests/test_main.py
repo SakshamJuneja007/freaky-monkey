@@ -1,0 +1,1 @@
+import main\n\ndef test_main_output(capsys):\n    main.main()\n    captured = capsys.readouterr()\n    assert "Hello, world!" in captured.out

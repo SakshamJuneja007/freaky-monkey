@@ -1,0 +1,42 @@
+# AI Computer Control Plane -- V1 runtime dependencies.
+# Exact pins: the benchmark is the deliverable, so the environment must be
+# reproducible across trials and machines (plan S27).
+#
+# Install:  python -m venv .venv && .venv/Scripts/python -m pip install -r requirements.txt
+
+# --- observation layer ---
+psutil==7.2.2              # process state (plan S24)
+pillow==12.3.0             # screenshots for the vision-only baseline
+
+# --- planner transport ---
+httpx==0.28.1              # OpenAI-compatible /chat/completions client
+python-dotenv==1.2.3       # loads .env; keys never live in source
+
+# --- test harness ---
+pytest==9.1.1
+
+# --- voice input (thin interface layer; the agent runs identically without it) ---
+# NVIDIA's OpenAI-compatible host exposes no /audio/transcriptions route, and
+# every ACTIVE speech function this key can invoke is apiBodyFormat=CUSTOM over
+# gRPC, so STT needs a Riva client rather than httpx. Verified against
+# ai-whisper-large-v3 on grpc.nvcf.nvidia.com:443.
+nvidia-riva-client==2.27.0   # Riva ASR gRPC stubs
+sounddevice==0.5.6           # PortAudio capture; bundles its own DLL on Windows
+
+# --- transitive, pinned for reproducibility ---
+anyio==4.14.2
+certifi==2026.7.22
+cffi==2.1.1                # sounddevice's PortAudio binding
+grpcio==1.83.1             # nvidia-riva-client
+grpcio-tools==1.81.1       # nvidia-riva-client
+h11==0.16.0
+httpcore==1.0.9
+idna==3.19
+iniconfig==2.3.0
+packaging==26.3
+pluggy==1.6.0
+protobuf==6.33.5           # nvidia-riva-client
+pycparser==3.0             # cffi
+
+# --- V2 (browser), installed when browser tasks land (plan S12) ---
+# playwright==1.5x.x       # plus: python -m playwright install chromium
