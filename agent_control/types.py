@@ -31,7 +31,50 @@ class FailureClass(str, Enum):
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     PERMISSION_DENIED = "PERMISSION_DENIED"
     ENVIRONMENT = "ENVIRONMENT"
+    #: The action ran and reported success but verification could not tell.
+    #: Unlike UNKNOWN there is a concrete thing to re-read, so it is recoverable.
+    INCONCLUSIVE = "INCONCLUSIVE"
+    #: The machine offers more than one valid continuation and nothing the agent
+    #: can observe decides between them, so a person has to. Distinct from
+    #: INCONCLUSIVE (evidence missing, re-reading may help) and from the failure
+    #: classes (something went wrong): here nothing is wrong and re-reading
+    #: cannot help, because what is missing is a preference.
+    AMBIGUOUS = "AMBIGUOUS"
     UNKNOWN = "UNKNOWN"
+
+
+class AgentState(str, Enum):
+    """Where the control loop is, as one word (plan S9/S30).
+
+    The runner sets this at the junctions it already passes through; it is not a
+    second control flow. Every value is entered immediately before the work it
+    names, so a display driven by these transitions can lag reality but never
+    invent it.
+    """
+
+    IDLE = "IDLE"
+    UNDERSTANDING = "UNDERSTANDING"
+    OBSERVING = "OBSERVING"
+    PLANNING = "PLANNING"
+    ACTING = "ACTING"
+    VERIFYING = "VERIFYING"
+    RECOVERING = "RECOVERING"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class DecisionKind(str, Enum):
+    """What the loop chose to do next."""
+
+    ACT = "ACT"
+    OBSERVE = "OBSERVE"
+    VERIFY = "VERIFY"
+    REPLAN = "REPLAN"
+    RECOVER = "RECOVER"
+    ASK_USER = "ASK_USER"
+    STOP = "STOP"
 
 
 class Source(str, Enum):
@@ -184,6 +227,57 @@ class VerificationResult:
         }
 
 
+@dataclass(frozen=True)
+class AgentDecision:
+    """Why the loop is about to do what it does next.
+
+    Structured so it can be traced and queried rather than read as prose. The
+    ``reason`` is authored by the control plane, never copied from the planner, and
+    the terminal renders fixed sentences from ``kind`` -- displaying this text
+    verbatim would be dumping reasoning at the user, which plan S30 forbids.
+    """
+
+    kind: DecisionKind
+    reason: str
+    detail: dict[str, Any] = field(default_factory=dict)
+
+    def to_json(self) -> dict:
+        return {
+            "kind": self.kind.value,
+            "reason": self.reason,
+            "detail": _jsonable(self.detail),
+        }
+
+
+@dataclass(frozen=True)
+class Clarification:
+    """A decision the run cannot make for itself, addressed to the user.
+
+    ``options`` may only contain continuations the agent actually observed and can
+    actually take. When the ambiguity is visible but its alternatives are not --
+    a Windows app chooser, whose contents no current backend can read -- options
+    stays empty and ``unobservable`` names the limit instead. Inventing plausible
+    options here would be the system claiming to see something it cannot.
+    """
+
+    question: str
+    options: tuple[str, ...] = ()
+    context: str = ""
+    #: Which reading raised this, when one did.
+    source: Source | None = None
+    #: What could not be read, when ``options`` is empty for that reason.
+    unobservable: str = ""
+
+    def to_json(self) -> dict:
+        return {
+            "question": self.question,
+            "options": list(self.options),
+            "context": self.context,
+            "source": self.source.value if self.source else None,
+            "unobservable": self.unobservable,
+        }
+
+
 class ControlPlaneError(Exception):
     """Base for errors the runtime raises deliberately."""
 
@@ -200,6 +294,25 @@ class PolicyDenied(ControlPlaneError):
     """Raised when the policy layer refuses an action. Enforced outside the LLM."""
 
     failure_class = FailureClass.PERMISSION_DENIED
+
+
+class NeedUserInput(ControlPlaneError):
+    """Raised when only a person can choose what happens next.
+
+    Not a failure and not a retry. Raising it unwinds the remaining actions of the
+    current batch -- which is how a run stops without executing steps that were
+    planned on an assumption that no longer holds -- and the runner turns it into a
+    suspended run carrying the question. ``verify_final`` is deliberately not
+    reached on that path, for the same reason a cancelled run skips it: several
+    checks are preconditions rather than outcomes, so a run stopped early could
+    otherwise report PASS for work it never did.
+    """
+
+    failure_class = FailureClass.AMBIGUOUS
+
+    def __init__(self, clarification: Clarification) -> None:
+        super().__init__(clarification.question)
+        self.clarification = clarification
 
 
 def _jsonable(value: Any) -> Any:

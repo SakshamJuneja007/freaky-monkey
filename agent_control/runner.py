@@ -30,9 +30,14 @@ from .trace import Trace
 from .types import (
     Action,
     ActionResult,
+    AgentDecision,
+    AgentState,
     Check,
+    Clarification,
+    DecisionKind,
     DEFAULT_MAX_STALENESS_S,
     FailureClass,
+    NeedUserInput,
     VerificationResult,
     Verdict,
 )
@@ -46,6 +51,10 @@ class RunConfig:
     fresh_precondition: bool = True
     recovery_enabled: bool = True
     budget: RecoveryBudget = field(default_factory=RecoveryBudget)
+    #: Someone is present to answer a question. Default False, so an unattended
+    #: run -- every benchmark trial -- still ends rather than blocking on a person
+    #: who is not there, and no measured number moves because this flag exists.
+    interactive: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -54,6 +63,7 @@ class RunConfig:
             "max_staleness_s": self.max_staleness_s,
             "fresh_precondition": self.fresh_precondition,
             "recovery_enabled": self.recovery_enabled,
+            "interactive": self.interactive,
             "budget": self.budget.to_json()["limits"],
         }
 
@@ -85,6 +95,15 @@ class RunOutcome:
     #: agent, and counting it as either would corrupt both the metrics table and
     #: the report a person reads (plan E phase 2).
     cancelled: bool = False
+    #: Where the loop stopped. ``IDLE`` only for an outcome built without a run.
+    state: AgentState = AgentState.IDLE
+    #: The run stopped to ask a person something and can be resumed from here.
+    #: Like ``cancelled`` this is the absence of a result rather than a bad one:
+    #: nothing was verified, nothing is claimed, and no budget was spent.
+    awaiting: bool = False
+    #: What is being asked, when ``awaiting``. Carries only continuations that
+    #: were actually observed (see :class:`~agent_control.types.Clarification`).
+    question: Clarification | None = None
 
     @property
     def verified_success(self) -> bool:
@@ -94,12 +113,14 @@ class RunOutcome:
     def false_success(self) -> bool:
         """Agent said done; independent verification disagreed.
 
-        A cancelled run is excluded. Ctrl+C can land after the planner claimed
-        completion but before ``verify_final`` returns, and counting that as a
-        false claim would blame the planner for a check *we* stopped -- inventing
-        the one metric this project exists to measure.
+        Cancelled and suspended runs are excluded. Ctrl+C can land after the
+        planner claimed completion but before ``verify_final`` returns, and a run
+        suspended on a question never reaches it at all; counting either as a false
+        claim would blame the planner for a check *we* stopped -- inventing the one
+        metric this project exists to measure.
         """
-        return self.reported_success and not self.verified_success and not self.cancelled
+        return (self.reported_success and not self.verified_success
+                and not self.cancelled and not self.awaiting)
 
     @property
     def silent_failure(self) -> bool:
@@ -118,6 +139,9 @@ class RunOutcome:
             "false_success": self.false_success,
             "silent_failure": self.silent_failure,
             "cancelled": self.cancelled,
+            "state": self.state.value,
+            "awaiting": self.awaiting,
+            "question": self.question.to_json() if self.question else None,
             "steps_used": self.steps_used,
             "wall_clock_s": round(self.wall_clock_s, 4),
             "aborted_reason": self.aborted_reason,
@@ -160,6 +184,14 @@ class _Loop:
     #: world taken by this run, it takes no part in the state fingerprint, and it
     #: must never satisfy a freshness precondition.
     extra_state: dict = field(default_factory=dict)
+    #: Where the loop is, as one word. Set at the junctions the loop already
+    #: passes through -- this is a label on the existing control flow, not a
+    #: second one, and nothing branches on it.
+    state: AgentState = AgentState.IDLE
+    #: A question the run cannot answer for itself. Once set, the run stops after
+    #: the current action rather than executing steps that were planned on an
+    #: assumption the user is about to settle.
+    question: Clarification | None = None
 
     def refresh(self) -> float:
         """Re-read state, re-baseline the fingerprint, return the stalest age."""
@@ -167,10 +199,66 @@ class _Loop:
         self.fingerprint = state_fingerprint(self.observations)
         return oldest_age_s(self.observations)
 
+    def enter(self, state: AgentState, **fields: Any) -> AgentState:
+        """Record that the loop has reached *state*. Returns it, for call sites.
+
+        Called immediately *before* the work the state names, never after and never
+        speculatively, so a display driven by these events can lag the machine but
+        cannot describe something that did not happen. Re-entering the same state
+        emits nothing: the repeat is already visible in the action and observation
+        events, and a status line that reprints itself reads as noise.
+        """
+        if state is self.state:
+            return state
+        previous, self.state = self.state, state
+        self.trace.emit("agent_state", state=state.value,
+                        previous=previous.value, **fields)
+        return state
+
+    def decide(self, kind: DecisionKind, reason: str, **detail: Any) -> AgentDecision:
+        """Record why the loop is about to do what it does next.
+
+        ``reason`` is authored here, in the control plane, and never copied from a
+        planner: the trace is a record of what the loop decided, and quoting the
+        model's own prose into it would turn an audit log into hidden reasoning
+        wearing a structured hat.
+        """
+        decision = AgentDecision(kind=kind, reason=reason, detail=dict(detail))
+        self.trace.emit("decision", **decision.to_json())
+        return decision
+
 
 #: Belt-and-braces ceiling. Budget exhaustion already terminates the retry loop;
 #: this guarantees termination even if a future strategy table forgets to.
 _MAX_ATTEMPTS_PER_ACTION = 4
+
+#: Recovery decision -> the decision kind recorded in the trace. Two vocabularies
+#: exist because they answer different questions: ``RecoveryDecision`` is what the
+#: budget was asked for, ``DecisionKind`` is what the loop does next, and
+#: ``REOBSERVE_THEN_RETRY`` is an OBSERVE from the outside.
+_DECISION_KIND = {
+    RecoveryDecision.RETRY: DecisionKind.RECOVER,
+    RecoveryDecision.REOBSERVE_THEN_RETRY: DecisionKind.OBSERVE,
+    RecoveryDecision.REPLAN: DecisionKind.REPLAN,
+    RecoveryDecision.ASK_USER: DecisionKind.ASK_USER,
+    RecoveryDecision.ABORT: DecisionKind.STOP,
+}
+
+
+def _clarification_in(result: ActionResult | None) -> Clarification | None:
+    """A question an executor reported as data rather than by raising.
+
+    Two routes into a suspended run exist because two kinds of code find
+    ambiguity. A task's observer has nowhere to put a return value, so it raises
+    :class:`~agent_control.types.NeedUserInput`; an executor is already returning
+    an ``ActionResult`` and can carry the question inside it. Only a real
+    ``Clarification`` is accepted -- a dict shaped like one is not, because the
+    whole point of the type is that its options came from something observed.
+    """
+    if result is None:
+        return None
+    found = result.detail.get("clarification")
+    return found if isinstance(found, Clarification) else None
 
 
 def _dispatch(loop: _Loop, failure_class: FailureClass, attempt: int) -> bool:
@@ -181,21 +269,46 @@ def _dispatch(loop: _Loop, failure_class: FailureClass, attempt: int) -> bool:
     than out of a counter someone remembered to increment.
     """
     decision, reason = loop.recovery.decide(failure_class)
+
+    if decision is RecoveryDecision.ASK_USER and loop.question is not None:
+        # Reachable only with an interactive approver *and* an observed question.
+        # Logged as a clarification rather than through ``trace.recovery``, which
+        # feeds the failure-category column and the recovery success rate: a
+        # question nobody has answered yet is neither a failure nor an attempt at
+        # anything. Nothing is spent here either -- ``RecoveryBudget.spend`` has no
+        # branch for ASK_USER -- so hesitating cannot exhaust a ceiling.
+        loop.trace.emit("clarification_needed", failure_class=failure_class.value,
+                        attempt=attempt, question=loop.question.to_json())
+        loop.decide(DecisionKind.ASK_USER, "only a person can choose the continuation",
+                    failure_class=failure_class.value)
+        loop.enter(AgentState.WAITING_FOR_USER)
+        return False
+
+    loop.enter(AgentState.RECOVERING, failure_class=failure_class.value)
     loop.trace.recovery(
         failure_class=failure_class, decision=decision.value,
         attempt=attempt, budget_left=loop.recovery.budget.remaining(),
     )
+    loop.decide(_DECISION_KIND[decision], reason,
+                failure_class=failure_class.value, attempt=attempt)
 
     if decision is RecoveryDecision.REOBSERVE_THEN_RETRY:
+        loop.enter(AgentState.OBSERVING)
         loop.refresh()
         return True
     if decision is RecoveryDecision.RETRY:
         return True
     if decision is RecoveryDecision.REPLAN:
+        loop.enter(AgentState.OBSERVING)
         loop.refresh()
         loop.replan = True
         return False
-    # ASK_USER collapses to ABORT in non-interactive runs (see recovery.Recovery).
+    # Either an outright ABORT, or an ASK_USER with nothing to ask: a policy
+    # refusal arrives here, and a refusal is not a choice. Turning one into a
+    # question would invite a person to approve what Policy already denied, which
+    # would move the authority for access out of the policy layer (plan S11).
+    # Any question parked earlier is dropped, because this reason supersedes it.
+    loop.question = None
     loop.abort_reason = f"{failure_class.value}: {reason}"
     return False
 
@@ -216,6 +329,7 @@ def _precondition_failure(loop: _Loop, action: Action) -> FailureClass | None:
         return None
 
     before = loop.fingerprint
+    loop.enter(AgentState.OBSERVING, purpose="precondition")
     age = loop.refresh()
     if age > loop.config.max_staleness_s:
         loop.trace.note("stale_reading_refused", age_s=round(age, 4),
@@ -266,9 +380,11 @@ def _run_action(loop: _Loop, action: Action) -> tuple[ActionResult | None,
             return None, checkpoint
 
         age = oldest_age_s(loop.observations)
+        loop.enter(AgentState.ACTING, action=action.kind, params=action.params)
         result = _permit_and_execute(loop, action)
         loop.trace.action(result, precondition_age_s=age)
 
+        loop.enter(AgentState.VERIFYING, action=action.kind, params=action.params)
         checkpoint = loop.task.verify_checkpoint(loop.policy, action, loop.trace)
         if checkpoint is not None:
             loop.trace.verification(checkpoint, checkpoint=True)
@@ -282,9 +398,13 @@ def _run_action(loop: _Loop, action: Action) -> tuple[ActionResult | None,
                     failure_class=recovering, attempt=attempt,
                     budget_left=loop.recovery.budget.remaining(),
                 )
+            loop.enter(AgentState.OBSERVING, purpose="baseline")
             loop.refresh()  # our own change becomes the new baseline
             return result, checkpoint
 
+        # An executor that found a genuine choice rather than a fault says so here,
+        # and ``_dispatch`` is what decides whether there is anyone to ask.
+        loop.question = _clarification_in(result)
         recovering = classify(
             result, checkpoint,
             precondition_age_s=age, max_staleness_s=loop.config.max_staleness_s,
@@ -335,7 +455,8 @@ def _plan(loop: _Loop, planner: Planner, history: list[dict]) -> PlannerStep:
 
 
 def _history_entry(action: Action, result: ActionResult | None,
-                   checkpoint: VerificationResult | None) -> dict:
+                   checkpoint: VerificationResult | None,
+                   *, skipped_verified: bool = False) -> dict:
     """What the planner is told about its own last action.
 
     Evidence, not encouragement: the checkpoint verdict comes from the verifier
@@ -343,10 +464,12 @@ def _history_entry(action: Action, result: ActionResult | None,
     """
     return {
         "action": {"kind": action.kind, "params": action.params},
-        "ok": bool(result and result.ok),
-        "error": (result.error if result else "given up on"),
+        "ok": bool((result and result.ok) or skipped_verified),
+        "error": (None if skipped_verified
+                  else result.error if result else "given up on"),
         "detail": (result.detail if result else {}),
         "checkpoint": checkpoint.verdict.value if checkpoint else None,
+        "skipped_verified": skipped_verified,
     }
 
 
@@ -360,27 +483,85 @@ def _drive(loop: _Loop, planner: Planner, history: list[dict]) -> tuple[bool, in
     steps_used = 0
     for index in range(loop.config.max_steps):
         steps_used = loop.steps_used = index + 1
+        loop.enter(AgentState.PLANNING, step=index)
         step = _plan(loop, planner, history)
 
         if step.error:
             # A planner that cannot produce a step is not a world failure; UNKNOWN
             # aborts safely rather than guessing an action (plan S9 last row).
+            from .general_task import GeneralTask
+
+            if (
+                isinstance(loop.task, GeneralTask)
+                and loop.task.requested_effects_complete()
+            ):
+                loop.trace.note(
+                    "planner_failed_after_verified_completion",
+                    error=step.error,
+                )
+                loop.decide(
+                    DecisionKind.VERIFY,
+                    "all explicitly requested tracked effects already passed",
+                )
+                return False, steps_used
+
+            if isinstance(loop.task, GeneralTask):
+                loop.task.mark_completion_uncertain(
+                    "the planner became unavailable before all explicitly "
+                    "requested effects were established"
+                )
+            loop.decide(DecisionKind.STOP, "the planner returned no usable step")
             _dispatch(loop, FailureClass.UNKNOWN, index)
             loop.abort_reason = loop.abort_reason or f"planner error: {step.error}"
             return False, steps_used
         if step.done:
             loop.trace.note("planner_reported_done", step=index)
+            loop.decide(DecisionKind.VERIFY,
+                        "the planner claims the goal is met; verification decides")
             return True, steps_used
         if not step.actions:
+            loop.decide(DecisionKind.STOP,
+                        "the planner neither acted nor claimed completion")
             loop.abort_reason = "planner produced no actions and did not claim completion"
             return False, steps_used
 
+        loop.decide(DecisionKind.ACT, "the next planned step is executable",
+                    actions=[a.kind for a in step.actions])
         for action in step.actions:
+            # GeneralTask owns the per-run effect ledger.  Re-read an equivalent
+            # prior PASS immediately before replaying it; only a fresh PASS may
+            # suppress execution, and no registered task is affected.
+            from .general_task import GeneralTask
+
+            if isinstance(loop.task, GeneralTask):
+                already = loop.task.verified_equivalent(
+                    loop.policy, action, loop.trace,
+                )
+                if already is not None:
+                    loop.trace.verification(already, checkpoint=True)
+                    loop.checkpoints.append(already)
+                    loop.trace.emit(
+                        "action_skipped",
+                        action=action.to_json(),
+                        reason="equivalent effect already verified PASS and still holds",
+                    )
+                    history.append(_history_entry(
+                        action, None, already, skipped_verified=True,
+                    ))
+                    loop.enter(AgentState.OBSERVING, purpose="baseline")
+                    loop.refresh()
+                    continue
+
             result, checkpoint = _run_action(loop, action)
             history.append(_history_entry(action, result, checkpoint))
             if result is None:
                 break
 
+        if loop.question is not None:
+            # A pending question outranks the rest of the plan: every later step
+            # was chosen on an assumption the user is about to settle, so running
+            # them would act on a guess. Returning here abandons them.
+            return False, steps_used
         if loop.abort_reason:
             return False, steps_used
         if loop.replan:
@@ -423,6 +604,26 @@ def _cancelled(task_id: str) -> VerificationResult:
     return VerificationResult(checks=[], label=f"cancelled:{task_id}")
 
 
+def _awaiting(task_id: str, label: str = "awaiting") -> VerificationResult:
+    """A run stopped on an unanswered question verifies *nothing*: zero checks.
+
+    Identical reasoning to :func:`_cancelled`, and identical mechanism, because
+    the two situations share the property that matters: the run stopped somewhere
+    other than the end. ``verify_final`` is deliberately **not** called, since
+    several of its checks are preconditions rather than outcomes -- ``file_exists``
+    passes for a file the agent never touched -- so a run suspended at its first
+    step could otherwise report PASS for work it never did. Waiting must not be
+    able to look like completion (PART 3 requirement 8).
+
+    Zero checks is not shorthand for UNKNOWN; it is the accurate statement that
+    nobody looked. ``VerificationResult.verdict`` already maps that to UNKNOWN.
+
+    ``label`` distinguishes the two ways a question ends a run: ``awaiting`` when
+    it was put to someone, ``ambiguous`` when there was nobody to ask.
+    """
+    return VerificationResult(checks=[], label=f"{label}:{task_id}")
+
+
 def run_task(task: Task, planner: Planner, policy: Policy,
              config: RunConfig | None = None, *, trial: int = 0,
              trace: Trace | None = None, synthetic: bool = False,
@@ -445,13 +646,19 @@ def run_task(task: Task, planner: Planner, policy: Policy,
     its report from this object. Callers that loop over trials must check
     ``outcome.cancelled`` and stop -- swallowing the interrupt here would otherwise
     turn one Ctrl+C into "carry on with the next one".
+
+    ``NeedUserInput`` is handled the same way and for the same reason, returning an
+    ``awaiting`` outcome that carries the question. With ``config.interactive``
+    False -- the default, and every benchmark trial -- there is nobody to ask, so
+    the run ends as an ordinary abort instead.
     """
     config = config or RunConfig()
     close_trace = trace is None
     trace = trace or Trace(task_id=task.task_id, condition=config.condition, trial=trial)
     loop = _Loop(
         task=task, policy=policy, config=config, trace=trace,
-        recovery=Recovery(budget=config.budget, enabled=config.recovery_enabled),
+        recovery=Recovery(budget=config.budget, enabled=config.recovery_enabled,
+                          interactive=config.interactive),
         extra_state=dict(extra_state or {}),
     )
 
@@ -459,6 +666,7 @@ def run_task(task: Task, planner: Planner, policy: Policy,
     reported_success = False
     steps_used = 0
     cancelled = False
+    awaiting = False
     history: list[dict] = []
 
     trace.emit(
@@ -467,11 +675,33 @@ def run_task(task: Task, planner: Planner, policy: Policy,
         workspace=str(policy.workspace), refuse_if_elevated=policy.refuse_if_elevated,
     )
     try:
+        loop.enter(AgentState.OBSERVING, purpose="initial")
         task.setup(policy)
         loop.refresh()
         reported_success, steps_used = _drive(loop, planner, history)
-        final = task.verify_final(policy, trace)
-        trace.verification(final, checkpoint=False)
+        if loop.question is not None:
+            # ``_drive`` stopped on a question rather than finishing. Same rule as
+            # the interrupt below: no ``verify_final``, so nothing can be claimed.
+            awaiting = True
+            final = _awaiting(task.task_id)
+        elif loop.abort_reason is not None:
+            # ``_drive`` did not finish normally -- some action was denied or the
+            # batch was otherwise aborted. ``verify_final`` still runs: it is
+            # useful diagnostic information about which of the *attempted*
+            # effects genuinely hold. But an abort means the run itself did not
+            # complete, so this verdict must not be recorded through the normal
+            # completion channel (``AgentState.VERIFYING`` + checkpoint
+            # verification), which would make it look like ordinary terminal
+            # evidence. It is logged distinctly instead, and the terminal state
+            # selection below treats ``abort_reason`` as decisive regardless of
+            # what this verdict says.
+            final = task.verify_final(policy, trace)
+            trace.note("diagnostic_verification_after_abort",
+                       verdict=final.verdict.value, abort_reason=loop.abort_reason)
+        else:
+            loop.enter(AgentState.VERIFYING, purpose="final")
+            final = task.verify_final(policy, trace)
+            trace.verification(final, checkpoint=False)
     except KeyboardInterrupt:
         # KeyboardInterrupt is a BaseException, so the handler below never saw it:
         # before this branch existed, Ctrl+C mid-run skipped the outcome entirely
@@ -483,28 +713,69 @@ def run_task(task: Task, planner: Planner, policy: Policy,
         # ``steps_used`` above is still 0. ``loop.steps_used`` is what the run
         # actually reached.
         steps_used = loop.steps_used
+        loop.question = None
         trace.note("run_cancelled", reason="KeyboardInterrupt",
                    steps_used=steps_used, reported_success=reported_success)
         loop.abort_reason = "cancelled by user before verification finished"
         final = _cancelled(task.task_id)
+    except NeedUserInput as need:
+        # Raised from inside the task -- an observer that found two valid
+        # continuations and no way to choose between them. Unwinding is how the
+        # rest of the planned batch is abandoned: those actions were chosen on an
+        # assumption that is now in question, so none of them run.
+        steps_used = loop.steps_used
+        decision, reason = loop.recovery.decide(FailureClass.AMBIGUOUS)
+        if decision is RecoveryDecision.ASK_USER:
+            awaiting = True
+            loop.question = need.clarification
+            trace.emit("clarification_needed", failure_class=FailureClass.AMBIGUOUS.value,
+                       attempt=steps_used, question=need.clarification.to_json())
+            loop.decide(DecisionKind.ASK_USER,
+                        "only a person can choose the continuation")
+            loop.enter(AgentState.WAITING_FOR_USER)
+            final = _awaiting(task.task_id)
+        else:
+            # Nobody to ask, so this *is* a failure of the run -- logged through
+            # ``trace.failure``, which is the channel for a class that ended a
+            # trial without any recovery attempt.
+            trace.failure(FailureClass.AMBIGUOUS, question=need.clarification.to_json(),
+                          steps_used=steps_used)
+            loop.abort_reason = f"{FailureClass.AMBIGUOUS.value}: {reason}"
+            final = _awaiting(task.task_id, "ambiguous")
     except Exception as exc:  # noqa: BLE001 - a crashed trial is a datum, not a stop
         # Same reason as the branch above: a crash inside ``_drive`` also unwinds it
         # without a return value, and a trial that crashed on its fourth step is not
         # a trial that took zero steps.
         steps_used = loop.steps_used
+        loop.question = None
         trace.note("run_exception", error=f"{type(exc).__name__}: {exc}")
         loop.abort_reason = loop.abort_reason or f"harness error: {type(exc).__name__}: {exc}"
         final = _harness_error(task.task_id, exc)
     finally:
-        # A cancelled run keeps its workspace. Teardown would delete the only
-        # evidence of how far it got, and the person who pressed Ctrl+C is the
-        # person most likely to want to look. This is not rollback or resumability
-        # (plan E phase 2 rules both out) -- it is simply not destroying state.
-        if teardown and not cancelled:
+        # A cancelled or suspended run keeps its workspace. Teardown would delete
+        # the only evidence of how far it got -- and for a suspended run, the state
+        # the answer is about to be applied to. This is not rollback or
+        # resumability (plan E phase 2 rules both out) -- it is simply not
+        # destroying state.
+        if teardown and not cancelled and not awaiting:
             try:
                 task.teardown(policy)
             except Exception as exc:  # noqa: BLE001
                 trace.note("teardown_failed", error=f"{type(exc).__name__}: {exc}")
+
+    loop.enter(
+        AgentState.CANCELLED if cancelled
+        else AgentState.WAITING_FOR_USER if awaiting
+        # An abort (e.g. a denied action) is decisive on its own: no
+        # ``final.verdict`` -- diagnostic or otherwise -- can promote an
+        # aborted run to COMPLETED. This is checked ahead of the PASS check
+        # for the same reason ``api.py:_status`` checks ``aborted_reason``
+        # ahead of ``Verdict.PASS`` -- an incidental successful effect must
+        # not be read as the run having succeeded.
+        else AgentState.FAILED if loop.abort_reason is not None
+        else AgentState.COMPLETED if final.verdict is Verdict.PASS
+        else AgentState.FAILED
+    )
 
     outcome = RunOutcome(
         task_id=task.task_id, condition=config.condition, trial=trial,
@@ -520,6 +791,9 @@ def run_task(task: Task, planner: Planner, policy: Policy,
         aborted_reason=loop.abort_reason,
         synthetic=synthetic or _planner_name(planner).startswith("mock"),
         cancelled=cancelled,
+        state=loop.state,
+        awaiting=awaiting,
+        question=loop.question if awaiting else None,
     )
     trace.emit("run_end", outcome={k: v for k, v in outcome.to_json().items()
                                    if k not in ("trace", "checkpoints")})

@@ -77,6 +77,14 @@ SENSITIVE_FRAGMENTS = (
     "id_ed25519",
     ".netrc",
     ".git-credentials",
+    # Added alongside the self-referential-project-analysis grant: once the
+    # repository itself can be a readable_root, its own ".env" (main.py loads
+    # model credentials from ROOT / ".env") sits inside that grant unless it
+    # is refused here too. "secret" and ".pem" are the same gap for the same
+    # reason -- none of the fragments above catches a bare ".env" file.
+    ".env",
+    "secret",
+    ".pem",
 )
 
 

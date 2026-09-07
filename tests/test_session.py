@@ -78,7 +78,10 @@ def test_typed_and_spoken_requests_take_the_same_path(chat: Session, calls: list
     assert len(calls) == 2
     assert calls[0]["request"] == calls[1]["request"] == REGISTERED
 
-    ignore = {"on_event"}  # a fresh closure per call by construction
+    # A fresh callback differs by construction, and verified recent context is
+    # expected to differ after the first successful turn. Neither changes the
+    # typed/voice execution route being asserted here.
+    ignore = {"on_event", "recent_context"}
     assert ({k: v for k, v in calls[0].items() if k not in ignore}
             == {k: v for k, v in calls[1].items() if k not in ignore})
 
@@ -111,10 +114,8 @@ def test_session_settings_are_what_the_pipeline_is_told(chat: Session,
 def test_the_reply_comes_from_the_verified_result(chat: Session, calls: list[dict]):
     """The sentence is a pure function of ``AgentResult``; the session adds no
     wording of its own, so it cannot upgrade a verdict on the way out."""
-    from agent_control.response import phrase_result
-
     turn = chat.submit(REGISTERED)
-    assert turn.reply == phrase_result(turn.result)
+    assert turn.reply == chat.narrator.presentation.result(turn.result)
     assert turn.ok is True
 
 
@@ -171,25 +172,79 @@ def test_empty_input_runs_nothing(blank: str, chat: Session, calls: list[dict]):
     assert calls == []
 
 
-def test_an_unregistered_request_is_refused_by_name(chat: Session, calls: list[dict],
-                                                    printed: list[str]):
-    """No faked generality: the backend runs registered workflows, and a request
-    outside that set is named as unsupported rather than steered into a task the
-    user did not ask for."""
+def test_a_request_with_no_capability_behind_it_claims_nothing(
+    chat: Session, calls: list[dict], printed: list[str],
+):
+    """No faked generality. "Book me a flight" names no registered workflow and
+    asks for nothing this machine can do, so it is answered as conversation --
+    and a conversational turn can never read as an attempt: ``result`` stays
+    ``None``, so ``executed`` and ``ok`` are both false however the sentence is
+    worded. Nothing was booked and nothing claims to have been.
+
+    The conversation engine is stubbed because what is under test is the
+    *routing and the claim*, not the model's wording; a live call would make
+    this test an availability check on someone else's service.
+    """
+    class Stub:
+        def reply(self, text, history=None, recent_context=None):
+            return "I cannot book flights; I have no booking tool."
+
+    chat._conversation = Stub()
+
     turn = chat.submit("book me a flight to Lisbon")
 
-    assert turn.task.status == "unsupported"
+    assert turn.task.status == "conversation"
+    assert turn.task.task_id == "", "not steered into a task the user did not ask for"
     assert turn.executed is False
-    assert calls == []
-    assert "do not have a workflow" in turn.reply
-    assert any(REGISTERED in line for line in printed), "the real set is listed"
+    assert turn.result is None
+    assert turn.ok is False
+    assert calls == [], "nothing was run"
 
 
 def test_a_near_miss_is_not_snapped_to_a_registered_task(chat: Session,
                                                          calls: list[dict]):
+    """"open the last pdf" is one word away from the registered
+    ``open_last_day_pdf`` and must not be rounded to it. What it *is* now is a
+    general computer action -- a real request about real files -- so it reaches
+    the pipeline as a ``GeneralTask`` carrying the sentence itself, never as the
+    registered task id.
+    """
     turn = chat.submit("open the last pdf")
-    assert turn.task.status == "unsupported"
-    assert calls == []
+
+    assert len(calls) == 1
+    assert calls[0]["task_id"] != REGISTERED, "not snapped to the near-miss task"
+    assert calls[0]["task_id"].startswith("general-")
+    assert calls[0]["task_obj"] is not None, "it went as a GeneralTask"
+    assert calls[0]["request"] == "open the last pdf", "the sentence travels intact"
+    assert turn.task.task_id == calls[0]["task_id"]
+
+
+def test_clear_folder_actions_always_route_to_execution(
+    chat: Session,
+    calls: list[dict],
+):
+    """A prior turn cannot make a later supported action look conversational."""
+    first = chat.submit("create a folder called AlphaTest")
+    second = chat.submit("create a folder called ConversationTest")
+
+    assert first.executed is True
+    assert second.executed is True
+    assert len(calls) == 2
+    assert all(call["task_obj"] is not None for call in calls)
+    assert all(call["request"].startswith("create a folder") for call in calls)
+
+
+def test_follow_up_name_correction_routes_to_execution(
+    chat: Session,
+    calls: list[dict],
+):
+    chat.submit("create a folder called AlphaTest")
+    corrected = chat.submit("no, call it BetaTest instead")
+
+    assert corrected.executed is True
+    assert len(calls) == 2
+    assert calls[-1]["task_obj"] is not None
+    assert calls[-1]["request"] == "no, call it BetaTest instead"
 
 
 def test_the_raw_input_is_kept_beside_the_normalized_one():
@@ -380,11 +435,13 @@ def test_status_lines_come_from_emitted_events_only(chat: Session, monkeypatch):
     no other source of lines."""
     def emitting(request, **kwargs):
         watch = kwargs["on_event"]
-        watch({"event": "planner_call", "completion_tokens": 42})
-        watch({"event": "action",
-               "result": {"ok": True, "action": {"kind": "open_path"}}})
-        watch({"event": "verification", "checkpoint": False,
-               "verification": {"verdict": "PASS"}})
+        watch({"event": "agent_state", "state": "OBSERVING",
+               "purpose": "initial"})
+        watch({"event": "agent_state", "state": "PLANNING"})
+        watch({"event": "agent_state", "state": "ACTING",
+               "action": "create_dir", "params": {"path": "C:/work/Banana"}})
+        watch({"event": "agent_state", "state": "VERIFYING",
+               "action": "create_dir", "params": {"path": "C:/work/Banana"}})
         return AgentResult(request=request, task_id=request,
                            status=TaskStatus.SUCCESS, completed=["file_exists"])
 
@@ -392,9 +449,10 @@ def test_status_lines_come_from_emitted_events_only(chat: Session, monkeypatch):
     turn = chat.submit(REGISTERED)
 
     assert turn.status_lines == [
-        "  planning ... 42 tokens",
-        "  open_path: ok",
-        "  final verification: PASS",
+        "DEIMOS is checking the current workspace ...",
+        "DEIMOS is planning the next step ...",
+        'DEIMOS is creating the folder "Banana" ...',
+        'DEIMOS is verifying "Banana" ...',
     ]
 
 
@@ -412,6 +470,7 @@ def test_unlisted_events_produce_no_line(chat: Session, monkeypatch):
 
 
 def test_a_refusal_and_a_failure_are_shown(chat: Session, monkeypatch):
+    chat.debug = True
     def emitting(request, **kwargs):
         kwargs["on_event"]({"event": "policy_decision", "decision": "DENY",
                             "action": {"kind": "run_process"},
@@ -773,6 +832,73 @@ def test_a_plain_line_is_a_task_and_a_slash_line_is_not(chat: Session,
     assert main._chat_command(chat, "/quit") is False
 
 
+@pytest.mark.parametrize("command", ["cls", "clear", " CLS "])
+def test_clear_commands_are_handled_locally(command: str, monkeypatch):
+    import main
+
+    cleared: list[bool] = []
+    monkeypatch.setattr(main, "_clear_terminal", lambda: cleared.append(True))
+
+    assert main._chat_local_command(command) is True
+    assert cleared == [True]
+
+
+def test_non_clear_text_is_not_consumed_as_a_local_command(monkeypatch):
+    import main
+
+    monkeypatch.setattr(
+        main,
+        "_clear_terminal",
+        lambda: pytest.fail("clear should not run"),
+    )
+    assert main._chat_local_command("create a folder called clear") is False
+
+
+def test_normal_chat_hides_internal_task_ids(
+    chat: Session,
+    calls: list[dict],
+    printed: list[str],
+):
+    chat.submit("create a folder called PrivacyTest")
+
+    output = "\n".join(printed)
+    assert calls and calls[0]["task_id"].startswith("general-")
+    assert "general-" not in output
+    assert "setup_python_project" not in output
+
+    printed.clear()
+    chat.submit("set up a Python project called PrivacySetup987")
+    assert calls[-1]["task_id"] == "setup_python_project"
+    assert "setup_python_project" not in "\n".join(printed)
+
+
+def test_debug_chat_may_show_internal_task_ids(
+    chat: Session,
+    calls: list[dict],
+    printed: list[str],
+):
+    chat.debug = True
+    chat.submit("create a folder called DebugPrivacyTest")
+
+    assert calls[0]["task_id"] in "\n".join(printed)
+
+
+def test_supported_action_never_returns_conversation_capability_denial(
+    chat: Session,
+    calls: list[dict],
+):
+    class DenyingConversation:
+        def reply(self, text, history=None):
+            return "I don't have the ability to create folders directly."
+
+    chat._conversation = DenyingConversation()
+    turn = chat.submit("create a folder called CapabilityTest")
+
+    assert turn.executed is True
+    assert calls and calls[0]["task_obj"] is not None
+    assert "don't have the ability" not in turn.reply.lower()
+
+
 def test_unknown_commands_are_named_rather_than_run(chat: Session,
                                                     calls: list[dict], capsys):
     import main
@@ -883,7 +1009,7 @@ def test_there_is_exactly_one_execution_call_site_per_interface():
 
     assert dict(sites) == {"main.py": 1, "agent_control/session.py": 1}, (
         f"the set of execution call sites changed: {dict(sites)}. One belongs to "
-        "the `run` subcommand and one to Session.submit; a third is a second agent."
+        "the `run` subcommand and one to Session._run; a third is a second agent."
     )
 
 
@@ -908,7 +1034,13 @@ def test_capture_json_round_trips():
     json.dumps(Capture(text="x", ok=True, seconds=1.0).to_json())
 
 
-def test_an_unsupported_task_is_not_accepted():
-    assert UserTask(raw="x", text="x", status="unsupported").accepted is False
+def test_a_task_with_no_registered_workflow_is_not_accepted():
+    """``accepted`` means "there is a workflow to run and we know its name".
+    Neither an unregistered request nor a conversational one qualifies -- both
+    reach a route that is decided later, and neither may be mistaken for a
+    resolved task by anything reading this field.
+    """
+    assert UserTask(raw="x", text="x", status="unregistered").accepted is False
+    assert UserTask(raw="x", text="x", status="conversation").accepted is False
     assert UserTask(raw="x", text="x", task_id="").accepted is False
     assert UserTask(raw="x", text="x", task_id=REGISTERED).accepted is True

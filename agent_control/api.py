@@ -28,8 +28,9 @@ from typing import Any, Callable, Sequence
 from .policy import Policy
 from .recovery import RecoveryBudget
 from .runner import RunConfig, RunOutcome, run_task
+from .task import Task
 from .trace import Trace
-from .types import Check, FailureClass, PolicyDenied, Verdict
+from .types import Check, Clarification, FailureClass, PolicyDenied, Verdict
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -46,6 +47,13 @@ class TaskStatus(str, Enum):
     #: The person stopped the run. Not a verdict about the task -- the absence of
     #: one. Distinct from UNKNOWN, which means we looked and could not tell.
     CANCELLED = "CANCELLED"
+    #: The run stopped to ask the person something, and can be resumed from where
+    #: it stopped. Also the absence of a verdict rather than a bad one, and
+    #: deliberately not UNKNOWN: nothing went wrong and nothing was unreadable --
+    #: what is missing is a decision only they can make. Waiting is not failure
+    #: (PART 3 requirement 6), and because ``is_success`` stays False it can never
+    #: be spoken as completion (requirement 8).
+    NEEDS_INPUT = "NEEDS_INPUT"
 
     @property
     def is_success(self) -> bool:
@@ -97,11 +105,29 @@ class AgentResult:
     #: guess.
     app: str = ""
 
+    #: What the run stopped to ask, when ``status`` is ``NEEDS_INPUT``. The
+    #: :class:`~agent_control.types.Clarification` object rather than its text,
+    #: because a caller holding only a sentence would have to re-derive the
+    #: observed options and the record of what could *not* be observed -- and
+    #: would then be free to invent both, which is the one thing PART 3 forbids.
+    question: Clarification | None = None
+
     outcome: RunOutcome | None = None
 
     @property
     def ok(self) -> bool:
         return self.status is TaskStatus.SUCCESS
+
+    @property
+    def needs_input(self) -> bool:
+        """Whether this run is suspended on a question rather than finished.
+
+        Not the complement of ``ok``: a suspended run is neither a success nor a
+        failure, and a caller has to tell "ask, then continue this run" apart from
+        "report it and stop". Everything that reads ``ok`` keeps working unchanged,
+        because a suspended run answers False there too.
+        """
+        return self.status is TaskStatus.NEEDS_INPUT
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -127,6 +153,8 @@ class AgentResult:
             "usage": self.usage,
             "target": self.target,
             "app": self.app,
+            "question": self.question.to_json() if self.question else None,
+            "needs_input": self.needs_input,
             "ok": self.ok,
         }
 
@@ -1126,19 +1154,23 @@ def parse_setup_candidates(text: str) -> tuple[str, ...]:
     if verb_at is None:
         return ()
 
-    names_a_project = any(word in _SETUP_KINDS for word in lowered) or (
-        any(word in _PYTHON_WORDS for word in lowered)
-        and any(word in _PROJECT_WORDS for word in lowered)
-    )
-    if not names_a_project:
-        return ()
-
     readings: list[list[str]] = []
+
+    def names_a_project(words_in_phrase: Sequence[str]) -> bool:
+        """The object of this creation phrase is a project, not later prose."""
+        return any(word in _SETUP_KINDS for word in words_in_phrase) or (
+            any(word in _PYTHON_WORDS for word in words_in_phrase)
+            and any(word in _PROJECT_WORDS for word in words_in_phrase)
+        )
 
     # Quotes are a name marker of their own, and the most explicit one there is:
     # ``create a python project "rocket os"`` says exactly which words the name is.
     quoted = _QUOTED_NAME.search(flat)
-    if quoted:
+    quoted_prefix = [
+        word.strip(_STRIP_SENTENCE).lower()
+        for word in flat[:quoted.start()].split()
+    ] if quoted else []
+    if quoted and names_a_project(quoted_prefix[verb_at + 1:]):
         readings.append(quoted.group(1).split())
 
     marker_at = next(
@@ -1149,7 +1181,10 @@ def parse_setup_candidates(text: str) -> tuple[str, ...]:
         ),
         None,
     )
-    if marker_at is not None:
+    if (
+        marker_at is not None
+        and names_a_project(lowered[verb_at + 1:marker_at])
+    ):
         after = lowered[marker_at + 1:]
         take = len(list(itertools.takewhile(
             lambda word: word not in _ENDS_A_NEW_NAME, after,
@@ -1333,6 +1368,49 @@ def parse_request(text: str) -> str | None:
     )
 
 
+#: File types as they are *said* rather than written: "pdf", not ".pdf". Derived
+#: from the one allowlist ``open_file`` already enforces so the two cannot drift
+#: apart, and so this adds no vocabulary of its own.
+_FILE_TYPE_WORDS = frozenset(suffix[1:] for suffix in OPENABLE_SUFFIXES)
+
+#: Words that pick a member out of a set instead of naming one. Not a general
+#: adjective list: each of these is only meaningful when several candidates exist
+#: and the sentence is deliberately leaving the choice to whoever looks.
+_SELECTION_WORDS = frozenset({
+    "last", "latest", "newest", "recent", "recently",
+    "first", "oldest",
+    "largest", "biggest", "smallest", "longest", "shortest",
+    "most", "least",
+    "any", "random",
+})
+
+
+def describes_a_selection(text: str) -> bool:
+    """Whether the sentence asks for a file identified by a *property* rather
+    than by name: "the most recently modified PDF", "the newest mp4".
+
+    Two signals are required together, because either one alone is ordinary:
+
+    * a selection word -- "open my latest project" has one and means a folder;
+    * a **bare** file-type word -- ``pdf``, never ``report.pdf``. A token that
+      carries a real extension is a name, and ``resolve_open_request`` already
+      resolves those against the location index.
+
+    The pair is what a folder request never carries: "open the downloads folder"
+    names a directory and no reading of it involves a file type. A request that
+    has both is naming a *kind* of file plus a rule for choosing among them,
+    which is discovery work -- something the general route can do by listing and
+    comparing, and something the location index structurally cannot answer,
+    since it holds names and not modification times.
+
+    This is a routing condition and not a phrase table: it decides which
+    resolver may not speak, and knows nothing about any particular sentence.
+    """
+    words = {word.strip(_STRIP_SENTENCE).lower() for word in text.split()}
+
+    return bool(words & _SELECTION_WORDS) and bool(words & _FILE_TYPE_WORDS)
+
+
 def resolve_request(
     text: str,
     *,
@@ -1351,18 +1429,33 @@ def resolve_request(
       location index for a folder called "python";
     * **project-open** is last because it is the widest: its gate is a verb plus a
       hint that a directory is meant, which "start a python project called foo"
-      also satisfies while meaning the opposite.
+      also satisfies while meaning the opposite. That width is also why it is the
+      one step a selection suppresses (see ``describes_a_selection``): "open the
+      most recently modified PDF in my Downloads folder" satisfies its gate on the
+      word "folder" alone, and answering as a folder search reports "no folder
+      named pdf", which is not a fact about the request.
     """
-    return (
+    resolved = (
         resolve_open_request(
             text, use_memory=use_memory, limit=limit, memory=memory,
         )
         or resolve_setup_request(
             text, use_memory=use_memory, limit=limit, memory=memory,
         )
-        or resolve_project_request(
-            text, use_memory=use_memory, limit=limit, memory=memory,
-        )
+    )
+
+    if resolved is not None:
+        return resolved
+
+    # Neither of the shapes above claimed it, and a sentence that picks a file
+    # type by a property is not a folder request either. Leaving it unresolved
+    # hands it to the caller's general route, which can list and compare; a
+    # resolver that only knows names cannot answer it and should not refuse it.
+    if describes_a_selection(text):
+        return None
+
+    return resolve_project_request(
+        text, use_memory=use_memory, limit=limit, memory=memory,
     )
 
 
@@ -1428,16 +1521,46 @@ def _status(
             or "stopped by the user; the run did not finish",
         )
 
+    # Second, and for the same structural reason: a run suspended on a question
+    # stopped somewhere other than the end, so it has no verdict to report. It is
+    # ahead of every branch below because each of those is an answer -- PASS, a
+    # refusal, partial progress, a failure, "could not tell" -- and this run gave
+    # none of them. ``runner._awaiting`` produced zero checks on purpose, which
+    # would otherwise fall through to UNKNOWN and describe a pending decision as
+    # something we looked at and could not determine (PART 3: these must not
+    # collapse into UNKNOWN).
+    if outcome.awaiting:
+        return (
+            TaskStatus.NEEDS_INPUT,
+            outcome.question.question if outcome.question
+            else outcome.aborted_reason
+            or "waiting for a decision only you can make",
+        )
+
+    # Third, and before the PASS check: a run that was aborted because Policy
+    # denied an action must never be reported as SUCCESS, no matter what
+    # ``verify_final`` found. ``verify_final`` still runs after this kind of
+    # abort (see ``runner.run_task``) and is diagnostically useful -- it can
+    # say which of the *attempted* effects genuinely hold -- but its verdict
+    # describes only the actions Policy allowed to execute. A denied action
+    # is invisible to that verdict by construction (``GeneralTask._remember``
+    # records nothing for a refused path), so an incidental PASS on an
+    # unrelated effect must not be read as the run having succeeded. Checking
+    # this ahead of ``outcome.verified is Verdict.PASS`` is what makes
+    # POLICY_BLOCKED terminal: nothing below can promote an aborted run back
+    # to SUCCESS. ``completed``/``failed``/``unresolved`` -- and therefore the
+    # diagnostic detail in ``AgentResult.checks`` -- are still derived from the
+    # same verification and remain visible to the caller either way.
+    aborted = outcome.aborted_reason or ""
+
+    if aborted.startswith(FailureClass.PERMISSION_DENIED.value):
+        return TaskStatus.POLICY_BLOCKED, aborted
+
     if outcome.verified is Verdict.PASS:
         return (
             TaskStatus.SUCCESS,
             f"verified {len(completed)} check(s)",
         )
-
-    aborted = outcome.aborted_reason or ""
-
-    if aborted.startswith(FailureClass.PERMISSION_DENIED.value):
-        return TaskStatus.POLICY_BLOCKED, aborted
 
     if completed and (failed or unresolved):
         return (
@@ -1561,6 +1684,69 @@ def readable_roots_for_task(
     return task_roots.get(task_id, ())
 
 
+#: Matches "this project", "this codebase", "current project", "the current
+#: repo", etc. -- a demonstrative or "current" immediately governing a word
+#: that names the running application's own source tree. Deliberately does
+#: NOT match "a project", "my project", "another project", or "the project in
+#: Downloads": none of those says *this one*, and a request naming or implying
+#: a different target must fall through to the existing clarification path,
+#: not be silently redirected here. "the" before "current" is optional so
+#: both "current project" and "the current project" match; nothing is
+#: optional in front of "this", since "this" already an unambiguous
+#: demonstrative on its own.
+_SELF_REFERENTIAL_PROJECT = re.compile(
+    r"\b(?:this|(?:the\s+)?current)\s+(?:project|codebase|repo|repository)\b"
+)
+
+
+def _is_self_referential_project_request(request: str) -> bool:
+    """Whether ``request`` is asking about *this* running DEIMOS repository.
+
+    Narrow by design (see :data:`_SELF_REFERENTIAL_PROJECT`): this exists so
+    "analyze this project" resolves to the repository DEIMOS is running from,
+    without making every sentence containing the word "project" do the same.
+    """
+    return bool(_SELF_REFERENTIAL_PROJECT.search((request or "").lower()))
+
+
+def general_readable_roots(request: str = "") -> tuple[Path, ...]:
+    """Read-only roots granted to Route 2 (general computer-action) requests.
+
+    Deliberately the union of grants this module already makes elsewhere to
+    registered tasks, and nothing wider than any of them:
+
+    * :func:`projects_root` -- already the write root ``setup_python_project``
+      is given, and already documented there as "never the home folder or a
+      drive root";
+    * ``Path.home() / "Downloads"`` -- already the read-only grant
+      :func:`readable_roots_for_task` gives ``open_last_day_pdf``;
+    * :data:`ROOT` -- the directory containing ``main.py`` and
+      ``agent_control`` -- granted **only** when ``request`` is
+      self-referential (:func:`_is_self_referential_project_request`), so
+      "analyze this project" has an actual source tree to look at instead of
+      an empty sandbox. Granted read-only, exactly like the other two: this
+      function only ever returns entries for ``Policy.readable_roots``, never
+      for ``Policy.workspace``, so nothing it returns can become writable.
+      ``request`` defaults to "" (no self-reference), which reproduces the
+      old two-root behavior exactly for every caller that does not pass one.
+
+    A general request needing anything outside these hits the same
+    ``PolicyDenied`` a registered task would. This function grants nothing by
+    itself -- ``Policy.readable_roots``, constructed from its return value, is
+    the actual gate -- it exists only so the grant is named once and stays
+    auditable, the same reason :func:`readable_roots_for_task` is public.
+    """
+    roots = [
+        projects_root(),
+        Path.home() / "Downloads",
+    ]
+
+    if _is_self_referential_project_request(request):
+        roots.append(ROOT)
+
+    return tuple(roots)
+
+
 def _remembered(
     request: str,
     policy: Policy,
@@ -1632,11 +1818,42 @@ def _permissions(policy: Policy) -> dict[str, Any]:
     }
 
 
+def _decisions(answers: Sequence[str]) -> dict[str, Any]:
+    """Tell the planner what the person already decided. Context, never a grant.
+
+    A resumed run is the *same* run: the question it stopped on was about which of
+    several real continuations to take, so the answer belongs in the state the
+    planner reads, beside the observations, exactly where ``_remembered`` puts a
+    remembered path. It arrives as data and is treated as data -- the policy layer
+    still decides whether the action the planner picks is allowed, and verification
+    still decides whether it worked. An answer that named something out of bounds
+    is refused by ``resolve_write_path`` like anything else, which is what keeps
+    "the user said so" from being a permission (PART 9 invariants 1-3).
+
+    Empty for the ordinary first attempt, so nothing about the prompt changes for a
+    run nobody has been asked anything about.
+    """
+    if not answers:
+        return {}
+
+    return {
+        "user_decisions": {
+            "note": "Answers this person gave to questions this run already "
+                    "asked. Most recent last. They resolve a choice you could "
+                    "not make; they do not permit anything the policy layer "
+                    "refuses.",
+            "answers": [str(answer) for answer in answers],
+        }
+    }
+
+
 def run_agent_task(
     request: str,
     *,
     task_id: str | None = None,
     task_params: dict[str, Any] | None = None,
+    task_obj: Task | None = None,
+    readable_roots: tuple[Path, ...] | None = None,
     planner: str = "llm",
     max_steps: int = 10,
     fresh_state: bool = True,
@@ -1647,9 +1864,12 @@ def run_agent_task(
     trial: int = 0,
     trace: Trace | None = None,
     use_memory: bool = True,
+    interactive: bool = False,
+    answers: Sequence[str] = (),
+    recent_context: dict[str, str] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentResult:
-    """Run one registered task through the single execution pipeline.
+    """Run a task through the single execution pipeline.
 
     ``on_event`` is forwarded to the trace so an interface can show real progress
     while the run proceeds. It is ignored when ``trace`` is supplied, because the
@@ -1661,90 +1881,168 @@ def run_agent_task(
     actually said, which is what the trace and ``_remembered`` want. Passing
     ``task_id`` skips resolution; it does not skip anything else -- the same
     policy, planner, runner, and verifiers follow.
+
+    ``task_obj`` is the general-computer-action route (plan: general-task
+    routing): a caller that has already built a ``Task`` -- currently only
+    ``GeneralTask``, from ``Session``'s Route 2 -- hands it to us directly
+    instead of a task id. When given, resolution, the registered-task gate,
+    and ``build_task`` are all skipped entirely; every existing call site,
+    which passes ``task_obj=None`` implicitly, is unaffected and takes the
+    exact path it always has. ``readable_roots`` is meaningful only alongside
+    ``task_obj``: it is what the constructed ``Policy`` grants, in place of
+    ``readable_roots_for_task``, which only knows about registered task ids.
+
+    ``interactive`` says whether someone is present to answer a question. False --
+    the default, and every benchmark trial -- means a run that finds an ambiguity
+    it cannot resolve ends instead of suspending, so no measured number moves
+    because this parameter exists. True lets the same run come back as
+    ``NEEDS_INPUT`` carrying the question in ``AgentResult.question``.
+
+    ``answers`` carries what the person said when a previous attempt at *this*
+    request asked. It reaches the planner as read-only state and nothing else; see
+    :func:`_decisions`.
     """
 
     from .planner import LLMUnavailable, MockPlanner
     from .planner.openai_compat import LLMClient, OpenAICompatPlanner
-    from benchmark.tasks import build_task
 
     params = dict(task_params or {})
 
-    if task_id is None:
-        task_id = resolve_task(request)
+    #: Bound before the guard below so a failure to prepare can still name the
+    #: workspace it was trying to create -- the one fact worth reporting about a
+    #: run that never started.
+    root: Path | None = None
 
-    if task_id is None:
+    # Assembling a run touches the filesystem: resolving the workspace path and
+    # constructing the Policy creates it. Both can fail on input a caller cannot
+    # pre-validate -- a task id that is not spellable as a directory on this
+    # platform, a missing or read-only drive -- and until now that failure landed
+    # in whatever loop called us. ``main.cmd_chat`` catches only
+    # KeyboardInterrupt, so a single bad request ended the session.
+    #
+    # A run that could not be prepared produced no verdict, which is exactly what
+    # UNKNOWN already means in this module (see ``runner._harness_error``, which
+    # reports an in-run crash the same way), so it is reported as UNKNOWN with the
+    # exception preserved in ``detail`` rather than as a new status. The clause is
+    # narrow on purpose: OSError and PolicyDenied are what this assembly is known
+    # to raise, and anything else is a bug in the project that stays loud.
+    try:
+        if task_obj is not None:
+            # Everything below this branch, down to policy construction, exists
+            # to turn a *name* into a registered Task. None of it applies when
+            # the Task already exists -- there is no id to resolve, no
+            # registered set to check membership in, and no build_task to call.
+            # Every line after this branch closes is the same pipeline a
+            # registered task goes through: same Policy, same planner
+            # selection, same run_task, same verification.
+            task = task_obj
+            task_id = task.task_id
+
+            root = (
+                Path(workspace).resolve()
+                if workspace is not None
+                else default_workspace(task_id).resolve()
+            )
+
+            named, through = _describe_target(task)
+
+            policy = Policy(
+                workspace=root,
+                readable_roots=tuple(readable_roots or ()),
+            )
+
+        else:
+            from benchmark.tasks import build_task
+
+            if task_id is None:
+                task_id = resolve_task(request)
+
+            if task_id is None:
+                return AgentResult(
+                    request=request,
+                    status=TaskStatus.UNSUPPORTED,
+                    detail=(
+                        f"no registered workflow matches {request!r}; "
+                        f"known: {', '.join(registered_tasks())}"
+                    ),
+                )
+
+            if task_id not in registered_tasks():
+                return AgentResult(
+                    request=request,
+                    status=TaskStatus.UNSUPPORTED,
+                    detail=(
+                        f"unknown task {task_id!r}; "
+                        f"known: {', '.join(registered_tasks())}"
+                    ),
+                )
+
+            # A parameterized task with no parameter has nothing to do. Refusing
+            # here keeps the empty-path specimen that ``main.py tasks`` builds
+            # from ever reaching a planner as a runnable instruction.
+            if task_id == "open_named_file" and not params.get("path"):
+                return AgentResult(
+                    request=request,
+                    task_id=task_id,
+                    status=TaskStatus.UNSUPPORTED,
+                    detail=(
+                        "this task needs a filename; say 'open <filename>' and "
+                        "I will look the location up"
+                    ),
+                )
+
+            if task_id == "open_project_in_vscode" and not params.get("path"):
+                return AgentResult(
+                    request=request,
+                    task_id=task_id,
+                    status=TaskStatus.UNSUPPORTED,
+                    detail=(
+                        "this task needs a project folder; say 'open <name> "
+                        "project in vscode' and I will look the location up"
+                    ),
+                )
+
+            if task_id == "setup_python_project" and not params.get("path"):
+                return AgentResult(
+                    request=request,
+                    task_id=task_id,
+                    status=TaskStatus.UNSUPPORTED,
+                    detail=(
+                        "this task needs a name for the new project; say 'set "
+                        "up a python project called <name>' and I will choose "
+                        "the location"
+                    ),
+                )
+
+            root = (
+                Path(workspace).resolve()
+                if workspace is not None
+                else write_root_for_task(task_id, params).resolve()
+            )
+
+            task = build_task(task_id, **params)
+
+            # Read off the task rather than out of the request string: the task
+            # holds the path that was actually resolved, where the request holds
+            # what the person said, and the two differ exactly when resolution
+            # did something useful.
+            named, through = _describe_target(task)
+
+            policy = Policy(
+                workspace=root,
+                readable_roots=readable_roots_for_task(task_id, params),
+            )
+
+    except (OSError, PolicyDenied) as exc:
         return AgentResult(
             request=request,
-            status=TaskStatus.UNSUPPORTED,
+            task_id=task_id or "",
+            status=TaskStatus.UNKNOWN,
             detail=(
-                f"no registered workflow matches {request!r}; "
-                f"known: {', '.join(registered_tasks())}"
+                f"could not prepare the run: {type(exc).__name__}: {exc}"
             ),
+            workspace=str(root) if root is not None else "",
         )
-
-    if task_id not in registered_tasks():
-        return AgentResult(
-            request=request,
-            status=TaskStatus.UNSUPPORTED,
-            detail=(
-                f"unknown task {task_id!r}; "
-                f"known: {', '.join(registered_tasks())}"
-            ),
-        )
-
-    # A parameterized task with no parameter has nothing to do. Refusing here
-    # keeps the empty-path specimen that ``main.py tasks`` builds from ever
-    # reaching a planner as a runnable instruction.
-    if task_id == "open_named_file" and not params.get("path"):
-        return AgentResult(
-            request=request,
-            task_id=task_id,
-            status=TaskStatus.UNSUPPORTED,
-            detail=(
-                "this task needs a filename; say 'open <filename>' and I will "
-                "look the location up"
-            ),
-        )
-
-    if task_id == "open_project_in_vscode" and not params.get("path"):
-        return AgentResult(
-            request=request,
-            task_id=task_id,
-            status=TaskStatus.UNSUPPORTED,
-            detail=(
-                "this task needs a project folder; say 'open <name> project in "
-                "vscode' and I will look the location up"
-            ),
-        )
-
-    if task_id == "setup_python_project" and not params.get("path"):
-        return AgentResult(
-            request=request,
-            task_id=task_id,
-            status=TaskStatus.UNSUPPORTED,
-            detail=(
-                "this task needs a name for the new project; say 'set up a "
-                "python project called <name>' and I will choose the location"
-            ),
-        )
-
-    root = (
-        Path(workspace).resolve()
-        if workspace is not None
-        else write_root_for_task(task_id, params).resolve()
-    )
-
-    task = build_task(task_id, **params)
-
-    # Read off the task rather than out of the request string: the task holds the
-    # path that was actually resolved, where the request holds what the person
-    # said, and the two differ exactly when resolution did something useful.
-    named, through = _describe_target(task)
-
-    policy = Policy(
-        workspace=root,
-        readable_roots=readable_roots_for_task(task_id, params),
-    )
 
     try:
         if planner == "mock":
@@ -1773,6 +2071,7 @@ def run_agent_task(
         fresh_precondition=fresh_state,
         recovery_enabled=recovery,
         budget=RecoveryBudget(),
+        interactive=interactive,
     )
 
     own_trace = trace is None
@@ -1796,6 +2095,32 @@ def run_agent_task(
             teardown=not keep_workspace,
             extra_state={
                 **_permissions(policy),
+                **_decisions(answers),
+                **(
+                    {
+                        "recent_context": {
+                            **{
+                                key: str(value)
+                                for key, value in (recent_context or {}).items()
+                                if key in {
+                                    "last_verified_directory",
+                                    "last_verified_file",
+                                    "last_verified_app",
+                                    "last_goal",
+                                }
+                                and value
+                            },
+                            "note": (
+                                "Verified references from the immediately recent "
+                                "successful work. Use them to resolve phrases such "
+                                "as 'that folder', 'it', and 'there'. They are not "
+                                "permissions; Policy still decides every path."
+                            ),
+                        }
+                    }
+                    if recent_context
+                    else {}
+                ),
                 **_remembered(
                     request,
                     policy,
@@ -1912,6 +2237,10 @@ def _result_from(
         workspace=str(root),
         target=target,
         app=app,
+        #: Only from a suspended run. ``RunOutcome`` already clears it otherwise,
+        #: and the guard is repeated here so a question can never outlive the wait
+        #: it belongs to and be re-asked after the run finished.
+        question=outcome.question if outcome.awaiting else None,
         trace_file=(outcome.trace or {}).get("trace_file"),
         usage=dict(outcome.usage or {}),
         outcome=outcome,

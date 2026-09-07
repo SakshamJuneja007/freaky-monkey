@@ -53,7 +53,14 @@ class RecoveryBudget:
         }
 
     def spend(self, decision: RecoveryDecision) -> bool:
-        """Consume budget for a decision. False if the ceiling is already hit."""
+        """Consume budget for a decision. False if the ceiling is already hit.
+
+        ``ASK_USER`` and ``ABORT`` have no branch here and therefore cost nothing.
+        That omission is the mechanism, not an oversight: a run suspended on a
+        question has not attempted anything, so charging it a retry would let a
+        person's hesitation exhaust the ceiling and turn a decision they are still
+        making into a failure they did not cause.
+        """
         left = self.remaining()
         if decision is RecoveryDecision.RETRY:
             if left["retries"] <= 0:
@@ -94,6 +101,12 @@ _STRATEGY: dict[FailureClass, RecoveryDecision] = {
     FailureClass.VERIFICATION_FAILED: RecoveryDecision.REOBSERVE_THEN_RETRY,
     FailureClass.PERMISSION_DENIED: RecoveryDecision.ASK_USER,
     FailureClass.ENVIRONMENT: RecoveryDecision.ABORT,
+    # Same decision as VERIFICATION_FAILED, different reason: the evidence is
+    # missing rather than negative, so re-reading is what can change the answer.
+    FailureClass.INCONCLUSIVE: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    # Nothing is broken and re-reading cannot help -- the missing input is a
+    # preference -- so the only move that can change the answer is asking.
+    FailureClass.AMBIGUOUS: RecoveryDecision.ASK_USER,
     FailureClass.UNKNOWN: RecoveryDecision.ABORT,
 }
 
@@ -123,8 +136,10 @@ def classify(
     if verification is not None:
         if verification.verdict is Verdict.FAIL:
             return FailureClass.VERIFICATION_FAILED
-        if verification.verdict is Verdict.UNKNOWN:
-            return FailureClass.UNKNOWN
+        # Verification could not tell, but the action ran and reported success,
+        # so there is something concrete to re-read rather than nothing to try.
+        if verification.verdict is Verdict.UNKNOWN and result is not None and result.ok:
+            return FailureClass.INCONCLUSIVE
     return FailureClass.UNKNOWN
 
 
@@ -145,9 +160,15 @@ class Recovery:
         preferred = _STRATEGY.get(failure_class, RecoveryDecision.ABORT)
 
         if preferred is RecoveryDecision.ASK_USER and not self.interactive:
-            return RecoveryDecision.ABORT, "permission denied; no interactive approver"
+            # Two classes route here now -- a denial to approve and an ambiguity to
+            # resolve -- and the reason names which, because "permission denied"
+            # over a suspended app-chooser would misreport why the run stopped.
+            return (RecoveryDecision.ABORT,
+                    f"{failure_class.value} needs a user decision; "
+                    "no interactive approver")
         if preferred is RecoveryDecision.ABORT:
             return preferred, f"{failure_class.value} is not recoverable in V1"
+        # ASK_USER never reaches this line, so no budget is charged for waiting.
         if not self.budget.spend(preferred):
             return RecoveryDecision.ABORT, f"budget exhausted for {preferred.value}"
         return preferred, f"{failure_class.value} -> {preferred.value}"

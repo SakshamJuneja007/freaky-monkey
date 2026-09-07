@@ -27,16 +27,20 @@ true by construction rather than by a code path that happens to exist.
 
 from __future__ import annotations
 from .conversation import ConversationEngine
+from .planner.openai_compat import LLMUnavailable
 
 import re
 import time
 from dataclasses import dataclass, field, replace
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 
 from . import api
-from .api import AgentResult
+from .api import AgentResult, TaskStatus
+from .task import Task
 from .response import (
+    DeimosPresentation,
     Narrator,
     phrase_choice,
     phrase_dropped,
@@ -44,7 +48,6 @@ from .response import (
     phrase_no_location,
     phrase_not_heard,
     phrase_result,
-    phrase_unsupported,
 )
 
 #: Trailing characters a person types or an STT model appends that are never part
@@ -54,11 +57,29 @@ _TRAILING = " \t\r\n.!?,;:'\"`"
 
 _WHITESPACE = re.compile(r"\s+")
 
+
+class IntentCategory(str, Enum):
+    """The one routing decision made before conversation or execution."""
+
+    CONVERSATION = "CONVERSATION"
+    ACTION = "ACTION"
+    FOLLOW_UP_ACTION = "FOLLOW_UP_ACTION"
+    CORRECTION = "CORRECTION"
+    CLARIFICATION_RESPONSE = "CLARIFICATION_RESPONSE"
+    CANCEL = "CANCEL"
+    LOCAL_COMMAND = "LOCAL_COMMAND"
+
 #: Status lines are printed for these trace events and no others. An allowlist,
 #: not a filter, so a new event kind is silent until somebody decides what it
 #: should say -- the failure mode of a denylist here is inventing narration for
 #: an event nobody designed a sentence for.
 STATUS_EVENTS = (
+    "agent_state",
+    "policy_decision",
+)
+
+DEBUG_STATUS_EVENTS = (
+    "agent_state",
     "planner_call",
     "policy_decision",
     "action",
@@ -87,12 +108,25 @@ class UserTask:
     #: ``open_named_file``. Empty for every fixed task, which is why nothing in the
     #: existing flow has to know about it.
     params: dict[str, Any] = field(default_factory=dict)
-    #: "accepted" | "empty" | "unsupported" | "dropped". Distinct causes stay
-    #: distinct; an empty line is not a failed request, and "dropped" -- a line
-    #: that answered a pending question with nothing selectable -- is neither.
+    #: "accepted" | "empty" | "unregistered" | "conversation" | "dropped".
+    #: Distinct causes stay distinct; an empty line is not a failed request, and
+    #: "dropped" -- a line that answered a pending question with nothing
+    #: selectable -- is neither.
+    #:
+    #: "unregistered" is the honest name for what this field can actually know:
+    #: that no registered workflow answers to this sentence. It is a statement
+    #: about the task registry, not about the assistant's reach -- the request
+    #: may still be a general computer action (Route 2) or conversation (Route
+    #: 3), and both are decided after normalization, not here. Whether something
+    #: is genuinely beyond the assistant is a property of a *run*, reported as
+    #: ``TaskStatus.UNSUPPORTED`` on an :class:`~agent_control.api.AgentResult`;
+    #: it is deliberately not spellable as a ``UserTask`` status, because at this
+    #: point nothing has looked.
+    #:
     #: Deliberately not "cancelled": that word is reserved for a *run* that was
     #: interrupted, which is a different event with a different status.
     status: str = "accepted"
+    intent: IntentCategory | None = None
 
     @property
     def accepted(self) -> bool:
@@ -106,6 +140,7 @@ class UserTask:
             "task_id": self.task_id,
             "params": dict(self.params),
             "status": self.status,
+            "intent": self.intent.value if self.intent is not None else None,
             "accepted": self.accepted,
         }
 
@@ -175,6 +210,36 @@ class Turn:
         }
 
 
+@dataclass
+class RecentContext:
+    """Small, typed context derived only from verified successful effects.
+
+    These paths help the next planner resolve phrases such as ``that folder``
+    and ``there``.  They are context, not authority: every resulting action is
+    still resolved and checked by the next run's :class:`Policy`.
+    """
+
+    last_verified_directory: Path | None = None
+    last_verified_file: Path | None = None
+    last_verified_app: str | None = None
+    last_goal: str | None = None
+    recent_action_summary: str | None = None
+
+    def planner_state(self) -> dict[str, str]:
+        state: dict[str, str] = {}
+        if self.last_verified_directory is not None:
+            state["last_verified_directory"] = str(self.last_verified_directory)
+        if self.last_verified_file is not None:
+            state["last_verified_file"] = str(self.last_verified_file)
+        if self.last_verified_app:
+            state["last_verified_app"] = self.last_verified_app
+        if self.last_goal:
+            state["last_goal"] = self.last_goal
+        if self.recent_action_summary:
+            state["recent_action_summary"] = self.recent_action_summary
+        return state
+
+
 def normalize(raw: str, *, source: str = "text") -> UserTask:
     """Turn one line of input -- typed or transcribed -- into a runnable request.
 
@@ -182,13 +247,16 @@ def normalize(raw: str, *, source: str = "text") -> UserTask:
 
     * nothing but whitespace -> ``empty``, and no execution is attempted;
     * resolves to a registered task -> ``accepted``;
-    * anything else -> ``unsupported``.
+    * anything else -> ``unregistered``.
 
-    The last branch is not a stub waiting for a general natural-language
-    front-end. The backend runs registered workflows; a request outside that set
-    is refused by name, with the set listed, rather than being coerced into the
-    nearest task. Guessing would make the interface look general while making the
-    agent act on something the user did not ask for.
+    The last branch says only what was checked: this sentence is not the name of
+    a registered workflow. It is not a verdict that the assistant cannot help,
+    and it is not a stub. :meth:`Session.submit` takes it further -- a structured
+    request shape, a general computer action, or conversation -- and refuses by
+    name only once every one of those has been tried. What normalization must
+    never do is coerce a request into the *nearest* registered task: guessing
+    would make the interface look general while making the agent act on
+    something the user did not ask for.
 
     Normalization stops at whitespace and trailing punctuation. Everything else
     -- case, ``-``/``_``/space equivalence -- is already handled by
@@ -204,7 +272,7 @@ def normalize(raw: str, *, source: str = "text") -> UserTask:
 
     if task_id is None:
         return UserTask(raw=raw or "", text=text, source=source,
-                        status="unsupported")
+                        status="unregistered")
 
     return UserTask(raw=raw or "", text=text, source=source, task_id=task_id)
 
@@ -385,6 +453,159 @@ def choose(pending: Pending, raw: str) -> str | None:
     return None
 
 
+#: Verbs whose presence means the request wants the machine touched, not just
+#: discussed. Matched against the whole lowered sentence rather than only
+#: ``_words`` so multi-word entries ("set up") work the same way single-word
+#: ones do.
+_ACTION_VERBS = (
+    "open", "launch", "start", "run", "execute",
+    "close", "quit", "kill",
+    "create", "make", "build", "generate", "set up", "setup",
+    "write", "edit", "update", "append", "add", "put", "save",
+    "delete", "remove", "move", "copy", "rename",
+    "install", "download", "fetch",
+    "find", "search", "look", "browse", "list", "show",
+    "pick", "choose", "select",
+    # Read-only investigation verbs. Without these, "analyze this project" has
+    # no action verb at all, _requires_computer_action returns False, and the
+    # request is classified CONVERSATION -- routed to the LLM chit-chat engine
+    # instead of GeneralTask, which is a different and worse failure than
+    # picking the wrong target: it never reaches policy, readable_roots, or
+    # the filesystem, so it cannot even ask a grounded clarifying question.
+    "analyze", "analyse", "inspect", "review", "investigate", "examine",
+)
+
+#: Phrasing that marks a request as a question about what to do, not an order
+#: to do it. Checked first and wins over an action verb found elsewhere in the
+#: sentence: "what project should I open" is still a question, even though it
+#: contains "open".
+_DELIBERATIVE_MARKERS = (
+    "what should i", "what do you think", "what would you",
+    "should i", "do you think", "any suggestions", "any ideas",
+    "what project", "what's the best", "what is the best",
+    "how do i feel", "i have no idea", "not sure what",
+    "what did we", "what did you", "what have we", "what are we doing",
+)
+
+
+def _requires_computer_action(text: str) -> bool:
+    """Route 2 vs Route 3: does this sentence ask for something to be *done*,
+    or is it asking to talk about something?
+
+    Conservative and lexical, in the same spirit as :func:`api.parse_request`:
+    a wrong guess in the "call it conversation" direction costs the user one
+    follow-up line. A wrong guess the other way hands a real request to the
+    planner -- still gated by policy, still required to earn a PASS from
+    verification -- but is the worse failure mode for a genuine question,
+    since a question answered by launching an application is a surprise, not
+    a shortcut. Ties therefore go to conversation.
+
+    This is a heuristic, not a natural-language front end: it will misjudge
+    some phrasing, and the asymmetry above is what keeps that failure mode
+    cheap rather than dangerous.
+    """
+    lowered = (text or "").lower()
+
+    if any(marker in lowered for marker in _DELIBERATIVE_MARKERS):
+        return False
+
+    words = set(_words(lowered))
+    return any(
+        (verb in words if " " not in verb else verb in lowered)
+        for verb in _ACTION_VERBS
+    )
+
+
+def _corrects_previous_action(text: str) -> bool:
+    """Whether ``text`` is phrased as a correction to an action just run.
+
+    This is deliberately narrower than general intent inference.  These forms
+    have no standalone object (``it`` / ``instead``), so they are only useful
+    when :class:`Session` can also prove that the immediately preceding turn
+    executed.  That keeps ordinary conversational uses of "call it" out of the
+    action route while ensuring an execution correction never reaches the
+    conversational model.
+    """
+    lowered = _WHITESPACE.sub(" ", (text or "").strip().lower())
+    return (
+        "instead" in lowered
+        and (
+            lowered.startswith("no ")
+            or lowered.startswith("no,")
+            or lowered.startswith("actually ")
+            or "call it " in lowered
+            or "rename it " in lowered
+        )
+    )
+
+
+_LOCAL_COMMANDS = frozenset({"cls", "clear", "/help", "/tasks", "/quit"})
+_CANCEL_WORDS = frozenset({"cancel", "drop", "forget it", "never mind", "nevermind"})
+_CONTEXT_REFERENCES = (
+    "that folder", "that directory", "that file", "there", "put it there",
+    "the one we just created", "the one you just created", "the one we created",
+)
+
+
+def _references_recent_context(text: str, context: RecentContext) -> bool:
+    lowered = _WHITESPACE.sub(" ", (text or "").strip().lower())
+    if any(marker in lowered for marker in _CONTEXT_REFERENCES):
+        return bool(context.last_verified_directory or context.last_verified_file)
+
+    for target in (context.last_verified_directory, context.last_verified_file):
+        if target is not None and target.name.lower() in lowered:
+            return True
+    return False
+
+
+def classify_intent(
+    text: str,
+    *,
+    accepted: bool = False,
+    structured: bool = False,
+    pending: bool = False,
+    previous_executed: bool = False,
+    recent_context: RecentContext | None = None,
+) -> IntentCategory:
+    """Classify a turn deterministically without granting any authority."""
+    lowered = _WHITESPACE.sub(" ", (text or "").strip().lower())
+    if lowered in _LOCAL_COMMANDS:
+        return IntentCategory.LOCAL_COMMAND
+    if lowered in _CANCEL_WORDS:
+        return IntentCategory.CANCEL
+    if previous_executed and _corrects_previous_action(text):
+        return IntentCategory.CORRECTION
+
+    action = accepted or structured or _requires_computer_action(text)
+    if action and recent_context is not None and _references_recent_context(
+        text, recent_context,
+    ):
+        return IntentCategory.FOLLOW_UP_ACTION
+    if pending and not action:
+        return IntentCategory.CLARIFICATION_RESPONSE
+    if action:
+        return IntentCategory.ACTION
+    return IntentCategory.CONVERSATION
+
+
+def _target_name(event: dict[str, Any]) -> str:
+    params = event.get("params") or {}
+    raw = (
+        params.get("path")
+        or params.get("dest")
+        or params.get("venv")
+        or params.get("open_path")
+        or params.get("app")
+        or ""
+    )
+    if not raw:
+        return ""
+    try:
+        return Path(str(raw)).name or str(raw)
+    except (OSError, ValueError):
+        return str(raw)
+
+
 def _status_line(event: dict[str, Any]) -> str:
     """One short line describing a trace event, or ``""`` to stay quiet.
 
@@ -392,7 +613,15 @@ def _status_line(event: dict[str, Any]) -> str:
     control loop. Nothing is timed, predicted, or interpolated between events:
     the display can only lag reality, never invent it.
     """
+    return DeimosPresentation().progress(event)
+
+
+def _debug_status_line(event: dict[str, Any]) -> str:
+    """Detailed developer rendering, including internal mechanics."""
     kind = event.get("event", "")
+
+    if kind == "agent_state":
+        return f"  state: {event.get('state', '?')}"
 
     if kind == "planner_call":
         if event.get("error"):
@@ -436,6 +665,37 @@ def _status_line(event: dict[str, Any]) -> str:
     return ""
 
 
+@dataclass(frozen=True)
+class Prepared:
+    """Everything the one execution call needs, whoever assembled it.
+
+    The two routes that execute -- a registered workflow resolved by name or by
+    request shape, and a general computer action -- differ only in what they
+    have to hand ``run_agent_task``. Naming that difference as a value lets both
+    of them converge on a single call expression in :meth:`Session._run` instead
+    of each keeping its own copy of the call and its result handling, which is
+    the property ``test_there_is_exactly_one_execution_call_site_per_interface``
+    exists to hold.
+
+    ``task_obj`` and ``readable_roots`` are the general-action half and default
+    to the registered route's values, so passing them is unconditional at the
+    call site: ``api.run_agent_task`` reads ``readable_roots`` only in its
+    ``task_obj`` branch and overwrites ``task_id`` from the task there, so
+    neither route can be affected by the other's fields being present.
+    """
+
+    task: UserTask
+    #: The one-line goal to announce. Read off whatever knows it -- the task
+    #: registry for a registered id, the ``GeneralTask`` for a general action.
+    goal: str
+    #: Names the route in the "running ..." line, empty for the registered one.
+    #: Narration only; nothing branches on it.
+    kind: str = ""
+    task_obj: Task | None = None
+    readable_roots: tuple[Path, ...] = ()
+    workspace: Path | None = None
+
+
 @dataclass
 class Session:
     """A live conversation over the one execution pipeline.
@@ -463,6 +723,9 @@ class Session:
     #: Print live status while a task runs. Printed, never spoken: a running
     #: commentary of every action is the narration Directive C rules out.
     show_status: bool = True
+    #: Developer-only presentation. JSON/traces always retain internal ids;
+    #: this flag permits them in the live chat display too.
+    debug: bool = False
     workspace: Path | None = None
     history: list[Turn] = field(default_factory=list)
     #: The one question awaiting an answer, or ``None``. This is not
@@ -470,6 +733,20 @@ class Session:
     #: line, so it cannot outlive the turn immediately after the one that set it,
     #: and :func:`choose` can only ever return a path it already contains.
     pending: Pending | None = None
+    recent_context: RecentContext = field(default_factory=RecentContext)
+    #: General actions in one conversation share one policy write root.  This is
+    #: the authority that makes a verified folder writable on the following
+    #: turn; the remembered path itself grants nothing.
+    _general_workspace: Path | None = field(
+        default=None, repr=False, compare=False,
+    )
+    #: Built lazily on the first Route 3 turn, not eagerly at construction: most
+    #: sessions may never say anything purely conversational, and constructing
+    #: an ``LLMClient`` has a real connection cost that a session which never
+    #: needs it should not pay.
+    _conversation: ConversationEngine | None = field(
+        default=None, repr=False, compare=False,
+    )
 
     @classmethod
     def build(cls, *, speech: bool | None = None,
@@ -544,9 +821,13 @@ class Session:
         rather than of two methods being kept in agreement.
 
         An answer to a pending question takes the same road: it becomes an
-        ordinary accepted :class:`UserTask` and falls into the same execution
-        block below. Nothing about answering a question executes anything by
+        ordinary accepted :class:`UserTask` and is handed to :meth:`_run` like
+        any other. Nothing about answering a question executes anything by
         itself.
+
+        Every route that executes ends in ``self._run(Prepared(...))``. This
+        method never calls ``run_agent_task`` itself, which is what keeps
+        "one execution path" a fact about the code rather than a convention.
         """
         # Take and clear, on the first line and unconditionally. A question
         # therefore cannot survive the turn that follows it, whatever that turn
@@ -570,9 +851,33 @@ class Session:
         # nothing. It must be the *same* parser the resolution step below uses,
         # or a sentence naming a project would be read as an answer to a pending
         # question about a file.
-        fresh = task.accepted or api.parse_request(task.text) is not None
+        parsed = api.parse_request(task.text)
+        previous_executed = bool(self.history) and self.history[-1].executed
+        intent = classify_intent(
+            task.text,
+            accepted=task.accepted,
+            structured=parsed is not None,
+            pending=pending is not None,
+            previous_executed=previous_executed,
+            recent_context=self.recent_context,
+        )
+        task = replace(task, intent=intent)
+        fresh = intent in {
+            IntentCategory.ACTION,
+            IntentCategory.FOLLOW_UP_ACTION,
+            IntentCategory.CORRECTION,
+            IntentCategory.LOCAL_COMMAND,
+        }
 
-        if pending is not None and not fresh:
+        if pending is not None and intent in {
+            IntentCategory.CLARIFICATION_RESPONSE,
+            IntentCategory.CANCEL,
+        }:
+            if intent is IntentCategory.CANCEL:
+                return self._refused(
+                    replace(task, status="dropped"),
+                    phrase_dropped(),
+                )
             answered = self._answer(pending, task, source=source)
 
             if isinstance(answered, Turn):
@@ -580,10 +885,27 @@ class Session:
 
             task = answered
 
+        if intent is IntentCategory.LOCAL_COMMAND:
+            return self._refused(
+                task,
+                "That local command is handled by the chat terminal and was not sent to the planner.",
+            )
+        if intent is IntentCategory.CANCEL and pending is None:
+            return self._refused(task, "There is no pending action to cancel.")
+
         if task.status == "empty":
             return self._refused(task, phrase_empty())
 
-        if task.status == "unsupported":
+        if task.status == "unregistered":
+            # Contextual follow-ups and corrections already have a verified,
+            # policy-rechecked reference.  Let GeneralTask interpret them before
+            # the location index can rewrite or reject the target.
+            if intent in {
+                IntentCategory.FOLLOW_UP_ACTION,
+                IntentCategory.CORRECTION,
+            }:
+                return self._general_action(task)
+
             # ``resolve_request`` covers every request shape the assistant knows
             # -- a named file, a named project folder, and a project to create --
             # so "open my hermes project in vs code", "open main1.mp4" and "set up
@@ -596,11 +918,14 @@ class Session:
             )
 
             if resolved is None:
-                self.narrator.note(
-                    f"No registered workflow matches {task.text!r}.\n"
-                    f"Registered: {', '.join(api.registered_tasks())}"
-                )
-                return self._refused(task, phrase_unsupported())
+                # Neither a registered task id nor one of the structured request
+                # shapes matched. That no longer means refusal by itself: Route 2
+                # (general computer action) and Route 3 (pure conversation) both
+                # live here, and which applies is decided by one lexical question.
+                if intent is IntentCategory.ACTION:
+                    return self._general_action(task)
+
+                return self._converse(task)
 
             if resolved.ambiguous:
                 return self._ask(task, resolved)
@@ -624,33 +949,10 @@ class Session:
                 status="accepted",
             )
 
-        lines: list[str] = []
-        self.narrator.accepted(
-            task.task_id,
-            api.task_goal(task.task_id, **task.params),
-        )
-        self.narrator.note(f"[{task.task_id}] running ...")
-
-        result = api.run_agent_task(
-            task.text,
-            task_id=task.task_id,
-            task_params=task.params,
-            planner=self.planner,
-            max_steps=self.max_steps,
-            keep_workspace=self.keep_workspace,
-            workspace=self.workspace,
-            use_memory=self.use_memory,
-            on_event=self._watcher(lines),
-        )
-
-        for line in result.report_lines():
-            self.narrator.note(line)
-
-        turn = Turn(task=task, reply=phrase_result(result), result=result,
-                    status_lines=lines)
-        self.narrator.reply(turn.reply)
-        self.history.append(turn)
-        return turn
+        return self._run(Prepared(
+            task=task,
+            goal=api.task_goal(task.task_id, **task.params),
+        ))
 
     def submit_capture(self, capture: Capture) -> Turn:
         """Submit a transcript, or report honestly why there is none.
@@ -739,6 +1041,208 @@ class Session:
             ),
         )
 
+    def _general_action(self, task: UserTask) -> Turn:
+        """Route 2: no registered workflow, but the request needs the machine
+        touched. Builds a :class:`~agent_control.general_task.GeneralTask` and
+        runs it through the exact pipeline a registered task uses -- same
+        planner, same policy, same recovery, same verification. Nothing here
+        is a second execution path; it is one more way to reach the existing
+        one.
+        """
+        from .general_task import GeneralTask
+
+        roots = api.general_readable_roots(task.text)
+        general_task = GeneralTask(request=task.text, readable_roots=roots)
+        if self._general_workspace is None:
+            self._general_workspace = (
+                self.workspace.resolve()
+                if self.workspace is not None
+                else api.default_workspace("general").resolve()
+            )
+
+        return self._run(Prepared(
+            task=replace(task, task_id=general_task.task_id, status="accepted"),
+            goal=general_task.goal,
+            kind="general action",
+            task_obj=general_task,
+            readable_roots=roots,
+            workspace=self._general_workspace,
+        ))
+
+    def _run(self, prepared: Prepared) -> Turn:
+        """Execute one prepared request. The only call to
+        :func:`api.run_agent_task` in this module, and the only place a
+        :class:`Turn` with a result is built.
+
+        A failure here is reported, not raised. ``run_agent_task`` already turns
+        an in-run crash into ``UNKNOWN`` (``runner._harness_error``) and a
+        failure to assemble the run into the same, so what is left for this
+        clause is a defect on the path between the two -- and the cost of
+        letting that reach ``main.cmd_chat``, which catches only
+        ``KeyboardInterrupt``, is the whole session rather than the turn. The
+        exception is converted into the result value the rest of this method
+        already knows how to report, with its type and message kept in
+        ``detail``: nothing is discarded, and ``UNKNOWN`` is not success, so a
+        run that died here cannot read as one that worked.
+        """
+        task = prepared.task
+        if self.debug:
+            self.narrator.accepted(task.task_id, prepared.goal, debug=True)
+            aside = f" ({prepared.kind})" if prepared.kind else ""
+            self.narrator.note(f"[{task.task_id}] running{aside} ...")
+        else:
+            self.narrator.reply(
+                self.narrator.presentation.acknowledgement(task.text, prepared.goal)
+            )
+
+        lines: list[str] = []
+
+        try:
+            result = api.run_agent_task(
+                task.text,
+                task_id=task.task_id,
+                task_params=task.params,
+                task_obj=prepared.task_obj,
+                readable_roots=prepared.readable_roots,
+                planner=self.planner,
+                max_steps=self.max_steps,
+                keep_workspace=self.keep_workspace,
+                workspace=(prepared.workspace
+                           if prepared.workspace is not None
+                           else self.workspace),
+                use_memory=self.use_memory,
+                recent_context=self.recent_context.planner_state(),
+                on_event=self._watcher(lines),
+            )
+
+        except Exception as exc:
+            result = AgentResult(
+                request=task.text,
+                task_id=task.task_id,
+                status=TaskStatus.UNKNOWN,
+                detail=f"the run raised {type(exc).__name__}: {exc}",
+            )
+
+        if result.ok:
+            self._update_recent_context(prepared, result)
+
+        if self.debug:
+            for line in result.report_lines():
+                self.narrator.note(line)
+
+        turn = Turn(task=task, reply=self.narrator.presentation.result(result), result=result,
+                    status_lines=lines)
+        self.narrator.reply(turn.reply)
+        self.history.append(turn)
+        return turn
+
+    def _update_recent_context(
+        self,
+        prepared: Prepared,
+        result: AgentResult,
+    ) -> None:
+        """Record references from effects whose final result verified PASS."""
+        from .general_task import GeneralTask
+
+        if isinstance(prepared.task_obj, GeneralTask):
+            for effect in prepared.task_obj.effects():
+                target = Path(effect.target)
+                if effect.kind == "create_dir":
+                    self.recent_context.last_verified_directory = target
+                elif effect.kind in {"write_file", "fetch_file"}:
+                    self.recent_context.last_verified_file = target
+                    self.recent_context.last_verified_directory = target.parent
+                elif effect.kind == "open_file":
+                    if target.is_dir():
+                        self.recent_context.last_verified_directory = target
+                    else:
+                        self.recent_context.last_verified_file = target
+                        self.recent_context.last_verified_directory = target.parent
+                elif effect.kind == "launch_app":
+                    self.recent_context.last_verified_app = effect.target
+                    opened = effect.params.get("open_path")
+                    if isinstance(opened, str) and opened:
+                        opened_path = Path(opened).resolve()
+                        if opened_path.is_dir():
+                            self.recent_context.last_verified_directory = opened_path
+                        else:
+                            self.recent_context.last_verified_file = opened_path
+                            self.recent_context.last_verified_directory = opened_path.parent
+            if prepared.task_obj.effects():
+                effect = prepared.task_obj.effects()[-1]
+                name = Path(effect.target).name or effect.target
+                summaries = {
+                    "create_dir": f"Created folder {name}.",
+                    "write_file": f"Created or updated file {name}.",
+                    "fetch_file": f"Downloaded file {name}.",
+                    "open_file": f"Opened {name}.",
+                    "launch_app": f"Launched {name}.",
+                }
+                self.recent_context.recent_action_summary = summaries.get(
+                    effect.kind, f"Completed the requested action for {name}."
+                )
+        else:
+            path = prepared.task.params.get("path")
+            if isinstance(path, str) and path:
+                resolved = Path(path).resolve()
+                if prepared.task.task_id in {
+                    "setup_python_project", "open_project_in_vscode",
+                }:
+                    self.recent_context.last_verified_directory = resolved
+                elif prepared.task.task_id == "open_named_file":
+                    self.recent_context.last_verified_file = resolved
+                    self.recent_context.last_verified_directory = resolved.parent
+
+            if result.app:
+                self.recent_context.last_verified_app = result.app
+
+            if result.target:
+                verb = "Opened" if prepared.task.task_id != "setup_python_project" else "Set up"
+                self.recent_context.recent_action_summary = f"{verb} {result.target}."
+
+        self.recent_context.last_goal = prepared.goal
+
+        if self.debug:
+            for key, value in self.recent_context.planner_state().items():
+                self.narrator.note(f"  recent_context.{key} = {value}")
+
+    def _converse(self, task: UserTask) -> Turn:
+        """Route 3: pure conversation. ``result`` stays ``None`` unconditionally
+        here, so :attr:`Turn.executed` and :attr:`Turn.ok` read false no matter
+        what the reply says -- this path must never be mistaken for one that
+        ran something.
+
+        The task is restamped ``conversation`` before the turn is recorded. It
+        arrived here as ``unregistered``, which was true of the registry and is
+        no longer the whole story: this request was answered as conversation, on
+        purpose, and a transcript that still called it unregistered would read
+        as a request the assistant failed to place.
+        """
+        try:
+            reply = self._conversation_engine().reply(
+                task.text,
+                history=self.history,
+                recent_context=self.recent_context.planner_state(),
+            )
+        except (LLMUnavailable, RuntimeError) as exc:
+            return self._refused(
+                task,
+                f"I could not reach the conversation model ({exc}), so I have "
+                "nothing to say about that and have not run anything.",
+            )
+
+        turn = Turn(task=replace(task, status="conversation"), reply=reply,
+                    result=None)
+        self.narrator.reply(reply)
+        self.history.append(turn)
+        return turn
+
+    def _conversation_engine(self) -> ConversationEngine:
+        """Build (once) and return this session's :class:`ConversationEngine`."""
+        if self._conversation is None:
+            self._conversation = ConversationEngine.from_env()
+        return self._conversation
+
     def _refused(self, task: UserTask, reply: str) -> Turn:
         """Record a turn that ran nothing. ``result`` stays ``None``."""
         turn = Turn(task=task, reply=reply)
@@ -757,9 +1261,14 @@ class Session:
             return None
 
         def watch(event: dict[str, Any]) -> None:
-            if event.get("event") not in STATUS_EVENTS:
+            allowed = DEBUG_STATUS_EVENTS if self.debug else STATUS_EVENTS
+            if event.get("event") not in allowed:
                 return
-            line = _status_line(event)
+            line = (
+                _debug_status_line(event)
+                if self.debug
+                else self.narrator.presentation.progress(event)
+            )
             if line:
                 lines.append(line)
                 self.narrator.note(line)

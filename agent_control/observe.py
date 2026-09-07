@@ -186,6 +186,55 @@ def accessibility_state(handle: int) -> Observation:
     return _observe(Source.ACCESSIBILITY, f"accessibility_state({handle})", read)
 
 
+#: Titles Windows gives the "How do you want to open this file?" dialog. Matched
+#: as lowercase substrings because the wording carries the file type on some
+#: builds ("How do you want to open this .pdf file?").
+CHOOSER_TITLES = (
+    "how do you want to open",
+    "open with",
+)
+
+
+def chooser_state() -> Observation:
+    """Whether an application-chooser dialog is on screen -- and nothing more.
+
+    Presence is observable: the chooser is an ordinary visible top-level window
+    with a stable title, so the same backend that answers ``window_state`` can
+    say it is there. Its *contents* are not observable. ``accessibility_tree``
+    returns None on the Win32 backend, and no action kind in ``os_tools`` can
+    click a list item, so the applications the dialog is offering can be neither
+    read nor chosen from.
+
+    ``options`` is therefore always ``None``, never ``[]``. The distinction is
+    the whole point: an empty list would read as "the dialog offered nothing",
+    which is a claim about what is on screen; ``None`` says the list could not
+    be read. Callers turning this into a question for the user must leave
+    ``Clarification.options`` empty and name the limit in ``unobservable``
+    rather than invent plausible application names (plan S27).
+    """
+    backend = get_backend()
+
+    def read() -> dict[str, Any]:
+        if not backend.available:
+            raise RuntimeError(f"window backend {backend.name!r} unavailable")
+        found = [
+            w
+            for w in backend.list_windows()
+            if w.visible and any(t in w.title.lower() for t in CHOOSER_TITLES)
+        ]
+        return {
+            "backend": backend.name,
+            "present": bool(found),
+            "count": len(found),
+            "title": found[0].title if found else None,
+            #: Not readable on any current backend -- see the docstring.
+            "options": None,
+            "titles": [w.title for w in found[:5]],
+        }
+
+    return _observe(Source.WINDOW, "chooser_state()", read)
+
+
 # -- python environment ----------------------------------------------------
 def venv_python(venv_dir: str | os.PathLike) -> Path:
     """Interpreter path inside a venv, for the host layout."""
@@ -276,6 +325,55 @@ def package_state(venv_dir: str | os.PathLike, packages: Iterable[str]) -> Obser
         }
 
     return _observe(Source.SHELL, f"package_state({venv_dir},{wanted})", read)
+
+
+def recent_entries(roots: Iterable[str | os.PathLike], *, limit: int = 20) -> Observation:
+    """Immediate children of ``roots``, most-recently-modified first.
+
+    Read-only, one level deep, and confined to exactly the roots the caller
+    passes in -- for the general-task route (plan: general-task routing),
+    that is always ``(policy.workspace, *policy.readable_roots)``, so this
+    reader can never show the planner a path ``resolve_read_path`` would not
+    already let it open. It is a *listing* primitive, not a wider grant.
+
+    A root that does not exist or is not a directory is skipped rather than
+    failing the whole read: ``readable_roots`` may legitimately be empty or
+    point somewhere not yet created, and one missing root should not make
+    every other root's listing come back as UNKNOWN.
+    """
+    root_paths = [Path(root) for root in roots]
+
+    def read() -> dict[str, Any]:
+        found: list[dict[str, Any]] = []
+        for root in root_paths:
+            if not root.exists() or not root.is_dir():
+                continue
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                try:
+                    stat = child.stat()
+                except OSError:
+                    continue
+                found.append(
+                    {
+                        "path": str(child),
+                        "name": child.name,
+                        "is_dir": child.is_dir(),
+                        "mtime": stat.st_mtime,
+                    }
+                )
+        found.sort(key=lambda entry: entry["mtime"], reverse=True)
+        return {
+            "roots": [str(root) for root in root_paths],
+            "count": len(found),
+            "entries": found[:limit],
+        }
+
+    label = ",".join(str(root) for root in root_paths)
+    return _observe(Source.FILESYSTEM, f"recent_entries({label})", read)
 
 
 def summarize(observations: dict[str, Observation]) -> dict[str, Any]:

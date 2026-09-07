@@ -24,7 +24,9 @@ planner has any knowledge that speech exists.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .api import AgentResult, TaskStatus
@@ -187,9 +189,11 @@ def _failure_clause(result: AgentResult) -> str:
     return ""
 
 
-def phrase_accepted(task_id: str, goal: str) -> str:
+def phrase_accepted(task_id: str, goal: str, *, debug: bool = False) -> str:
     """Said once, before execution: what the agent understood."""
-    return f"Understood. Starting {task_id.replace('_', ' ')}: {_shorten(goal)}"
+    if debug:
+        return f"Understood. Starting {task_id.replace('_', ' ')}: {_shorten(goal)}"
+    return f"DEIMOS is understanding your request: {_shorten(goal)}"
 
 
 def phrase_unsupported() -> str:
@@ -365,6 +369,110 @@ def phrase_result(result: AgentResult) -> str:
     return f"Task failed. {failed} did not pass verification.{tail}"
 
 
+@dataclass(frozen=True)
+class PersonaConfig:
+    """Presentation-only settings for DEIMOS.
+
+    These values affect wording and nothing else.  In particular, they are never
+    passed to the planner, Policy, executor, or verifier.
+    """
+
+    name: str = "DEIMOS"
+    address: str = "sir"
+    dry_humor: bool = True
+
+    @classmethod
+    def from_env(cls) -> "PersonaConfig":
+        humor = os.getenv("DEIMOS_DRY_HUMOR", "1").strip().lower()
+        return cls(
+            name=os.getenv("DEIMOS_PERSONA_NAME", "DEIMOS").strip() or "DEIMOS",
+            address=os.getenv("DEIMOS_ADDRESS", "sir").strip(),
+            dry_humor=humor not in {"0", "false", "no", "off"},
+        )
+
+
+@dataclass(frozen=True)
+class DeimosPresentation:
+    """Turn verified runtime facts into one consistent assistant voice."""
+
+    config: PersonaConfig = field(default_factory=PersonaConfig.from_env)
+
+    def acknowledgement(self, request: str, goal: str) -> str:
+        """A pre-execution acknowledgement that never implies completion."""
+        lowered = f"{request} {goal}".lower()
+        address = f", {self.config.address}" if self.config.address else ""
+        destructive = any(
+            word in lowered for word in ("delete", "remove", "erase", "destroy")
+        )
+
+        if destructive:
+            return f"Understood{address}. I'll check the target and policy before acting."
+        if self.config.dry_humor and "python project" in lowered:
+            return (
+                f"Another project{address}. Ambition remains undefeated. "
+                "I'll set it up and verify each required result."
+            )
+        if "folder" in lowered or "directory" in lowered:
+            return f"Understood{address}. I'll handle the folder and verify the result."
+        if "file" in lowered or ".txt" in lowered:
+            return f"Understood{address}. I'll handle the file and verify the result."
+        return f"Understood{address}. I'll handle it and verify the result."
+
+    def result(self, result: AgentResult) -> str:
+        """Render completion only from independently verified success."""
+        if not result.ok:
+            return phrase_result(result)
+
+        address = f", {self.config.address}" if self.config.address else ""
+        did, obj = _DID.get(result.task_id, ""), _object(result)
+        if did and obj:
+            return f"Done{address}. {did} {obj}, and verification passed."
+        return f"Done{address}. The requested change is complete and verification passed."
+
+    def progress(self, event: dict) -> str:
+        """Render only a state transition that the runner actually emitted."""
+        kind = event.get("event", "")
+        if kind == "agent_state":
+            state = str(event.get("state", ""))
+            purpose = str(event.get("purpose", ""))
+            action = str(event.get("action", ""))
+            params = event.get("params") or {}
+            raw_target = (
+                params.get("path") or params.get("dest") or params.get("venv")
+                or params.get("open_path") or params.get("app") or ""
+            )
+            try:
+                target = Path(str(raw_target)).name if raw_target else ""
+            except (OSError, ValueError):
+                target = str(raw_target)
+            named = f' "{target}"' if target else ""
+
+            if state == "OBSERVING" and purpose in {"initial", "precondition"}:
+                return f"{self.config.name} is checking the current workspace ..."
+            if state == "PLANNING":
+                return f"{self.config.name} is planning the next step ..."
+            if state == "ACTING":
+                verbs = {
+                    "create_dir": "creating the folder",
+                    "write_file": "updating the file",
+                    "fetch_file": "downloading",
+                    "open_file": "opening",
+                    "launch_app": "launching",
+                    "create_venv": "creating the environment",
+                    "install_requirements": "installing the requested packages for",
+                    "run_command": "running the requested command for",
+                }
+                verb = verbs.get(action, "performing the requested action on")
+                return f"{self.config.name} is {verb}{named} ..."
+            if state == "VERIFYING":
+                target_text = named or " the result"
+                return f"{self.config.name} is verifying{target_text} ..."
+
+        if kind == "policy_decision" and str(event.get("decision", "")).upper() != "ALLOW":
+            return f"{self.config.name} stopped because policy did not allow that action."
+        return ""
+
+
 @dataclass
 class Narrator:
     """The output layer: prints everything, speaks the few things worth hearing.
@@ -376,6 +484,7 @@ class Narrator:
 
     speaker: Speaker | None = None
     write: Callable[[str], None] = print
+    presentation: DeimosPresentation = field(default_factory=DeimosPresentation)
     #: Sentences handed to speech, in order. Kept for the ``--json`` payload and
     #: for tests that assert what was *not* said.
     spoken: list[str] = field(default_factory=list)
@@ -427,8 +536,8 @@ class Narrator:
         self.speaker.config = replace(self.speaker.config, enabled=bool(enabled))
         return self.speaker.enabled
 
-    def accepted(self, task_id: str, goal: str) -> None:
-        self.say(phrase_accepted(task_id, goal))
+    def accepted(self, task_id: str, goal: str, *, debug: bool = False) -> None:
+        self.say(phrase_accepted(task_id, goal, debug=debug))
 
     def finished(self, result: AgentResult) -> None:
         """The report. Text is the full verdict list; speech is one sentence."""

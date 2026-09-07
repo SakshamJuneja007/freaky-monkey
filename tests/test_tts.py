@@ -116,9 +116,15 @@ def test_a_missing_planner_is_not_reported_as_a_task_failure() -> None:
 def test_a_long_goal_is_shortened_rather_than_read_out() -> None:
     goal = " ".join(f"word{n}" for n in range(60))
     spoken = phrase_accepted("open_last_day_pdf", goal)
-    assert spoken.startswith("Understood. Starting open last day pdf:")
+    assert spoken.startswith("DEIMOS is understanding your request:")
+    assert "open last day pdf" not in spoken
     assert spoken.endswith("and so on")
     assert len(spoken.split()) < 25
+
+
+def test_debug_accepted_message_may_name_the_internal_route() -> None:
+    spoken = phrase_accepted("open_last_day_pdf", "open it", debug=True)
+    assert "open last day pdf" in spoken
 
 
 # -- the layer is off unless asked -------------------------------------------

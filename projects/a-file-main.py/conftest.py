@@ -1,1 +1,0 @@
-import pytest\n\n# Pytest configuration can go here.

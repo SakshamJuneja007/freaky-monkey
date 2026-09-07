@@ -425,3 +425,27 @@ def test_the_prompt_and_the_permissions_block_use_the_same_names(tmp_path) -> No
     for key in ("write_root", "readable_paths"):
         assert key in granted
         assert key in SYSTEM_PROMPT
+
+
+def test_recent_verified_context_reaches_planner_extra_state(
+    captured_run,
+    tmp_path,
+) -> None:
+    folder = (tmp_path / "ws" / "BananaTest987").resolve()
+
+    run_agent_task(
+        "open_last_day_pdf",
+        planner="mock",
+        workspace=tmp_path / "ws",
+        recent_context={
+            "last_verified_directory": str(folder),
+            "last_goal": "create a folder called BananaTest987",
+            "ignored": "must not escape the bounded schema",
+        },
+    )
+
+    context = captured_run["kwargs"]["extra_state"]["recent_context"]
+    assert context["last_verified_directory"] == str(folder)
+    assert context["last_goal"] == "create a folder called BananaTest987"
+    assert "ignored" not in context
+    assert "not permissions" in context["note"]

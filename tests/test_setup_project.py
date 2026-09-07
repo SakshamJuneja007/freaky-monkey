@@ -917,7 +917,8 @@ def test_the_starter_test_can_actually_run(tmp_path: Path):
         (project / relative).write_text(content, encoding="utf-8")
 
     run = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", str(project)],
+        [sys.executable, "-m", "pytest", "-q", "tests"],
+        cwd=project,
         capture_output=True, text=True, timeout=180,
     )
 
