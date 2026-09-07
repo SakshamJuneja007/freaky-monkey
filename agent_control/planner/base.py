@@ -23,11 +23,18 @@ class PlannerStep:
     """One turn of planner output."""
 
     actions: list[Action] = field(default_factory=list)
+
     #: Planner asserts the goal is already achieved. Evidence, not proof.
     done: bool = False
+
     reasoning: str = ""
+
     #: Set when the planner itself failed (bad JSON, API error, refusal).
     error: str | None = None
+
+    #: Action kinds/items proposed by the planner that the runtime cannot execute.
+    #: Kept structured so the runner can explain an empty executable plan.
+    rejected: list[str] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {
@@ -35,6 +42,7 @@ class PlannerStep:
             "done": self.done,
             "reasoning": self.reasoning[:2000],
             "error": self.error,
+            "rejected": list(self.rejected),
         }
 
 
@@ -47,14 +55,25 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
 
-    def add(self, *, prompt: int = 0, completion: int = 0, vision: bool = False) -> None:
+    def add(
+        self,
+        *,
+        prompt: int = 0,
+        completion: int = 0,
+        vision: bool = False,
+    ) -> None:
         self.calls += 1
         self.prompt_tokens += prompt
         self.completion_tokens += completion
+
         if vision:
             self.vision_calls += 1
 
-    def cost_usd(self, price_in_per_m: float, price_out_per_m: float) -> float:
+    def cost_usd(
+        self,
+        price_in_per_m: float,
+        price_out_per_m: float,
+    ) -> float:
         return (
             self.prompt_tokens / 1_000_000 * price_in_per_m
             + self.completion_tokens / 1_000_000 * price_out_per_m
@@ -94,6 +113,12 @@ ALLOWED_ACTION_KINDS: tuple[str, ...] = (
     "write_file",
     "fetch_file",
     "open_file",
+
+    # Read-only inspection actions.
+    "list_directory",
+    "read_text_file",
+    "search_files",
+
     "create_venv",
     "install_requirements",
     "run_command",

@@ -431,6 +431,33 @@ class GeneralTask:
     def effects(self) -> tuple[Effect, ...]:
         """The ledger, for callers that want to describe the run. Read-only."""
         return tuple(self._effects)
+    
+
+    def inspection_only(self) -> bool:
+        """Whether this run performed only known read-only inspection actions.
+
+        Inspection actions intentionally have no entry in ``_EFFECTS`` because
+        they do not change the machine and therefore have no world effect to
+        verify. This classification is separate from verification: it does not
+        turn UNKNOWN into PASS and does not claim that the planner's conclusions
+        are correct.
+
+        False is returned for:
+        * a run with no actions;
+        * a run that attempted any tracked world-changing effect;
+        * a run containing an unknown or non-inspection untracked action.
+        """
+        inspection_kinds = frozenset({
+            "list_directory",
+            "read_text_file",
+            "search_files",
+        })
+
+        return (
+            not self._effects
+            and bool(self._untracked)
+            and set(self._untracked).issubset(inspection_kinds)
+        )
 
     def verify_checkpoint(self, policy: Policy, action: Action,
                           trace: Trace | None = None) -> VerificationResult | None:

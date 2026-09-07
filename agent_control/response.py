@@ -350,9 +350,9 @@ def phrase_result(result: AgentResult) -> str:
         did = "was set up" if result.task_id in _CREATES else "opened"
         if obj:
             return (f"I could not verify that {obj} {did}, so I am not claiming "
-                    "it worked. Check the text output.")
+                    "it worked. The run ended without a verified result.")
         return ("I could not verify the result, so I am not claiming it worked. "
-                "Check the text output.")
+                "The run ended without a verified result.")
 
     tail = (" The planner reported success, but verification disagreed."
             if result.false_success else "")

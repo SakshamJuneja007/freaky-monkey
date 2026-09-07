@@ -305,6 +305,147 @@ def open_file(policy: Policy, action: Action) -> ActionResult:
     )
 
 
+# -- read-only inspection --------------------------------------------------
+
+_MAX_DIRECTORY_ENTRIES = 200
+_MAX_READ_LINES = 500
+_MAX_READ_BYTES = 256 * 1024
+_MAX_SEARCH_RESULTS = 100
+_MAX_SEARCH_FILES = 2_000
+_MAX_SEARCH_FILE_BYTES = 512 * 1024
+_SEARCH_SKIP_DIRS = frozenset({".git", ".venv", "__pycache__", "node_modules"})
+
+
+def _bounded_int(value: Any, *, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(parsed, maximum))
+
+
+@_guard
+def list_directory(policy: Policy, action: Action) -> ActionResult:
+    """Return a bounded, non-recursive listing of a permitted directory."""
+    started = time.time()
+    target = policy.resolve_read_path(action.params["path"])
+    if not target.exists():
+        return _result(action, started, ok=False, error=f"directory does not exist: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    if not target.is_dir():
+        return _result(action, started, ok=False, error=f"path is not a directory: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    limit = _bounded_int(action.params.get("max_entries"), default=_MAX_DIRECTORY_ENTRIES,
+                         minimum=1, maximum=_MAX_DIRECTORY_ENTRIES)
+    entries = []
+    truncated = False
+    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+        # A readable parent must not turn a sensitive child into planner-visible data.
+        try:
+            resolved = policy.resolve_read_path(child)
+        except PolicyDenied:
+            continue
+        if len(entries) >= limit:
+            truncated = True
+            break
+        entries.append({
+            "name": resolved.name,
+            "kind": "directory" if resolved.is_dir() else "file",
+            "suffix": resolved.suffix.lower() if resolved.is_file() else "",
+        })
+    return _result(action, started, ok=True, detail={
+        "path": str(target), "entry_count": len(entries), "entries": entries,
+        "truncated": truncated,
+    })
+
+
+@_guard
+def read_text_file(policy: Policy, action: Action) -> ActionResult:
+    """Read a bounded line window from a permitted text file."""
+    started = time.time()
+    target = policy.resolve_read_path(action.params["path"])
+    if not target.exists():
+        return _result(action, started, ok=False, error=f"file does not exist: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    if not target.is_file():
+        return _result(action, started, ok=False, error=f"path is not a file: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    size = target.stat().st_size
+    if size > _MAX_READ_BYTES:
+        return _result(action, started, ok=False,
+                       error=f"file exceeds read limit ({_MAX_READ_BYTES} bytes): {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED,
+                       detail={"path": str(target), "bytes": size, "max_bytes": _MAX_READ_BYTES})
+    raw = target.read_bytes()
+    if b"\x00" in raw:
+        return _result(action, started, ok=False, error=f"binary file refused: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    try:
+        text = raw.decode("utf-8")
+        encoding = "utf-8"
+    except UnicodeDecodeError:
+        return _result(action, started, ok=False, error=f"non-UTF-8 text file refused: {target}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(target)})
+    lines = text.splitlines()
+    start = _bounded_int(action.params.get("start_line"), default=1, minimum=1, maximum=max(1, len(lines) or 1))
+    limit = _bounded_int(action.params.get("max_lines"), default=300, minimum=1, maximum=_MAX_READ_LINES)
+    window = lines[start - 1:start - 1 + limit]
+    end = start + len(window) - 1 if window else start - 1
+    return _result(action, started, ok=True, detail={
+        "path": str(target), "encoding": encoding, "start_line": start, "end_line": end,
+        "total_lines": len(lines), "truncated": end < len(lines), "content": "\n".join(window),
+    })
+
+
+@_guard
+def search_files(policy: Policy, action: Action) -> ActionResult:
+    """Search bounded UTF-8 text files under a permitted directory."""
+    started = time.time()
+    root = policy.resolve_read_path(action.params["path"])
+    query = action.params.get("query")
+    if not isinstance(query, str) or not query:
+        return _result(action, started, ok=False, error="search_files requires non-empty 'query'",
+                       failure_class=FailureClass.PRECONDITION_FAILED)
+    if not root.exists() or not root.is_dir():
+        return _result(action, started, ok=False, error=f"path is not an existing directory: {root}",
+                       failure_class=FailureClass.PRECONDITION_FAILED, detail={"path": str(root)})
+    max_results = _bounded_int(action.params.get("max_results"), default=20, minimum=1, maximum=_MAX_SEARCH_RESULTS)
+    matches, scanned, truncated = [], 0, False
+    for current, dirs, files in os.walk(root, followlinks=False):
+        dirs[:] = [d for d in dirs if d not in _SEARCH_SKIP_DIRS]
+        for name in sorted(files):
+            if scanned >= _MAX_SEARCH_FILES or len(matches) >= max_results:
+                truncated = True
+                break
+            candidate = Path(current) / name
+            try:
+                target = policy.resolve_read_path(candidate)
+            except PolicyDenied:
+                continue
+            try:
+                if not target.is_file() or target.stat().st_size > _MAX_SEARCH_FILE_BYTES:
+                    continue
+                raw = target.read_bytes()
+                scanned += 1
+                if b"\x00" in raw:
+                    continue
+                text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for line_no, line in enumerate(text.splitlines(), 1):
+                if query in line:
+                    matches.append({"path": str(target), "line": line_no, "text": line[:1000]})
+                    if len(matches) >= max_results:
+                        truncated = True
+                        break
+        if truncated:
+            break
+    return _result(action, started, ok=True, detail={
+        "path": str(root), "query": query, "matches": matches,
+        "match_count": len(matches), "files_scanned": scanned, "truncated": truncated,
+    })
+
+
 # -- shell / environment ---------------------------------------------------
 
 
@@ -599,6 +740,9 @@ DISPATCH: dict[str, Callable[[Policy, Action], ActionResult]] = {
     "write_file": write_file,
     "fetch_file": fetch_file,
     "open_file": open_file,
+    "list_directory": list_directory,
+    "read_text_file": read_text_file,
+    "search_files": search_files,
     "run_command": run_command,
     "create_venv": create_venv,
     "install_requirements": install_requirements,

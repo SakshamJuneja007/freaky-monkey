@@ -327,14 +327,19 @@ class Policy:
             # READ-ONLY ACTIONS
             # ----------------------------------------------------------
 
-            if action.kind == "open_file":
+            if action.kind in {
+                "open_file",
+                "list_directory",
+                "read_text_file",
+                "search_files",
+            }:
 
                 if "path" not in action.params:
                     raise PolicyDenied(
-                        "open_file requires 'path'"
+                        f"{action.kind} requires 'path'"
                     )
 
-                # Opening an existing file is a read operation.
+                # These actions inspect existing data only.
                 self.resolve_read_path(
                     action.params["path"]
                 )
