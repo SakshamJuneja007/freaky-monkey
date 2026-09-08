@@ -12,6 +12,10 @@ outbound-host allowlist.
 Read-only access outside the workspace is possible only through explicitly
 configured readable_roots. This allows benchmark tasks to read existing user
 files, such as a PDF in Downloads, without granting write access there.
+
+Browser navigation is intentionally separate from programmatic network fetching.
+Opening https://youtube.com in Chrome does not grant the runtime permission to
+fetch arbitrary data from youtube.com directly.
 """
 
 from __future__ import annotations
@@ -40,10 +44,15 @@ DEFAULT_ALLOWED_EXECUTABLES = frozenset(
         "pip",
         "code",
         "git",
+         "chrome",
     }
 )
 
-# Hosts the runtime may fetch from over HTTPS.
+
+# Hosts the runtime may fetch from directly over HTTPS.
+#
+# This applies to programmatic network operations such as fetch_file().
+# It does NOT restrict ordinary browser navigation.
 DEFAULT_ALLOWED_HOSTS = frozenset(
     {
         "raw.githubusercontent.com",
@@ -54,6 +63,23 @@ DEFAULT_ALLOWED_HOSTS = frozenset(
     }
 )
 
+
+# Schemes permitted when navigating using a registered browser.
+#
+# Deliberately excludes:
+# - file:
+# - data:
+# - javascript:
+# - chrome:
+# - custom protocols
+ALLOWED_BROWSER_SCHEMES = frozenset(
+    {
+        "http",
+        "https",
+    }
+)
+
+
 # Action kinds that are irreversible or outside the workspace by nature.
 HIGH_IMPACT_KINDS = frozenset(
     {
@@ -63,6 +89,7 @@ HIGH_IMPACT_KINDS = frozenset(
         "set_env_global",
     }
 )
+
 
 # Path fragments that must never be read or written.
 SENSITIVE_FRAGMENTS = (
@@ -77,11 +104,8 @@ SENSITIVE_FRAGMENTS = (
     "id_ed25519",
     ".netrc",
     ".git-credentials",
-    # Added alongside the self-referential-project-analysis grant: once the
-    # repository itself can be a readable_root, its own ".env" (main.py loads
-    # model credentials from ROOT / ".env") sits inside that grant unless it
-    # is refused here too. "secret" and ".pem" are the same gap for the same
-    # reason -- none of the fragments above catches a bare ".env" file.
+
+    # Repository-readable roots must not expose model credentials or secrets.
     ".env",
     "secret",
     ".pem",
@@ -95,11 +119,16 @@ def is_elevated() -> bool:
         try:
             import ctypes
 
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            return bool(
+                ctypes.windll.shell32.IsUserAnAdmin()
+            )
         except Exception:
             return False
 
-    return hasattr(os, "geteuid") and os.geteuid() == 0
+    return (
+        hasattr(os, "geteuid")
+        and os.geteuid() == 0
+    )
 
 
 @dataclass
@@ -108,9 +137,13 @@ class Policy:
 
     workspace: Path
 
-    allowed_executables: frozenset[str] = DEFAULT_ALLOWED_EXECUTABLES
+    allowed_executables: frozenset[str] = (
+        DEFAULT_ALLOWED_EXECUTABLES
+    )
 
-    allowed_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS
+    allowed_hosts: frozenset[str] = (
+        DEFAULT_ALLOWED_HOSTS
+    )
 
     # What to do with actions classified CONFIRM.
     confirm_mode: str = "deny"
@@ -126,14 +159,19 @@ class Policy:
     def __post_init__(self) -> None:
         """Normalize policy paths and enforce startup safety rules."""
 
-        self.workspace = Path(self.workspace).resolve()
+        self.workspace = Path(
+            self.workspace
+        ).resolve()
 
         self.readable_roots = tuple(
             Path(root).resolve()
             for root in self.readable_roots
         )
 
-        if self.refuse_if_elevated and is_elevated():
+        if (
+            self.refuse_if_elevated
+            and is_elevated()
+        ):
             raise PolicyDenied(
                 "Refusing to run with administrator/root privileges "
                 "(plan S10). Start the runtime from an ordinary user shell."
@@ -161,15 +199,22 @@ class Policy:
         candidate = Path(raw)
 
         if not candidate.is_absolute():
-            candidate = self.workspace / candidate
+            candidate = (
+                self.workspace
+                / candidate
+            )
 
         resolved = candidate.resolve()
 
-        self._refuse_sensitive(resolved)
+        self._refuse_sensitive(
+            resolved
+        )
 
-        if not resolved.is_relative_to(self.workspace):
+        if not resolved.is_relative_to(
+            self.workspace
+        ):
             raise PolicyDenied(
-                f"write outside workspace: "
+                "write outside workspace: "
                 f"{resolved} !< {self.workspace}"
             )
 
@@ -190,11 +235,16 @@ class Policy:
         candidate = Path(raw)
 
         if not candidate.is_absolute():
-            candidate = self.workspace / candidate
+            candidate = (
+                self.workspace
+                / candidate
+            )
 
         resolved = candidate.resolve()
 
-        self._refuse_sensitive(resolved)
+        self._refuse_sensitive(
+            resolved
+        )
 
         allowed_roots = (
             self.workspace,
@@ -215,14 +265,16 @@ class Policy:
         self,
         resolved: Path,
     ) -> None:
-        """Reject paths containing known sensitive credential locations."""
+        """
+        Reject paths containing known sensitive credential locations.
+        """
 
         lowered = resolved.as_posix().lower()
 
         for fragment in SENSITIVE_FRAGMENTS:
             if fragment in lowered:
                 raise PolicyDenied(
-                    f"sensitive path refused "
+                    "sensitive path refused "
                     f"(matched {fragment!r}): {resolved}"
                 )
 
@@ -237,7 +289,9 @@ class Policy:
         """Check whether a command executable is allowlisted."""
 
         if not argv:
-            raise PolicyDenied("empty command")
+            raise PolicyDenied(
+                "empty command"
+            )
 
         if any(
             not isinstance(argument, str)
@@ -247,7 +301,9 @@ class Policy:
                 "argv must be a list of strings"
             )
 
-        name = Path(argv[0]).name.lower()
+        name = Path(
+            argv[0]
+        ).name.lower()
 
         for suffix in (
             ".exe",
@@ -255,11 +311,17 @@ class Policy:
             ".bat",
             ".com",
         ):
-            if name.endswith(suffix):
-                name = name[:-len(suffix)]
+            if name.endswith(
+                suffix
+            ):
+                name = name[
+                    :-len(suffix)
+                ]
                 break
 
-        if name not in self.allowed_executables:
+        if name not in (
+            self.allowed_executables
+        ):
             raise PolicyDenied(
                 f"executable not allowlisted: {name!r}"
             )
@@ -268,23 +330,83 @@ class Policy:
         self,
         url: str,
     ) -> str:
-        """Check whether a URL is an allowed HTTPS destination."""
+        """
+        Check whether a URL is an allowed HTTPS destination for
+        programmatic network access.
+        """
 
-        parsed = urlparse(url)
-
-        if parsed.scheme != "https":
+        if (
+            not isinstance(url, str)
+            or not url.strip()
+        ):
             raise PolicyDenied(
-                f"only https fetches allowed, "
+                "URL must be a non-empty string"
+            )
+
+        parsed = urlparse(
+            url
+        )
+
+        if parsed.scheme.lower() != "https":
+            raise PolicyDenied(
+                "only https fetches allowed, "
                 f"got {parsed.scheme!r}"
             )
 
         host = (
-            parsed.hostname or ""
+            parsed.hostname
+            or ""
         ).lower()
 
-        if host not in self.allowed_hosts:
+        if host not in (
+            self.allowed_hosts
+        ):
             raise PolicyDenied(
                 f"host not allowlisted: {host!r}"
+            )
+
+        return url
+
+    def check_browser_url(
+        self,
+        url: str,
+    ) -> str:
+        """
+        Validate a URL intended for browser navigation.
+
+        Browser navigation is deliberately separate from programmatic
+        network fetching. Opening a website in Chrome does not grant the
+        runtime permission to fetch arbitrary data from that host directly.
+        """
+
+        if (
+            not isinstance(url, str)
+            or not url.strip()
+        ):
+            raise PolicyDenied(
+                "browser URL must be a non-empty string"
+            )
+
+        parsed = urlparse(
+            url
+        )
+
+        scheme = (
+            parsed.scheme
+            or ""
+        ).lower()
+
+        if scheme not in (
+            ALLOWED_BROWSER_SCHEMES
+        ):
+            raise PolicyDenied(
+                "browser navigation requires http or https, "
+                f"got {parsed.scheme!r}"
+            )
+
+        if not parsed.hostname:
+            raise PolicyDenied(
+                f"browser URL has no hostname: {url!r}"
             )
 
         return url
@@ -304,8 +426,10 @@ class Policy:
         """
 
         # High-impact actions require explicit policy handling.
-        if action.kind in HIGH_IMPACT_KINDS:
-
+        if (
+            action.kind
+            in HIGH_IMPACT_KINDS
+        ):
             decision = {
                 "deny": Decision.DENY,
                 "ask": Decision.CONFIRM,
@@ -334,12 +458,14 @@ class Policy:
                 "search_files",
             }:
 
-                if "path" not in action.params:
+                if (
+                    "path"
+                    not in action.params
+                ):
                     raise PolicyDenied(
                         f"{action.kind} requires 'path'"
                     )
 
-                # These actions inspect existing data only.
                 self.resolve_read_path(
                     action.params["path"]
                 )
@@ -356,7 +482,10 @@ class Policy:
                     "dir",
                     "venv",
                 ):
-                    if key in action.params:
+                    if (
+                        key
+                        in action.params
+                    ):
                         self.resolve_write_path(
                             action.params[key]
                         )
@@ -365,18 +494,50 @@ class Policy:
             # NETWORK ACCESS
             # ----------------------------------------------------------
 
-            if "url" in action.params:
-                self.check_url(
-                    action.params["url"]
-                )
+            if (
+                "url"
+                in action.params
+            ):
+
+                if (
+                    action.kind
+                    == "launch_app"
+                ):
+
+                    app = (
+                        action.params.get(
+                            "app"
+                        )
+                    )
+
+                    if app == "chrome":
+                        self.check_browser_url(
+                            action.params["url"]
+                        )
+                    else:
+                        raise PolicyDenied(
+                            "URL navigation is only supported "
+                            "for the registered Chrome app, "
+                            f"got {app!r}"
+                        )
+
+                else:
+                    self.check_url(
+                        action.params["url"]
+                    )
 
             # ----------------------------------------------------------
             # PROCESS EXECUTION
             # ----------------------------------------------------------
 
-            if "argv" in action.params:
+            if (
+                "argv"
+                in action.params
+            ):
                 self.check_executable(
-                    list(action.params["argv"])
+                    list(
+                        action.params["argv"]
+                    )
                 )
 
             # ----------------------------------------------------------
@@ -384,13 +545,32 @@ class Policy:
             # ----------------------------------------------------------
 
             if (
-                "app" in action.params
-                and action.kind == "launch_app"
+                action.kind
+                == "launch_app"
             ):
-                # Application validation is handled by os_tools.APP_REGISTRY.
-                pass
+
+                app = (
+                    action.params.get(
+                        "app"
+                    )
+                )
+
+                if (
+                    not isinstance(
+                        app,
+                        str,
+                    )
+                    or not app
+                ):
+                    raise PolicyDenied(
+                        "launch_app requires a non-empty 'app'"
+                    )
+
+                # The registered application itself is validated by
+                # os_tools.APP_REGISTRY during execution.
 
         except PolicyDenied as exc:
+
             return (
                 Decision.DENY,
                 str(exc),
@@ -405,11 +585,18 @@ class Policy:
         self,
         action: Action,
     ) -> None:
-        """Raise PolicyDenied unless the action is explicitly allowed."""
+        """
+        Raise PolicyDenied unless the action is explicitly allowed.
+        """
 
-        decision, reason = self.check(action)
+        decision, reason = self.check(
+            action
+        )
 
-        if decision is not Decision.ALLOW:
+        if (
+            decision
+            is not Decision.ALLOW
+        ):
             raise PolicyDenied(
                 f"{decision.value}: {reason}"
             )
@@ -419,8 +606,13 @@ class Policy:
 # Untrusted data fencing
 # ----------------------------------------------------------------------
 
-_UNTRUSTED_OPEN = "<<<UNTRUSTED_DATA:{label}>>>"
-_UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_DATA:{label}>>>"
+_UNTRUSTED_OPEN = (
+    "<<<UNTRUSTED_DATA:{label}>>>"
+)
+
+_UNTRUSTED_CLOSE = (
+    "<<<END_UNTRUSTED_DATA:{label}>>>"
+)
 
 
 def wrap_untrusted(
@@ -436,17 +628,26 @@ def wrap_untrusted(
     treated as data rather than instructions.
     """
 
-    open_tag = _UNTRUSTED_OPEN.format(
-        label=label,
+    open_tag = (
+        _UNTRUSTED_OPEN.format(
+            label=label,
+        )
     )
 
-    close_tag = _UNTRUSTED_CLOSE.format(
-        label=label,
+    close_tag = (
+        _UNTRUSTED_CLOSE.format(
+            label=label,
+        )
     )
 
-    body = content[:max_chars]
+    body = content[
+        :max_chars
+    ]
 
-    truncated = len(content) > max_chars
+    truncated = (
+        len(content)
+        > max_chars
+    )
 
     body = body.replace(
         open_tag,
