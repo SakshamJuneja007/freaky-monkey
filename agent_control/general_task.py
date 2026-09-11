@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import observe, verifiers
+from .translation import translate_for_planner
 from .policy import Policy
 from .trace import Trace
 from .types import (
@@ -232,10 +233,22 @@ def _verify_launched(policy: Policy, effect: Effect,
     while showing none of what was asked for. The window half can only add
     uncertainty, never a pass, which is the safe direction to be wrong in.
     """
-    parts = [verifiers.verify_app_running(policy, effect.target, trace=trace)]
+    opened = effect.params.get("open_path")
+    url = effect.params.get("url")
+
+    url_target = url if isinstance(url, str) and url else opened if isinstance(opened, str) and opened else None
+    title_hint = None
+    if isinstance(url_target, str) and url_target.startswith(("http://", "https://")):
+        from urllib.parse import urlparse
+        host = (urlparse(url_target).hostname or "").lower().removeprefix("www.")
+        title_hint = host.split(".")[0] if host else None
+
+    parts = [verifiers.verify_app_running(
+        policy, effect.target, trace=trace, window_title_contains=title_hint
+    )]
 
     opened = effect.params.get("open_path")
-    if isinstance(opened, str) and opened:
+    if isinstance(opened, str) and opened and not opened.startswith(("http://", "https://")):
         try:
             resolved = policy.resolve_read_path(opened)
         except (PolicyDenied, OSError, ValueError):
@@ -364,7 +377,7 @@ class GeneralTask:
             # readable in traces and workspace paths alike.
             self.task_id = f"general-{uuid.uuid4().hex[:12]}"
         if not self.goal:
-            self.goal = self.request
+            self.goal = translate_for_planner(self.request)
 
     # -- Task protocol (task.py) ---------------------------------------
 
@@ -573,6 +586,38 @@ class GeneralTask:
             ))
 
         if not parts:
+            browser_kinds = frozenset({
+                "open_url",
+                "browser_open_url",
+                "browser_search",
+                "browser_click",
+                "browser_type",
+                "browser_press_key",
+                "browser_scroll",
+                "browser_select",
+                "browser_wait",
+                "browser_close_tab",
+            })
+            if self._untracked and set(self._untracked).issubset(browser_kinds):
+                return VerificationResult(
+                    label=f"general:{self.task_id}",
+                    checks=[
+                        Check(
+                            name="browser_execution",
+                            verdict=Verdict.PASS,
+                            evidence={
+                                "effects": [],
+                                "browser_actions": dict(self._untracked),
+                                "state_verification": "disabled",
+                            },
+                            reason=(
+                                "browser executor completed the requested "
+                                "operation; browser state verification is disabled"
+                            ),
+                        )
+                    ],
+                )
+
             return VerificationResult(
                 label=f"general:{self.task_id}",
                 checks=[

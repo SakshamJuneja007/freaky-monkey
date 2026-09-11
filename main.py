@@ -848,7 +848,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         max_steps=args.max_steps,
         keep_workspace=args.keep_workspace,
         use_memory=not args.no_memory,
-        show_status=not args.no_status,
+        show_status=bool(getattr(args, "debug", False)) and not args.no_status,
         debug=getattr(args, "debug", False),
     )
 

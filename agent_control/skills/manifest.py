@@ -19,6 +19,7 @@ class SkillManifest:
     capabilities: frozenset[Capability] = field(
         default_factory=frozenset
     )
+    dependencies: tuple[str, ...] = ()
 
     #: Declares that the skill's actions, taken as a whole, can cause an
     #: external effect that a person would want to know happened (sending a
@@ -43,4 +44,5 @@ class SkillManifest:
                 for capability in self.capabilities
             ),
             "side_effecting": self.side_effecting,
+            "dependencies": list(self.dependencies),
         }

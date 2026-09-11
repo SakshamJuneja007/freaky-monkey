@@ -292,6 +292,26 @@ def phrase_not_heard(reason: str) -> str:
     return f"I could not turn that audio into text{named}, so I have not run anything."
 
 
+def _natural_success_reply(result: AgentResult) -> str:
+    """Return a concise, context-aware reply after verified success."""
+    request = " ".join((result.request or "").lower().split())
+    obj = _object(result)
+    if "youtube" in request or "youtu.be" in request:
+        return "YouTube is open. Want music, a search, or are we just wandering the internet today?"
+    if "spotify" in request or "music" in request:
+        return "Your music app is open. What are we listening to?"
+    if "github" in request or "gitlab" in request or "bitbucket" in request:
+        return "Developer territory reached. What are we looking for?"
+    if result.app:
+        name = _APP_NAMES.get(result.app, result.app.replace("_", " ").title())
+        return f"{name} is open and verified. What do you want to do next?"
+    if result.task_id == "open_named_file" and result.target:
+        return f"{Path(result.target).name} is open and verified. What’s next?"
+    if obj:
+        return f"That’s done and verified. {obj} is where it should be."
+    return "That’s done and verified. What’s next?"
+
+
 def phrase_result(result: AgentResult) -> str:
     """One honest sentence about what actually happened.
 
@@ -378,7 +398,7 @@ class PersonaConfig:
     """
 
     name: str = "DEIMOS"
-    address: str = "sir"
+    address: str = ""
     dry_humor: bool = True
 
     @classmethod
@@ -386,7 +406,7 @@ class PersonaConfig:
         humor = os.getenv("DEIMOS_DRY_HUMOR", "1").strip().lower()
         return cls(
             name=os.getenv("DEIMOS_PERSONA_NAME", "DEIMOS").strip() or "DEIMOS",
-            address=os.getenv("DEIMOS_ADDRESS", "sir").strip(),
+            address=os.getenv("DEIMOS_ADDRESS", "").strip(),
             dry_humor=humor not in {"0", "false", "no", "off"},
         )
 
@@ -398,78 +418,65 @@ class DeimosPresentation:
     config: PersonaConfig = field(default_factory=PersonaConfig.from_env)
 
     def acknowledgement(self, request: str, goal: str) -> str:
-        """A pre-execution acknowledgement that never implies completion."""
-        lowered = f"{request} {goal}".lower()
-        address = f", {self.config.address}" if self.config.address else ""
-        destructive = any(
-            word in lowered for word in ("delete", "remove", "erase", "destroy")
-        )
+        """Natural acknowledgement; no emojis and no canned robot script."""
+        text = " ".join((request or goal or "").lower().split())
+        if "youtube" in text or "youtu.be" in text:
+            return "YouTube. On it. Let’s see what you’re after."
+        if "spotify" in text or "music" in text:
+            return "Music? Absolutely. Give me a second."
+        if any(x in text for x in ("http://", "https://", ".com", ".org", ".net")):
+            return "Got it. I’ll open that and make sure it actually showed up."
+        if any(x in text for x in ("open ", "launch ", "start ")):
+            return "Got it. I’ll open it and check that it’s really there."
+        if any(x in text for x in ("create ", "make ", "write ")):
+            return "Sure. I’ll take care of it and check the result."
+        if any(x in text for x in ("delete ", "remove ", "erase ")):
+            return "Alright. I’ll handle that carefully."
+        return "Got it. Let me handle that."
 
-        if destructive:
-            return f"Understood{address}. I'll check the target and policy before acting."
-        if self.config.dry_humor and "python project" in lowered:
-            return (
-                f"Another project{address}. Ambition remains undefeated. "
-                "I'll set it up and verify each required result."
-            )
-        if "folder" in lowered or "directory" in lowered:
-            return f"Understood{address}. I'll handle the folder and verify the result."
-        if "file" in lowered or ".txt" in lowered:
-            return f"Understood{address}. I'll handle the file and verify the result."
-        return f"Understood{address}. I'll handle it and verify the result."
 
     def result(self, result: AgentResult) -> str:
-        """Render completion only from independently verified success."""
-        if not result.ok:
-            return phrase_result(result)
+        """Render one conversational reply from verified runtime facts."""
+        if result.ok:
+            return _natural_success_reply(result)
 
-        address = f", {self.config.address}" if self.config.address else ""
-        did, obj = _DID.get(result.task_id, ""), _object(result)
-        if did and obj:
-            return f"Done{address}. {did} {obj}, and verification passed."
-        return f"Done{address}. The requested change is complete and verification passed."
+        request = " ".join((result.request or "").lower().split())
+        obj = _object(result)
+
+        if result.status is TaskStatus.POLICY_BLOCKED:
+            if obj:
+                return f"Nope — I’m not allowed to do that with {obj}. That one stays behind the velvet rope. "
+            return "Nope — policy blocked that one. Nice try, though. "
+
+        if result.status is TaskStatus.CANCELLED:
+            return "Stopped. Nothing’s being dressed up as finished when it isn’t."
+
+        if result.status is TaskStatus.UNAVAILABLE:
+            return "The planner is offline right now. The brain’s taking a coffee break. "
+
+        if result.status is TaskStatus.UNSUPPORTED:
+            return "I can’t do that one yet. No fake confidence, no magic tricks."
+
+        if result.status is TaskStatus.PARTIAL:
+            if "youtube" in request or "youtu.be" in request:
+                return "YouTube looks like it’s open, but my verification got a little grumpy. I’m not going to pretend that part is perfect."
+            if obj:
+                return f"{obj} looks like it got most of the way there, but I couldn’t fully verify it. I’d rather be honest than do the robot victory dance. "
+            return "That got partway there, but I couldn’t fully verify the result. No victory lap yet. "
+
+        if result.status is TaskStatus.UNKNOWN:
+            return "Something went sideways and I couldn’t verify the result. I’m not calling that a win — and I’m not claiming it worked."
+
+        if obj:
+            return f"Hmm — I couldn’t fully get {obj} into a verified state. Let’s not pretend otherwise."
+        return "Hmm — that didn’t reach a verified result. The task failed verification, so I’m not claiming it worked."
 
     def progress(self, event: dict) -> str:
-        """Render only a state transition that the runner actually emitted."""
-        kind = event.get("event", "")
-        if kind == "agent_state":
-            state = str(event.get("state", ""))
-            purpose = str(event.get("purpose", ""))
-            action = str(event.get("action", ""))
-            params = event.get("params") or {}
-            raw_target = (
-                params.get("path") or params.get("dest") or params.get("venv")
-                or params.get("open_path") or params.get("app") or ""
-            )
-            try:
-                target = Path(str(raw_target)).name if raw_target else ""
-            except (OSError, ValueError):
-                target = str(raw_target)
-            named = f' "{target}"' if target else ""
-
-            if state == "OBSERVING" and purpose in {"initial", "precondition"}:
-                return f"{self.config.name} is checking the current workspace ..."
-            if state == "PLANNING":
-                return f"{self.config.name} is planning the next step ..."
-            if state == "ACTING":
-                verbs = {
-                    "create_dir": "creating the folder",
-                    "write_file": "updating the file",
-                    "fetch_file": "downloading",
-                    "open_file": "opening",
-                    "launch_app": "launching",
-                    "create_venv": "creating the environment",
-                    "install_requirements": "installing the requested packages for",
-                    "run_command": "running the requested command for",
-                }
-                verb = verbs.get(action, "performing the requested action on")
-                return f"{self.config.name} is {verb}{named} ..."
-            if state == "VERIFYING":
-                target_text = named or " the result"
-                return f"{self.config.name} is verifying{target_text} ..."
-
-        if kind == "policy_decision" and str(event.get("decision", "")).upper() != "ALLOW":
-            return f"{self.config.name} stopped because policy did not allow that action."
+        """Keep internal execution chatter out of the normal conversation."""
+        if self.config.dry_humor:
+            kind = event.get("event", "")
+            if kind == "policy_decision" and str(event.get("decision", "")).upper() != "ALLOW":
+                return "That one hit a safety boundary, so I stopped there. "
         return ""
 
 

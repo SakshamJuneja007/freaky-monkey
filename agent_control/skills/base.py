@@ -52,6 +52,7 @@ class SkillInfo:
     manifest: SkillManifest = field(
         default_factory=SkillManifest
     )
+    version: str = "1.0.0"
 
 
 class SkillExecutor(Protocol):
@@ -131,3 +132,4 @@ class Skill(ABC):
     def supports(self, kind: str) -> bool:
         """Return whether this skill supports an action kind."""
         return kind in self.action_kinds
+

@@ -27,9 +27,11 @@ true by construction rather than by a code path that happens to exist.
 
 from __future__ import annotations
 from .conversation import ConversationEngine
+from .conversation_memory import ConversationMemory
 from .planner.openai_compat import LLMUnavailable
 
 import re
+import json
 import time
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -38,6 +40,7 @@ from typing import Any, Callable
 
 from . import api
 from .api import AgentResult, TaskStatus
+from .types import Action
 from .task import Task
 from .response import (
     DeimosPresentation,
@@ -325,6 +328,18 @@ _WORD = re.compile(r"[a-z0-9]+")
 
 
 @dataclass(frozen=True)
+class PendingApproval:
+    request: str
+    action: dict[str, Any]
+    asked_at: float
+    ttl_s: float = 180.0
+
+    @property
+    def expired(self) -> bool:
+        return (time.time() - self.asked_at) > self.ttl_s
+
+
+@dataclass(frozen=True)
 class Pending:
     """One unanswered question, bound to the exact options it offered.
 
@@ -465,7 +480,7 @@ _ACTION_VERBS = (
     "delete", "remove", "move", "copy", "rename",
     "install", "download", "fetch",
     "find", "search", "look", "browse", "list", "show",
-    "pick", "choose", "select",
+    "pick", "choose", "select", "play",
     # Read-only investigation verbs. Without these, "analyze this project" has
     # no action verb at all, _requires_computer_action returns False, and the
     # request is classified CONVERSATION -- routed to the LLM chit-chat engine
@@ -694,6 +709,7 @@ class Prepared:
     task_obj: Task | None = None
     readable_roots: tuple[Path, ...] = ()
     workspace: Path | None = None
+    approved_action: dict[str, Any] | None = None
 
 
 @dataclass
@@ -733,6 +749,7 @@ class Session:
     #: line, so it cannot outlive the turn immediately after the one that set it,
     #: and :func:`choose` can only ever return a path it already contains.
     pending: Pending | None = None
+    pending_approval: PendingApproval | None = None
     recent_context: RecentContext = field(default_factory=RecentContext)
     #: General actions in one conversation share one policy write root.  This is
     #: the authority that makes a verified folder writable on the following
@@ -744,6 +761,9 @@ class Session:
     #: sessions may never say anything purely conversational, and constructing
     #: an ``LLMClient`` has a real connection cost that a session which never
     #: needs it should not pay.
+    _conversation_memory_store: ConversationMemory | None = field(
+        default=None, repr=False, compare=False,
+    )
     _conversation: ConversationEngine | None = field(
         default=None, repr=False, compare=False,
     )
@@ -834,6 +854,29 @@ class Session:
         # turns out to be -- which is what keeps this from becoming context the
         # agent accumulates.
         pending, self.pending = self.pending, None
+        approval, self.pending_approval = self.pending_approval, None
+
+        if approval is not None and approval.expired:
+            approval = None
+
+        normalized_raw = (raw or "").strip().lower()
+        if approval is not None and normalized_raw in {"yes", "y", "approve", "approved", "send it", "do it", "confirm"}:
+            from .skills.messaging.task import ApprovedMessagingTask
+            from .skills.builtin import _BROWSER_BACKEND
+            if _BROWSER_BACKEND is None:
+                return self._refused(UserTask(raw=raw, text=approval.request, source=source, status="dropped"), "The messaging browser is not available, so nothing was sent.")
+            approved_task = ApprovedMessagingTask(
+                Action(kind=str(approval.action["kind"]), params=dict(approval.action.get("params", {}))),
+                __import__("agent_control.skills.messaging", fromlist=["BrowserMessagingBackend"]).BrowserMessagingBackend(_BROWSER_BACKEND),
+            )
+            return self._run(Prepared(
+                task=UserTask(raw=raw, text=approval.request, source=source, task_id=approved_task.task_id, status="accepted"),
+                goal=approved_task.goal, kind="approved messaging action", task_obj=approved_task,
+                readable_roots=(), workspace=self.workspace, approved_action=approval.action,
+            ))
+
+        if approval is not None and normalized_raw in {"no", "n", "cancel", "stop", "never mind", "nevermind"}:
+            return self._refused(UserTask(raw=raw, text=approval.request, source=source, status="dropped"), "Cancelled. Nothing was sent.")
 
         if pending is not None and pending.expired:
             self.narrator.note(
@@ -1090,11 +1133,6 @@ class Session:
             self.narrator.accepted(task.task_id, prepared.goal, debug=True)
             aside = f" ({prepared.kind})" if prepared.kind else ""
             self.narrator.note(f"[{task.task_id}] running{aside} ...")
-        else:
-            self.narrator.reply(
-                self.narrator.presentation.acknowledgement(task.text, prepared.goal)
-            )
-
         lines: list[str] = []
 
         try:
@@ -1104,14 +1142,16 @@ class Session:
                 task_params=task.params,
                 task_obj=prepared.task_obj,
                 readable_roots=prepared.readable_roots,
-                planner=self.planner,
+                planner=("mock" if prepared.approved_action is not None else self.planner),
                 max_steps=self.max_steps,
                 keep_workspace=self.keep_workspace,
                 workspace=(prepared.workspace
                            if prepared.workspace is not None
                            else self.workspace),
                 use_memory=self.use_memory,
+                interactive=True,
                 recent_context=self.recent_context.planner_state(),
+                approved_action=prepared.approved_action,
                 on_event=self._watcher(lines),
             )
 
@@ -1130,10 +1170,22 @@ class Session:
             for line in result.report_lines():
                 self.narrator.note(line)
 
-        turn = Turn(task=task, reply=self.narrator.presentation.result(result), result=result,
+        if result.needs_input and result.question is not None:
+            context = result.question.context or ""
+            if context.startswith("APPROVAL_ACTION:"):
+                try:
+                    action = json.loads(context[len("APPROVAL_ACTION:"):])
+                    if isinstance(action, dict) and isinstance(action.get("kind"), str):
+                        self.pending_approval = PendingApproval(task.text, action, time.time())
+                except Exception:
+                    pass
+
+        reply = self._action_reply(task, result)
+        turn = Turn(task=task, reply=reply, result=result,
                     status_lines=lines)
         self.narrator.reply(turn.reply)
         self.history.append(turn)
+        self._remember_turn(turn)
         return turn
 
     def _update_recent_context(
@@ -1223,6 +1275,7 @@ class Session:
                 task.text,
                 history=self.history,
                 recent_context=self.recent_context.planner_state(),
+                memories=self._conversation_memory().search(task.text, limit=8),
             )
         except (LLMUnavailable, RuntimeError) as exc:
             return self._refused(
@@ -1235,7 +1288,42 @@ class Session:
                     result=None)
         self.narrator.reply(reply)
         self.history.append(turn)
+        self._remember_turn(turn)
         return turn
+
+    def _action_reply(self, task: UserTask, result: AgentResult) -> str:
+        memory = self._conversation_memory()
+        memories = memory.search(task.text, limit=8)
+        context = dict(self.recent_context.planner_state())
+        event = {
+            "request": task.text,
+            "status": result.status.value,
+            "success": result.ok,
+            "task_id": result.task_id,
+            "target": result.target,
+            "app": result.app,
+            "detail": result.detail,
+            "duration_seconds": result.duration_seconds,
+        }
+        try:
+            return self._conversation_engine().action_reply(
+                task.text, event, self.history, context, memories
+            )
+        except (LLMUnavailable, RuntimeError):
+            return self.narrator.presentation.result(result)
+
+    def _conversation_memory(self) -> ConversationMemory:
+        if self._conversation_memory_store is None:
+            self._conversation_memory_store = ConversationMemory.from_env()
+
+        return self._conversation_memory_store
+
+    def _remember_turn(self, turn: Turn) -> None:
+        try:
+            self._conversation_memory().append_turn(turn)
+        except OSError:
+            if self.debug:
+                self.narrator.note("[memory] could not persist conversation turn")
 
     def _conversation_engine(self) -> ConversationEngine:
         """Build (once) and return this session's :class:`ConversationEngine`."""

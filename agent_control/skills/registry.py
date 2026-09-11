@@ -23,11 +23,16 @@ from .gate import is_planner_visible
 from .status import SkillStatus
 
 
+# ``Skill`` is imported only for type checking/validation; concrete skills may
+# still use duck-typed executors and verifiers behind the stable interface.
+from .base import Skill
+
+
 @dataclass
 class SkillRegistry:
     """Registry of installed skills and their security audit state."""
 
-    _skills: dict[str, object] = field(
+    _skills: dict[str, Skill] = field(
         default_factory=dict
     )
 
@@ -35,13 +40,16 @@ class SkillRegistry:
         default_factory=dict
     )
 
-    def register(self, skill: object) -> SkillAuditReport:
+    def register(self, skill: Skill) -> SkillAuditReport:
         """Register and audit a skill.
 
         Registration does not imply planner exposure. Every skill receives a
         deterministic audit report first. The report is stored alongside the
         skill and controls whether the skill may later be exposed to the LLM.
         """
+
+        if not isinstance(skill, Skill):
+            raise TypeError("cannot register a non-Skill object")
 
         info = getattr(skill, "info", None)
 
@@ -71,19 +79,19 @@ class SkillRegistry:
 
         return report
 
-    def unregister(self, name: str) -> object | None:
+    def unregister(self, name: str) -> Skill | None:
         """Remove a skill and its audit report."""
 
         self._reports.pop(name, None)
 
         return self._skills.pop(name, None)
 
-    def find(self, name: str) -> object | None:
+    def find(self, name: str) -> Skill | None:
         """Return a registered skill by name, or ``None`` if absent."""
 
         return self._skills.get(name)
 
-    def get(self, name: str) -> object:
+    def get(self, name: str) -> Skill:
         """Return a registered skill by name.
 
         Unlike :meth:`find`, this strict accessor raises ``KeyError`` when the
@@ -100,7 +108,7 @@ class SkillRegistry:
 
         return tuple(sorted(self._skills))
 
-    def find_for_action(self, kind: str) -> object | None:
+    def find_for_action(self, kind: str) -> Skill | None:
         """Find the sole approved skill capable of executing ``kind``.
 
         Registration alone never makes a skill dispatchable. Only skills whose
@@ -109,7 +117,7 @@ class SkillRegistry:
         ambiguous and fails closed rather than depending on registration order.
         """
 
-        matches: list[object] = []
+        matches: list[Skill] = []
 
         for name, skill in self._skills.items():
             report = self._reports.get(name)
@@ -138,6 +146,20 @@ class SkillRegistry:
 
         return matches[0]
 
+    def resolve(self, kind: str) -> Skill | None:
+        """Resolve an action kind to its approved owning skill."""
+        return self.find_for_action(kind)
+
+    def capabilities(self) -> tuple[str, ...]:
+        """Return capabilities advertised by approved registered skills."""
+        capabilities: set[str] = set()
+        for skill in self.planner_visible():
+            capabilities.update(
+                capability.value
+                for capability in skill.manifest.capabilities
+            )
+        return tuple(sorted(capabilities))
+
     def report(
         self,
         name: str,
@@ -159,7 +181,7 @@ class SkillRegistry:
 
         return report.status
 
-    def all_skills(self) -> tuple[object, ...]:
+    def all_skills(self) -> tuple[Skill, ...]:
         """Return every registered skill.
 
         This is for runtime management and inspection only. It does not imply
@@ -173,10 +195,10 @@ class SkillRegistry:
 
         return tuple(self._reports.values())
 
-    def planner_visible(self) -> tuple[object, ...]:
+    def planner_visible(self) -> tuple[Skill, ...]:
         """Return only skills approved for planner exposure."""
 
-        visible: list[object] = []
+        visible: list[Skill] = []
 
         for name, skill in self._skills.items():
             report = self._reports.get(name)
@@ -189,10 +211,10 @@ class SkillRegistry:
 
         return tuple(visible)
 
-    def restricted(self) -> tuple[object, ...]:
+    def restricted(self) -> tuple[Skill, ...]:
         """Return registered skills hidden from the planner."""
 
-        hidden: list[object] = []
+        hidden: list[Skill] = []
 
         for name, skill in self._skills.items():
             report = self._reports.get(name)
@@ -328,7 +350,7 @@ class SkillRegistry:
 
         return len(self._skills)
 
-    def __iter__(self) -> Iterable[object]:
+    def __iter__(self) -> Iterable[Skill]:
         """Iterate over registered skills."""
 
         return iter(

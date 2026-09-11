@@ -884,6 +884,22 @@ def _permit_and_execute(
         reason,
     )
 
+    if decision is Decision.CONFIRM:
+        if loop.config.interactive:
+            raise NeedUserInput(
+                Clarification(
+                    question=f"Approve {action.kind.replace('_', ' ')}?",
+                    context="APPROVAL_ACTION:" + __import__("json").dumps(action.to_json(), sort_keys=True),
+                    unobservable="the exact external delivery state is not established until the action runs",
+                )
+            )
+        return ActionResult(
+            action=action,
+            ok=False,
+            error=f"policy CONFIRM: {reason}",
+            failure_class=FailureClass.PERMISSION_DENIED,
+        )
+
     if decision is not Decision.ALLOW:
         return ActionResult(
             action=action,

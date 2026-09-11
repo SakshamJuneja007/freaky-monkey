@@ -1,124 +1,129 @@
-# =============================================================================
-
-# Environment variables / secrets
-
-# =============================================================================
-
-.env
-.env.*
-!.env.example
-
-# =============================================================================
-
+@"
+# ================================
 # Python
-
-# =============================================================================
-
-**pycache**/
+# ================================
+__pycache__/
 *.py[cod]
-*$py.class
-
-*.so
-
+*.pyo
+*.pyd
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-
-*.egg-info/
-*.egg
-
-build/
-dist/
-
-# =============================================================================
+.coverage
+htmlcov/
 
 # Virtual environments
-
-# =============================================================================
-
 .venv/
 venv/
 env/
 ENV/
 
-projects/venv/
+# ================================
+# Environment / secrets
+# ================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+credentials/
 
-# =============================================================================
+# ================================
+# DEIMOS runtime state
+# ================================
+agent_memory_space/
 
-# Agent runtime data and memory
+# Keep source code inside agent_memory_space only if explicitly forced
+# Uncomment specific exceptions if you later decide to version them.
 
-# =============================================================================
+# ================================
+# Runtime logs / traces
+# ================================
+*.log
+*.jsonl
+logs/
+runtime_logs/
+runs/
+artifacts/
+results/
 
-.agent_memory/
-.agent_memory.zip
+# ================================
+# Browser / Chromium data
+# ================================
+**/Default/
+**/Cache/
+**/Code Cache/
+**/GPUCache/
+**/ShaderCache/
+**/GrShaderCache/
+**/Crashpad/
+**/IndexedDB/
+**/Local Storage/
+**/Session Storage/
+**/Sessions/
+**/Service Worker/
+**/Storage/
+**/Network/
+**/*Cookies*
+**/*History*
+**/*Login Data*
+**/*Web Data*
+**/*Account Web Data*
+**/*Preferences*
+**/*Secure Preferences*
+**/DevToolsActivePort
+**/Local State
+**/First Run
+**/Last Version
+**/Variations*
+**/*Metrics*
+**/*.pma
 
-.sandbox/
+# ================================
+# Browser automation artifacts
+# ================================
+playwright-report/
+test-results/
+blob-report/
+screenshots/
+videos/
+traces/
 
-# =============================================================================
+# ================================
+# IDE / editors
+# ================================
+.vscode/
+.idea/
+*.code-workspace
 
-# Claude / local AI tool configuration
-
-# =============================================================================
-
-.claude/
-
-# =============================================================================
-
-# Benchmark output
-
-# =============================================================================
-
-benchmark/results/
-
-# =============================================================================
-
-# Local project workspace
-
-# =============================================================================
-
-# Ignore projects created/opened locally by the agent.
-
-# Keep this ignored if these are test/runtime projects rather than source code.
-
-projects/hermes/
-projects/test_project/
-
-# =============================================================================
-
-# OS files
-
-# =============================================================================
-
+# ================================
+# OS junk
+# ================================
 .DS_Store
 Thumbs.db
 desktop.ini
 
-# =============================================================================
-
-# IDE
-
-# =============================================================================
-
-.vscode/
-.idea/
+# ================================
+# Temporary files
+# ================================
+*.tmp
+*.temp
+*.bak
 *.swp
 *.swo
+*~
+@"
 
-# =============================================================================
+# ================================
+# DEIMOS local/runtime state
+# ================================
+.agent_memory/
+.sandbox/
+.claude/
 
-# Logs
-
-# =============================================================================
-
-*.log
-logs/
-
-# =============================================================================
-
-# Coverage
-
-# =============================================================================
-
-.coverage
-htmlcov/
-coverage.xml
+# Local agent state
+*.state
+*.session
+*.lock
+"@ | Add-Content -Encoding UTF8 .gitignore

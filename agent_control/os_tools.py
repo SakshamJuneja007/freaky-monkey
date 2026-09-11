@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -31,7 +32,7 @@ from typing import Any, Callable
 import httpx
 
 from .observe import venv_python
-from .policy import Policy
+from .policy import BLOCKED_APP_EXECUTABLES, Policy
 from .types import Action, ActionResult, FailureClass, PolicyDenied
 
 
@@ -540,12 +541,12 @@ def open_file(
             detail={"path": str(target)},
         )
 
-    if not target.is_file():
+    if not target.is_file() and not target.is_dir():
         return _result(
             action,
             started,
             ok=False,
-            error=f"path is not a file: {target}",
+            error=f"path is not a file or directory: {target}",
             failure_class=FailureClass.PRECONDITION_FAILED,
             detail={"path": str(target)},
         )
@@ -717,12 +718,12 @@ def read_text_file(
             detail={"path": str(target)},
         )
 
-    if not target.is_file():
+    if not target.is_file() and not target.is_dir():
         return _result(
             action,
             started,
             ok=False,
-            error=f"path is not a file: {target}",
+            error=f"path is not a file or directory: {target}",
             failure_class=FailureClass.PRECONDITION_FAILED,
             detail={"path": str(target)},
         )
@@ -1267,79 +1268,143 @@ def install_requirements(
 # ---------------------------------------------------------------------------
 
 
-def resolve_app_executable(
-    app: str,
-) -> Path | None:
-    """
-    Find a registered app's launcher, or None if it is not installed.
-    """
-    spec = APP_REGISTRY.get(app)
+def _normalize_app_name(app: str) -> str:
+    name = " ".join(str(app).strip().split()).lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name
 
-    if not spec:
+
+def _blocked_app_name(app: str) -> bool:
+    normalized = _normalize_app_name(app)
+    return normalized in BLOCKED_APP_EXECUTABLES
+
+
+def _app_aliases(app: str) -> tuple[str, ...]:
+    normalized = _normalize_app_name(app)
+    aliases = {normalized}
+    aliases.update({
+        "vscode" if normalized in {"visual studio code", "vs code"} else normalized,
+        "chrome" if normalized == "google chrome" else normalized,
+        "edge" if normalized in {"microsoft edge", "edge browser"} else normalized,
+        "mspaint" if normalized in {"paint", "microsoft paint"} else normalized,
+        "calc" if normalized == "calculator" else normalized,
+    })
+    return tuple(sorted(aliases))
+
+
+def _registry_app_executable(app: str) -> Path | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
         return None
 
-    windows_candidates = (
-        spec.get(
-            "windows_candidates",
-            [],
-        )
-        if sys.platform == "win32"
-        else []
-    )
+    aliases = _app_aliases(app)
+    roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+    views = (0,)
+    if hasattr(winreg, "KEY_WOW64_64KEY") and hasattr(winreg, "KEY_WOW64_32KEY"):
+        views = (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY)
 
-    for raw in windows_candidates:
-        candidate = Path(
-            os.path.expandvars(raw)
-        )
-
-        if candidate.exists():
-            return candidate
-
-    for name in spec.get(
-        "executables",
-        [],
-    ):
-        found = shutil.which(name)
-
-        if found:
-            return _prefer_real_binary(
-                Path(found),
-                spec,
-            )
-
+    for root in roots:
+        for view in views:
+            for alias in aliases:
+                key_path = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{alias}.exe"
+                try:
+                    with winreg.OpenKey(root, key_path, 0, winreg.KEY_READ | view) as key:
+                        value, _ = winreg.QueryValueEx(key, "")
+                except OSError:
+                    continue
+                candidate = Path(os.path.expandvars(str(value).strip().strip('"')))
+                if candidate.is_file():
+                    return candidate
     return None
 
 
-def _prefer_real_binary(
-    shim: Path,
-    spec: dict[str, Any],
-) -> Path:
-    """
-    Prefer the real executable over a launcher shim when available.
-    """
-    if shim.suffix.lower() not in {
-        ".cmd",
-        ".bat",
-        "",
-    }:
-        return shim
+def _common_windows_candidates(app: str) -> list[Path]:
+    if sys.platform != "win32":
+        return []
+    aliases = _app_aliases(app)
+    roots = [
+        Path(os.environ.get("WINDIR", r"C:\Windows")) / "System32",
+        Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")),
+        Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")),
+        Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))),
+    ]
+    # Direct system executables are common for Notepad/Paint/etc.; installed
+    # application trees are searched only to a bounded depth by name.
+    for alias in aliases:
+        direct = roots[0] / f"{alias}.exe"
+        if direct.is_file():
+            return [direct]
 
-    for relative in spec.get(
-        "real_binary_relative",
-        [],
-    ):
-        candidate = (
-            shim.parent / relative
-        ).resolve()
+    found: list[Path] = []
+    wanted = {alias.replace(" ", "").lower() for alias in aliases}
+    for root in roots[1:]:
+        if not root.is_dir():
+            continue
+        try:
+            for candidate in root.rglob("*.exe"):
+                try:
+                    relative_depth = len(candidate.relative_to(root).parts)
+                except ValueError:
+                    continue
+                if relative_depth > 5:
+                    continue
+                stem = re.sub(r"[^a-z0-9]+", "", candidate.stem.lower())
+                if stem in wanted and candidate.is_file():
+                    found.append(candidate)
+                    if len(found) >= 20:
+                        return found
+        except OSError:
+            continue
+    return found
 
-        if (
-            candidate.exists()
-            and candidate.suffix.lower()
-            == ".exe"
-        ):
-            return candidate
 
-    return shim
+def resolve_app_executable(app: str) -> Path | None:
+    """Resolve a semantic GUI app name without accepting an executable path."""
+    if not isinstance(app, str) or not app.strip() or _blocked_app_name(app):
+        return None
+
+    normalized = _normalize_app_name(app)
+    spec = APP_REGISTRY.get(normalized)
+    if spec:
+        windows_candidates = spec.get("windows_candidates", []) if sys.platform == "win32" else []
+        for raw in windows_candidates:
+            candidate = Path(os.path.expandvars(raw))
+            if candidate.is_file():
+                return candidate
+        for name in spec.get("executables", []):
+            found = shutil.which(name)
+            if found:
+                return Path(found)
+
+    registry_candidate = _registry_app_executable(normalized)
+    if registry_candidate:
+        return registry_candidate
+
+    for candidate in _common_windows_candidates(normalized):
+        return candidate
+
+    # PATH is useful on non-Windows and for portable desktop applications.
+    for alias in _app_aliases(normalized):
+        found = shutil.which(alias) or shutil.which(f"{alias}.exe")
+        if found:
+            return Path(found).resolve()
+    return None
+
+
+def _dynamic_app_spec(app: str, executable: Path) -> dict[str, Any]:
+    process = executable.name
+    display = " ".join(str(app).strip().split())
+    return {
+        "executables": [process],
+        "windows_candidates": [str(executable)],
+        "real_binary_relative": [],
+        "process_names": [process],
+        "window_title_contains": display if len(display) >= 3 else None,
+    }
 
 
 def _chrome_agent_profile(
@@ -1388,20 +1453,15 @@ def launch_app(
 
     app = action.params["app"]
 
-    if app not in APP_REGISTRY:
-        return _result(
-            action,
-            started,
-            ok=False,
-            error=(
-                f"unregistered app {app!r}"
-            ),
-            failure_class=FailureClass.PRECONDITION_FAILED,
-        )
+    if not isinstance(app, str) or not app.strip():
+        return _result(action, started, ok=False, error="launch_app requires a non-empty app name",
+                       failure_class=FailureClass.PRECONDITION_FAILED)
+    if _blocked_app_name(app):
+        return _result(action, started, ok=False,
+                       error=f"shell/interpreter application is blocked: {app!r}",
+                       failure_class=FailureClass.PERMISSION_DENIED)
 
-    executable = resolve_app_executable(
-        app
-    )
+    executable = resolve_app_executable(app)
 
     if executable is None:
         return _result(
@@ -1409,8 +1469,7 @@ def launch_app(
             started,
             ok=False,
             error=(
-                f"{app!r} is not installed "
-                f"on this host"
+                f"could not resolve installed application {app!r} on this host"
             ),
             failure_class=FailureClass.ENVIRONMENT,
             detail={"app": app},
@@ -1418,8 +1477,14 @@ def launch_app(
 
     argv = [str(executable)]
 
-    # Registered applications still pass through executable policy validation.
-    policy.check_executable(argv)
+    # Dynamically resolved GUI applications still pass through the deterministic
+    # application-specific policy gate. This never widens run_command.
+    executable = policy.check_app_executable(executable)
+
+    normalized_app = _normalize_app_name(app)
+    if normalized_app not in APP_REGISTRY:
+        APP_REGISTRY[normalized_app] = _dynamic_app_spec(app, executable)
+        app = normalized_app
 
     if app == "chrome":
         chrome_profile = (
@@ -1437,77 +1502,15 @@ def launch_app(
             ]
         )
 
-    open_path = action.params.get(
-        "open_path"
-    )
-
-    url = action.params.get(
-        "url"
-    )
-
-    # The action must not contain two competing launch targets.
-    if open_path and url:
+    # launch_app is intentionally application-only. File paths and URLs have
+    # their own semantic action kinds so the planner cannot accidentally turn a
+    # target into a different operation.
+    if action.params.get("open_path") or action.params.get("url"):
         return _result(
-            action,
-            started,
-            ok=False,
-            error=(
-                "provide either 'url' or 'open_path', "
-                "not both"
-            ),
+            action, started, ok=False,
+            error="launch_app accepts only an app name; use open_file or open_url for targets",
             failure_class=FailureClass.PRECONDITION_FAILED,
         )
-
-    if url:
-        if app != "chrome":
-            return _result(
-                action,
-                started,
-                ok=False,
-                error=(
-                    f"app {app!r} does not support "
-                    f"URL launching"
-                ),
-                failure_class=FailureClass.PRECONDITION_FAILED,
-            )
-
-        argv.append(
-            policy.check_url(
-                str(url)
-            )
-        )
-
-    elif open_path:
-        target = str(open_path)
-
-        # Backwards compatibility: previous planners may still send URLs in
-        # ``open_path``. Detect HTTP(S) explicitly and keep the target out of
-        # filesystem path resolution.
-        if _is_http_url(target):
-            if app != "chrome":
-                return _result(
-                    action,
-                    started,
-                    ok=False,
-                    error=(
-                        f"app {app!r} does not support "
-                        f"URL launching"
-                    ),
-                    failure_class=FailureClass.PRECONDITION_FAILED,
-                )
-
-            argv.append(
-                policy.check_url(target)
-            )
-
-        else:
-            argv.append(
-                str(
-                    policy.resolve_read_path(
-                        target
-                    )
-                )
-            )
 
     proc = subprocess.Popen(
         argv,
@@ -1544,21 +1547,40 @@ def launch_app(
             _chrome_agent_profile(policy)
         )
 
-    if url:
-        detail["url"] = str(url)
-
-    elif open_path and _is_http_url(str(open_path)):
-        detail["url"] = str(open_path)
-
-    elif open_path:
-        detail["open_path"] = str(open_path)
-
     return _result(
         action,
         started,
         ok=True,
         detail=detail,
     )
+
+
+@_guard
+def open_url(policy: Policy, action: Action) -> ActionResult:
+    """Open an HTTP(S) URL using the user's default browser.
+
+    This is deliberately separate from ``launch_app`` and ``run_command``. The
+    URL is validated as browser navigation, then handed to the platform's URL
+    association without a shell command. Independent verification remains the
+    task-level verifier's responsibility.
+    """
+    started = time.time()
+    url = policy.check_browser_url(str(action.params.get("url", "")))
+
+    if sys.platform == "win32":
+        os.startfile(url)
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, shell=False)
+    else:
+        subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, shell=False)
+
+    settle = _bounded_float(action.params.get("settle_s", 3.0), default=3.0,
+                            minimum=0.0, maximum=_MAX_OPEN_SETTLE_SECONDS)
+    if settle > 0:
+        time.sleep(settle)
+    return _result(action, started, ok=True, detail={"url": url, "settled_s": settle})
 
 
 # Semantic action kind -> executor.
@@ -1580,6 +1602,7 @@ DISPATCH: dict[
     "create_venv": create_venv,
     "install_requirements": install_requirements,
     "launch_app": launch_app,
+    "open_url": open_url,
 }
 
 

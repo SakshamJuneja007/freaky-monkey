@@ -135,6 +135,12 @@ def classify(
 
     if verification is not None:
         if verification.verdict is Verdict.FAIL:
+            if result is not None and result.ok and result.action.kind == "launch_app":
+                target = result.action.params.get("url") or result.action.params.get("open_path")
+                if isinstance(target, str) and target.startswith(("http://", "https://")):
+                    # Never open the same URL again just because browser-title
+                    # evidence was inconclusive. Report honestly instead.
+                    return FailureClass.ENVIRONMENT
             return FailureClass.VERIFICATION_FAILED
         # Verification could not tell, but the action ran and reported success,
         # so there is something concrete to re-read rather than nothing to try.

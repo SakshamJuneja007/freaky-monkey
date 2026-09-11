@@ -109,6 +109,12 @@ class Planner(Protocol):
 #: ``tests/test_planner_contract.py`` so the prompt can never drift from reality.
 ALLOWED_ACTION_KINDS: tuple[str, ...] = (
     "launch_app",
+    "open_url",
+    "whatsapp_send_message",
+    "whatsapp_search_contact",
+    "gmail_send_email",
+    "gmail_search_mail",
+    "gmail_read_mail",
     "create_dir",
     "write_file",
     "fetch_file",

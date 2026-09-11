@@ -448,12 +448,7 @@ def test_status_lines_come_from_emitted_events_only(chat: Session, monkeypatch):
     monkeypatch.setattr(sess.api, "run_agent_task", emitting)
     turn = chat.submit(REGISTERED)
 
-    assert turn.status_lines == [
-        "DEIMOS is checking the current workspace ...",
-        "DEIMOS is planning the next step ...",
-        'DEIMOS is creating the folder "Banana" ...',
-        'DEIMOS is verifying "Banana" ...',
-    ]
+    assert turn.status_lines == []
 
 
 def test_unlisted_events_produce_no_line(chat: Session, monkeypatch):

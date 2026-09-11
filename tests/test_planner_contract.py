@@ -53,7 +53,10 @@ def test_every_executable_action_is_offered_to_the_planner():
 def test_every_offered_action_can_actually_be_executed():
     """The other direction: offering a kind with no dispatch entry would make the
     planner emit actions that are discarded after the model was paid for them."""
-    invented = sorted(set(ALLOWED_ACTION_KINDS) - set(os_tools.DISPATCH))
+    from agent_control.skills.builtin import build_builtin_registry
+    policy = Policy(workspace=Path.cwd() / ".test-workspace", refuse_if_elevated=False)
+    skill_actions = set(build_builtin_registry(policy).action_kinds())
+    invented = sorted(set(ALLOWED_ACTION_KINDS) - (set(os_tools.DISPATCH) | skill_actions))
 
     assert invented == [], f"the planner is offered {invented}, which nothing executes"
 

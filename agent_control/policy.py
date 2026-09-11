@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import os
 import sys
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -44,9 +46,24 @@ DEFAULT_ALLOWED_EXECUTABLES = frozenset(
         "pip",
         "code",
         "git",
-         "chrome",
+        "chrome",
     }
 )
+
+# Launching a named GUI application is a different capability from running an
+# arbitrary command.  Application resolution is allowed to discover an installed
+# executable, but these interpreter/shell families are never valid GUI targets.
+BLOCKED_APP_EXECUTABLES = frozenset({
+    "cmd",
+    "command",
+    "powershell",
+    "pwsh",
+    "bash",
+    "sh",
+    "zsh",
+    "fish",
+    "wsl",
+})
 
 
 # Hosts the runtime may fetch from directly over HTTPS.
@@ -87,6 +104,8 @@ HIGH_IMPACT_KINDS = frozenset(
         "kill_process",
         "run_elevated",
         "set_env_global",
+        "whatsapp_send_message",
+        "gmail_send_email",
     }
 )
 
@@ -155,6 +174,10 @@ class Policy:
     max_download_bytes: int = 2 * 1024 * 1024
 
     refuse_if_elevated: bool = True
+
+    # Exact action fingerprints explicitly approved by the person. This is a
+    # trusted runtime value, never an Action parameter and never supplied by the planner.
+    approved_action_fingerprints: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         """Normalize policy paths and enforce startup safety rules."""
@@ -326,6 +349,25 @@ class Policy:
                 f"executable not allowlisted: {name!r}"
             )
 
+
+    def check_app_executable(self, executable: str | os.PathLike) -> Path:
+        """Validate an executable resolved for a semantic ``launch_app``.
+
+        This deliberately does not reuse ``check_executable``: ``run_command``
+        remains restricted to its small command allowlist, while named GUI apps
+        may be discovered dynamically.  The resolved path must be a real file and
+        must not be a shell/interpreter executable.
+        """
+        path = Path(executable).resolve()
+        if not path.is_file():
+            raise PolicyDenied(f"application executable does not exist: {path}")
+
+        name = path.stem.lower()
+        if name in BLOCKED_APP_EXECUTABLES:
+            raise PolicyDenied(f"shell/interpreter application is blocked: {path.name!r}")
+
+        return path
+
     def check_url(
         self,
         url: str,
@@ -412,6 +454,22 @@ class Policy:
         return url
 
     # ------------------------------------------------------------------
+    # Trusted approval
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def action_fingerprint(action: Action) -> str:
+        payload = {
+            "kind": action.kind,
+            "params": action.params,
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def is_explicitly_approved(self, action: Action) -> bool:
+        return self.action_fingerprint(action) in self.approved_action_fingerprints
+
+    # ------------------------------------------------------------------
     # Action gate
     # ------------------------------------------------------------------
 
@@ -425,11 +483,11 @@ class Policy:
         This method never executes anything.
         """
 
-        # High-impact actions require explicit policy handling.
-        if (
-            action.kind
-            in HIGH_IMPACT_KINDS
-        ):
+        # A previously approved action may proceed only when its complete
+        # semantic fingerprint matches the trusted runtime approval.
+        if action.kind in HIGH_IMPACT_KINDS and self.is_explicitly_approved(action):
+            decision = Decision.ALLOW
+        elif action.kind in HIGH_IMPACT_KINDS:
             decision = {
                 "deny": Decision.DENY,
                 "ask": Decision.CONFIRM,
@@ -458,37 +516,30 @@ class Policy:
                 "search_files",
             }:
 
-                if (
-                    "path"
-                    not in action.params
-                ):
-                    raise PolicyDenied(
-                        f"{action.kind} requires 'path'"
-                    )
+                if "path" not in action.params:
+                    raise PolicyDenied(f"{action.kind} requires 'path'")
+                self.resolve_read_path(action.params["path"])
 
-                self.resolve_read_path(
-                    action.params["path"]
-                )
+            elif action.kind == "open_url":
+                if "url" not in action.params:
+                    raise PolicyDenied("open_url requires 'url'")
+
+            elif action.kind == "launch_app":
+                # launch_app is application-only. In particular, do not feed
+                # legacy open_path/url fields through the write-path branch.
+                if "open_path" in action.params or "url" in action.params:
+                    raise PolicyDenied(
+                        "launch_app accepts only 'app'; use open_file or open_url for targets"
+                    )
 
             # ----------------------------------------------------------
             # WRITE ACTIONS
             # ----------------------------------------------------------
 
             else:
-
-                for key in (
-                    "path",
-                    "dest",
-                    "dir",
-                    "venv",
-                ):
-                    if (
-                        key
-                        in action.params
-                    ):
-                        self.resolve_write_path(
-                            action.params[key]
-                        )
+                for key in ("path", "dest", "dir", "venv"):
+                    if key in action.params:
+                        self.resolve_write_path(action.params[key])
 
             # ----------------------------------------------------------
             # NETWORK ACCESS
@@ -499,32 +550,14 @@ class Policy:
                 in action.params
             ):
 
-                if (
-                    action.kind
-                    == "launch_app"
-                ):
-
-                    app = (
-                        action.params.get(
-                            "app"
-                        )
+                if action.kind == "open_url":
+                    self.check_browser_url(action.params["url"])
+                elif action.kind == "launch_app":
+                    raise PolicyDenied(
+                        "launch_app does not accept URLs; use open_url"
                     )
-
-                    if app == "chrome":
-                        self.check_browser_url(
-                            action.params["url"]
-                        )
-                    else:
-                        raise PolicyDenied(
-                            "URL navigation is only supported "
-                            "for the registered Chrome app, "
-                            f"got {app!r}"
-                        )
-
                 else:
-                    self.check_url(
-                        action.params["url"]
-                    )
+                    self.check_url(action.params["url"])
 
             # ----------------------------------------------------------
             # PROCESS EXECUTION
@@ -566,8 +599,16 @@ class Policy:
                         "launch_app requires a non-empty 'app'"
                     )
 
-                # The registered application itself is validated by
-                # os_tools.APP_REGISTRY during execution.
+                normalized = app.strip().lower()
+                if normalized.endswith(".exe"):
+                    normalized = normalized[:-4]
+                if normalized in BLOCKED_APP_EXECUTABLES:
+                    raise PolicyDenied(
+                        f"shell/interpreter application is blocked: {app!r}"
+                    )
+
+                # The concrete executable is resolved and validated by
+                # os_tools.launch_app through check_app_executable().
 
         except PolicyDenied as exc:
 

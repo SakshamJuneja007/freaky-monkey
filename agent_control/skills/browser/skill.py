@@ -15,12 +15,13 @@ from .actions import (
     BROWSER_ACTION_KINDS,
     BrowserAction,
 )
+from .backend import PlaywrightChromeBackend
 from .executor import (
     BrowserBackend,
     BrowserExecutionResult,
     BrowserExecutor,
 )
-from .verifier import (
+from .browser_verifiers import (
     BrowserVerificationResult,
     BrowserVerifier,
 )
@@ -77,6 +78,12 @@ class BrowserSkill(Skill):
             backend
         )  # type: ignore[arg-type]
 
+    def supports(self, kind: str) -> bool:
+        """Return whether the skill owns a core or browser-specific action."""
+        if kind == "open_url":
+            return True
+        return super().supports(kind)
+
     @property
     def info(self) -> SkillInfo:
         """Return immutable metadata describing the browser skill."""
@@ -117,7 +124,12 @@ class BrowserSkill(Skill):
                 "a string 'kind'"
             )
 
-        if not self.supports(action_kind):
+        # ``open_url`` is the core DEIMOS semantic action. The browser skill
+        # owns that action at runtime while retaining its browser-prefixed
+        # internal action vocabulary for backwards compatibility.
+        if action_kind == "open_url":
+            action_kind = "browser_open_url"
+        elif not self.supports(action_kind):
             raise ValueError(
                 "browser skill does not support "
                 f"{action_kind!r}"

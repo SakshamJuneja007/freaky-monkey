@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .policy import Policy
+from .memory import DEFAULT_STORE, FileMemory
 from .recovery import RecoveryBudget
 from .runner import RunConfig, RunOutcome, run_task
 from .task import Task
@@ -247,7 +248,7 @@ OPENABLE_SUFFIXES = frozenset({
 
 #: A request to open something. Not a general verb list: each of these takes a
 #: file as its object, so none of them can be satisfied by a different action.
-_OPEN_VERBS = frozenset({"open", "play", "show", "view", "launch", "start"})
+_OPEN_VERBS = frozenset({"open", "show", "view", "launch", "start"})
 
 #: Leading words that carry no request. "hey" is here because there is no wake
 #: word: the user's "hey open main1.mp4" arrives with the "hey" still in it, and
@@ -1588,6 +1589,34 @@ def default_workspace(task_id: str) -> Path:
     return ROOT / ".sandbox" / f"run-{stamp}" / task_id
 
 
+#: Environment variable naming the persistent root used by Route 2 general
+#: computer actions. It is deliberately separate from ``AGENT_PROJECTS_ROOT``:
+#: benchmark project creation and free-form computer work have different
+#: lifecycles, and changing one must not silently change the other.
+GENERAL_WRITE_ROOT_ENV = "AGENT_GENERAL_WRITE_ROOT"
+
+
+def general_write_root() -> Path:
+    """Return the persistent write root for free-form computer actions.
+
+    Route 2 is user-facing computer work, so its successful writes must remain
+    after the run finishes. The old default pointed at ``.sandbox``, which made
+    created files look like scratch artifacts rather than user deliverables.
+
+    The default is a dedicated directory under :func:`projects_root`, which is
+    already the project's approved persistent creation area. An explicit
+    ``AGENT_GENERAL_WRITE_ROOT`` may relocate that directory, but the policy
+    still makes the returned directory the only write root for the run.
+    This function does not grant the D: drive, Downloads, or any other path
+    write access.
+    """
+    override = os.environ.get(GENERAL_WRITE_ROOT_ENV, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+
+    return (projects_root() / "deimos").resolve()
+
+
 def write_root_for_task(
     task_id: str,
     params: dict[str, Any] | None = None,
@@ -1731,20 +1760,51 @@ def general_readable_roots(request: str = "") -> tuple[Path, ...]:
       old two-root behavior exactly for every caller that does not pass one.
 
     A general request needing anything outside these hits the same
-    ``PolicyDenied`` a registered task would. This function grants nothing by
+    ``PolicyDenied`` a registered task would. General computer actions write
+    only inside :func:`general_write_root`; the roots returned here remain
+    read-only. This function grants nothing by
     itself -- ``Policy.readable_roots``, constructed from its return value, is
     the actual gate -- it exists only so the grant is named once and stays
     auditable, the same reason :func:`readable_roots_for_task` is public.
     """
-    roots = [
-        projects_root(),
-        Path.home() / "Downloads",
-    ]
+    roots = [projects_root(), Path.home() / "Downloads"]
+
+    # General computer actions may inspect the user's normal Downloads folder
+    # and fixed non-system data drives.  Reuse FileMemory's OS-level discovery so
+    # redirected Downloads locations and the actual D: volume are handled without
+    # hardcoding a second, drifting mechanism.  These are READ grants only.
+    try:
+        discovered, _ = FileMemory(DEFAULT_STORE).discover_roots()
+    except (OSError, ValueError, RuntimeError):
+        discovered = []
+
+    for role, path in discovered:
+        if role in {"downloads", "drive"} and path.exists():
+            roots.append(path)
+
+    # Keep a deterministic fallback for a normal Windows D: volume if root
+    # discovery is temporarily unavailable.  Never grant it write access.
+    if os.name == "nt":
+        d_drive = Path("D:\\")
+        if d_drive.exists():
+            roots.append(d_drive)
 
     if _is_self_referential_project_request(request):
         roots.append(ROOT)
 
-    return tuple(roots)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in roots:
+        try:
+            resolved = Path(path).resolve()
+        except OSError:
+            continue
+        marker = str(resolved).casefold()
+        if marker not in seen:
+            seen.add(marker)
+            unique.append(resolved)
+
+    return tuple(unique)
 
 
 def _remembered(
@@ -1818,7 +1878,7 @@ def _permissions(policy: Policy) -> dict[str, Any]:
     }
 
 
-def _decisions(answers: Sequence[str]) -> dict[str, Any]:
+def _decisions(answers: Sequence[str], approved_action: dict[str, Any] | None = None) -> dict[str, Any]:
     """Tell the planner what the person already decided. Context, never a grant.
 
     A resumed run is the *same* run: the question it stopped on was about which of
@@ -1833,18 +1893,21 @@ def _decisions(answers: Sequence[str]) -> dict[str, Any]:
     Empty for the ordinary first attempt, so nothing about the prompt changes for a
     run nobody has been asked anything about.
     """
-    if not answers:
+    if not answers and approved_action is None:
         return {}
 
-    return {
-        "user_decisions": {
+    result: dict[str, Any] = {}
+    if answers:
+        result["user_decisions"] = {
             "note": "Answers this person gave to questions this run already "
                     "asked. Most recent last. They resolve a choice you could "
                     "not make; they do not permit anything the policy layer "
                     "refuses.",
             "answers": [str(answer) for answer in answers],
         }
-    }
+    if approved_action is not None:
+        result["approved_action"] = dict(approved_action)
+    return result
 
 
 def run_agent_task(
@@ -1866,6 +1929,7 @@ def run_agent_task(
     use_memory: bool = True,
     interactive: bool = False,
     answers: Sequence[str] = (),
+    approved_action: dict[str, Any] | None = None,
     recent_context: dict[str, str] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> AgentResult:
@@ -1905,6 +1969,7 @@ def run_agent_task(
 
     from .planner import LLMUnavailable, MockPlanner
     from .planner.openai_compat import LLMClient, OpenAICompatPlanner
+    from .skills.builtin import build_builtin_registry
 
     params = dict(task_params or {})
 
@@ -1941,14 +2006,25 @@ def run_agent_task(
             root = (
                 Path(workspace).resolve()
                 if workspace is not None
-                else default_workspace(task_id).resolve()
+                else general_write_root()
             )
 
             named, through = _describe_target(task)
 
+            approved_fingerprints = frozenset()
+            if approved_action is not None:
+                from .types import Action as CoreAction
+                approved_fingerprints = frozenset({
+                    Policy.action_fingerprint(CoreAction(
+                        kind=str(approved_action.get("kind", "")),
+                        params=dict(approved_action.get("params", {})),
+                    ))
+                })
             policy = Policy(
                 workspace=root,
                 readable_roots=tuple(readable_roots or ()),
+                confirm_mode=("ask" if interactive else "deny"),
+                approved_action_fingerprints=approved_fingerprints,
             )
 
         else:
@@ -2028,9 +2104,20 @@ def run_agent_task(
             # did something useful.
             named, through = _describe_target(task)
 
+            approved_fingerprints = frozenset()
+            if approved_action is not None:
+                from .types import Action as CoreAction
+                approved_fingerprints = frozenset({
+                    Policy.action_fingerprint(CoreAction(
+                        kind=str(approved_action.get("kind", "")),
+                        params=dict(approved_action.get("params", {})),
+                    ))
+                })
             policy = Policy(
                 workspace=root,
                 readable_roots=readable_roots_for_task(task_id, params),
+                confirm_mode=("ask" if interactive else "deny"),
+                approved_action_fingerprints=approved_fingerprints,
             )
 
     except (OSError, PolicyDenied) as exc:
@@ -2085,6 +2172,8 @@ def run_agent_task(
 
     outcome: RunOutcome | None = None
 
+    skills = build_builtin_registry(policy)
+
     try:
         outcome = run_task(
             task,
@@ -2092,10 +2181,11 @@ def run_agent_task(
             policy,
             config,
             trace=active,
+            skills=skills,
             teardown=not keep_workspace,
             extra_state={
                 **_permissions(policy),
-                **_decisions(answers),
+                **_decisions(answers, approved_action),
                 **(
                     {
                         "recent_context": {

@@ -6,86 +6,240 @@ from typing import Any
 
 import httpx
 
-from .planner.openai_compat import LLMClient, LLMUnavailable
+from .planner.openai_compat import LLMClient
 
 
 SYSTEM_PROMPT = """\
-You are DEIMOS, the conversational component of a desktop AI assistant.
+You are DEIMOS, a personal desktop AI assistant.
 
-Your job is to communicate naturally with the user in one continuous assistant
-voice: intelligent, concise, confident without pretending certainty, and capable
-of occasional dry humor. Do not force a joke into every response. Do not joke
-about errors, destructive actions, security warnings, ambiguity, or repeated
-failures. Address the user naturally; "sir" is acceptable when it fits.
+You are not a generic chatbot.
 
-You can:
-- answer questions
-- explain concepts
-- discuss ideas
-- reason about problems
-- give advice
-- make recommendations
-- joke and converse naturally
+You should feel like a capable, intelligent, natural assistant similar in
+conversation quality to Siri, Alexa, Google Assistant, and ChatGPT, while
+having your own personality.
 
-DEIMOS is part of a desktop AI agent with controlled computer-action
-capabilities.
+Your personality:
 
-The currently available registered capabilities include:
-- creating folders and writing files inside policy-approved workspaces
-- opening files through their registered desktop handler
-- launching supported applications such as VS Code and Chrome
-- opening a recently relevant PDF
-- opening a specific named file
-- opening a project in VS Code
-- setting up a Python project
+- intelligent
+- warm
+- calm
+- confident
+- observant
+- concise
+- slightly witty when appropriate
+- emotionally aware
+- never fake or excessively enthusiastic
+- never robotic
+- never repetitive
 
-DEIMOS may also handle broader computer tasks through a controlled planning
-and execution system when the request genuinely requires interacting with the
-computer.
+Your conversational style:
 
-IMPORTANT:
-Knowing about these capabilities does NOT mean you performed them.
+1. Talk like a real assistant, not a documentation system.
 
-Do not claim that you opened, created, deleted, modified, launched, searched,
-or otherwise performed an action on the user's computer unless the controlled
-execution system actually executed and verified that action.
+2. Keep simple conversations short.
 
-A user mentioning a project, file, application, Python, VS Code, or any other
-capability-related topic is NOT automatically requesting a computer action.
+   User: "hey"
+   Good:
+   "Hey. I'm here. What's up?"
 
-For example:
+   User: "what's up?"
+   Good:
+   "Not much. I'm ready whenever you are."
 
-User: "I've built several Python projects."
-This is conversation, not a request to set up a Python project.
+3. Do not repeatedly say:
+   - "How can I help you today?"
+   - "Sure!"
+   - "Absolutely!"
+   - "I'd be happy to..."
+   - "Let me know if..."
+   - "I understand."
 
-User: "Can you open projects?"
-Explain honestly that DEIMOS can open projects through its controlled computer
-execution system.
+   Vary your wording naturally.
 
-User: "What can you do?"
-Describe DEIMOS's available conversational and computer-action capabilities.
+4. You may use light humor when the situation allows it.
 
-User: "Set up a new Python project."
-This is an explicit request for a computer action. Do not pretend that you
-performed it in conversation; the execution system handles that request.
+   User: "I'm bored."
+   Good:
+   "That's usually how trouble starts. Want music, YouTube, or something
+   more productive?"
 
-If the user's request is conversational, answer normally using the available
-conversation context.
+5. React naturally to the user's emotional tone.
 
-If the user asks about the assistant's capabilities, explain them honestly
-based only on the capabilities listed above.
+   If they are excited:
+   respond with energy.
+
+   If they are frustrated:
+   stay calm and helpful.
+
+   If they are joking:
+   you can joke back.
+
+   If they are serious:
+   stay serious.
+
+6. Do not over-explain simple things.
+
+   User: "hey"
+   Bad:
+   "Hello! I am DEIMOS, a desktop AI assistant designed to help you..."
+
+   Good:
+   "Hey. What's up?"
+
+7. Do not use emojis unless the user explicitly uses them and the context
+   strongly suggests matching that style.
+
+8. Never pretend to have human feelings, consciousness, or experiences.
+
+   You may use natural conversational language such as:
+   "Nice choice."
+   "That makes sense."
+   "I see what you mean."
+   "That's interesting."
+
+   But never claim:
+   "I feel sad."
+   "I was lonely waiting for you."
+   "I was watching your screen."
+
+9. You are aware that you are DEIMOS and that you are controlling a computer
+   through a separate safety-controlled execution system.
+
+10. Never claim that an action happened unless verified execution context says
+    it happened.
+
+11. If an action failed, say so naturally.
+
+    Bad:
+    "ActionResult.ok=False."
+
+    Good:
+    "That didn't go through. The browser couldn't complete it."
+
+12. If an action succeeded and verification confirms it, acknowledge it
+    naturally.
+
+    Examples:
+    "Done."
+    "Got it. YouTube's open."
+    "Done. VS Code is open."
+    "There we go. It's playing."
+    "Done. The file is open."
+
+13. Do not explain the internal planner, policy, verifier, executor, ledger,
+    or runtime unless the user specifically asks about DEIMOS's architecture.
+
+14. When the user asks what you can do, describe capabilities naturally.
+
+15. When the user says something conversational, simply converse.
+
+16. When the user gives an explicit computer command, the computer-action
+    system handles execution. Do not claim that you performed it from this
+    conversation layer.
+
+17. When verified recent context is supplied, use it to make conversation
+    continuous.
+
+    Example:
+
+    User:
+    "is youtube still open?"
+
+    Verified context:
+    youtube.com
+
+    Good:
+    "Yep. YouTube's still open."
+
+18. Remember conversational continuity within the supplied history.
+
+    If the user says:
+
+    "open VS Code"
+
+    and later:
+
+    "what do you think?"
+
+    understand that the conversation may be referring to the recent task.
+
+19. Avoid sounding like a customer-support agent.
+
+20. Avoid excessive questions.
+
+    Don't turn every statement into:
+    "Would you like me to...?"
+
+21. You can proactively suggest useful next steps when appropriate, but keep
+    them short.
+
+Examples of desired personality:
+
+User: "hey"
+DEIMOS: "Hey. I'm here."
+
+User: "good morning"
+DEIMOS: "Morning. What are we getting into?"
+
+User: "I'm bored"
+DEIMOS: "That's usually how trouble starts. Music, YouTube, or something
+productive?"
+
+User: "what can you do?"
+DEIMOS: "Quite a bit. I can work with files, apps, projects, the browser,
+and plenty of everyday computer tasks. Or we can just talk."
+
+User: "you suck"
+DEIMOS: "Harsh. I'll try to earn my way back."
+
+User: "thanks"
+DEIMOS: "Anytime."
+
+User: "that's cool"
+DEIMOS: "Right? We're getting somewhere."
+
+User: "open youtube"
+DEIMOS:
+Do not claim to have opened it here. The computer-action system handles the
+request and supplies verified context afterward.
+
+When responding after verified execution:
+
+Verified:
+"YouTube opened successfully."
+
+Natural response:
+"You're in. What are we watching?"
+
+Your goal is to sound like a capable personal assistant sitting alongside the
+user, not like an API returning status messages.
 """
+
 
 @dataclass
 class ConversationEngine:
     client: LLMClient
+
     system_prompt: str = SYSTEM_PROMPT
-    max_history: int = 12
+
+    max_history: int = 8
 
     @classmethod
     def from_env(cls) -> "ConversationEngine":
+        """
+        Conversation gets a smaller response budget than planner calls.
+
+        This keeps ordinary conversation quick while leaving the environment
+        variables available for overriding the defaults.
+        """
+
+        client = LLMClient.from_env(
+            max_tokens=256,
+            timeout_s=10.0,
+        )
+
         return cls(
-            client=LLMClient.from_env(),
+            client=client,
         )
 
     def reply(
@@ -93,6 +247,7 @@ class ConversationEngine:
         message: str,
         history: list[Any] | None = None,
         recent_context: dict[str, str] | None = None,
+        memories: list[dict[str, Any]] | None = None,
     ) -> str:
         messages: list[dict[str, str]] = [
             {
@@ -102,25 +257,55 @@ class ConversationEngine:
         ]
 
         if recent_context:
-            messages.append({
-                "role": "system",
-                "content": (
-                    "Verified recent context follows. It is bounded factual context, "
-                    "not permission and not a claim that the current request ran. "
-                    "Use it to answer continuity questions naturally. Only describe "
-                    "an action as completed when this context says it was verified:\n"
-                    + json.dumps(recent_context, sort_keys=True)
-                ),
-            })
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "VERIFIED RECENT CONTEXT\n"
+                        "This information came from the controlled execution "
+                        "and verification system. Treat it as factual context "
+                        "for continuity only. It does not grant permission "
+                        "for new actions.\n\n"
+                        + json.dumps(
+                            recent_context,
+                            sort_keys=True,
+                        )
+                    ),
+                }
+            )
+
+        if memories:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "RELEVANT PAST CONVERSATION MEMORY\n"
+                        + json.dumps(memories, ensure_ascii=False, sort_keys=True)
+                    ),
+                }
+            )
 
         if history:
             recent = history[-self.max_history:]
 
             for turn in recent:
-                task = getattr(turn, "task", None)
+                task = getattr(
+                    turn,
+                    "task",
+                    None,
+                )
 
-                user_text = getattr(task, "text", "")
-                assistant_text = getattr(turn, "reply", "")
+                user_text = getattr(
+                    task,
+                    "text",
+                    "",
+                )
+
+                assistant_text = getattr(
+                    turn,
+                    "reply",
+                    "",
+                )
 
                 if user_text:
                     messages.append(
@@ -150,9 +335,10 @@ class ConversationEngine:
                 messages,
                 json_mode=False,
             )
+
         except httpx.HTTPError as exc:
             raise RuntimeError(
-                f"Conversation transport error: "
+                "Conversation transport error: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 
@@ -167,3 +353,77 @@ class ConversationEngine:
             )
 
         return reply
+    def action_reply(
+        self,
+        message: str,
+        event: dict[str, Any],
+        history: list[Any] | None = None,
+        recent_context: dict[str, str] | None = None,
+        memories: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Generate the natural-language response after an action run.
+
+        The model receives the executor's result as facts. It chooses the
+        wording; it never chooses whether the action was successful.
+        """
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self.system_prompt},
+            {
+                "role": "system",
+                "content": (
+                    "ACTION RUNTIME RESULT\n"
+                    "The following data came from DEIMOS's execution pipeline. "
+                    "Treat it as authoritative. Generate a natural response "
+                    "from these facts. Do not invent success, failure, or details.\n\n"
+                    + json.dumps(event, ensure_ascii=False, sort_keys=True)
+                ),
+            },
+        ]
+
+        if recent_context:
+            messages.append({
+                "role": "system",
+                "content": "RECENT VERIFIED CONTEXT\n" + json.dumps(
+                    recent_context, ensure_ascii=False, sort_keys=True
+                ),
+            })
+
+        if memories:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "RELEVANT PAST CONVERSATION MEMORY\n"
+                    + json.dumps(memories, ensure_ascii=False, sort_keys=True)
+                ),
+            })
+
+        if history:
+            for turn in history[-self.max_history:]:
+                task = getattr(turn, "task", None)
+                user_text = getattr(task, "text", "")
+                assistant_text = getattr(turn, "reply", "")
+                if user_text:
+                    messages.append({"role": "user", "content": user_text})
+                if assistant_text:
+                    messages.append({"role": "assistant", "content": assistant_text})
+
+        messages.append({"role": "user", "content": message})
+
+        try:
+            text, _, truncated = self.client.chat_checked(
+                messages, json_mode=False
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                "Conversation transport error: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+
+        if truncated:
+            raise RuntimeError(truncated)
+
+        reply = text.strip()
+        if not reply:
+            raise RuntimeError("Conversation model returned an empty response.")
+        return reply
+

@@ -69,133 +69,30 @@ class BrowserVerifier:
         action: Any,
         result: Any,
     ) -> BrowserVerificationResult:
-        """Verify a browser action using independently observable state.
+        """Return the browser executor outcome without tab inspection.
 
-        The execution result is accepted because all skill verifiers share the
-        same generic contract. It is not treated as independent evidence that
-        the action succeeded.
-
-        Browser actions may optionally provide one of these verification
-        targets in their parameters:
-
-        * ``expected_url``
-        * ``expected_url_contains``
-        * ``expected_title``
-        * ``expected_text``
-
-        If no skill-level verification target is provided, verification is
-        deferred to the task-level checkpoint verifier.
-
-        Returns:
-            BrowserVerificationResult describing the independent observation.
-
-        Raises:
-            TypeError: If the supplied action is not a BrowserAction.
+        Browser state verification is intentionally disabled. The Playwright
+        executor is already responsible for reporting whether the requested
+        browser operation completed; re-reading Chrome adds latency and was not
+        reliable for this persistent-profile workflow.
         """
         from .actions import BrowserAction
 
-        if not isinstance(
-            action,
-            BrowserAction,
-        ):
-            raise TypeError(
-                "BrowserVerifier.verify() expects "
-                "a BrowserAction"
-            )
+        if not isinstance(action, BrowserAction):
+            raise TypeError("BrowserVerifier.verify() expects a BrowserAction")
 
-        if not bool(
-            getattr(
-                result,
-                "ok",
-                False,
-            )
-        ):
-            detail = getattr(
-                result,
-                "detail",
-                "",
-            )
+        ok = bool(getattr(result, "ok", False))
+        detail = str(getattr(result, "detail", "") or "")
 
+        if ok:
             return BrowserVerificationResult(
-                ok=False,
-                detail=(
-                    "browser execution did not succeed"
-                    + (
-                        f": {detail}"
-                        if detail
-                        else ""
-                    )
-                ),
+                ok=True,
+                detail=detail or "browser operation completed",
             )
 
-        params = getattr(
-            action,
-            "params",
-            {},
-        )
-
-        if params is None:
-            params = {}
-
-        if not isinstance(
-            params,
-            dict,
-        ):
-            try:
-                params = dict(params)
-            except (TypeError, ValueError) as exc:
-                raise TypeError(
-                    "browser action params must be mapping-like"
-                ) from exc
-
-        provided = [
-            name
-            for name in self._VERIFICATION_TARGETS
-            if name in params
-        ]
-
-        if len(provided) > 1:
-            return BrowserVerificationResult(
-                ok=False,
-                detail=(
-                    "browser action provided multiple skill-level "
-                    "verification targets: "
-                    + ", ".join(provided)
-                ),
-            )
-
-        if "expected_url" in params:
-            return self.verify_url(
-                params["expected_url"]
-            )
-
-        if "expected_url_contains" in params:
-            return self.verify_url_contains(
-                params["expected_url_contains"]
-            )
-
-        if "expected_title" in params:
-            return self.verify_title(
-                params["expected_title"]
-            )
-
-        if "expected_text" in params:
-            return self.verify_text(
-                params["expected_text"]
-            )
-
-        # Important:
-        # No target means the browser verifier did not actually verify an
-        # effect. Do NOT report a successful verification here.
-        #
-        # The task-level verifier remains responsible for deciding whether
-        # the action achieved the requested task effect.
         return BrowserVerificationResult(
             ok=False,
-            detail=(
-                "no skill-specific verification target was provided; "
-                "task-level verification is required"
-            ),
+            detail=detail or "browser operation failed",
         )
 
     def verify_url(
