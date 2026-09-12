@@ -541,6 +541,24 @@ class Policy:
                     if key in action.params:
                         self.resolve_write_path(action.params[key])
 
+            if action.kind == "browser_apply_job":
+                if "job_url" not in action.params:
+                    raise PolicyDenied("browser_apply_job requires 'job_url'")
+                self.check_browser_url(action.params["job_url"])
+                if "resume_path" not in action.params:
+                    raise PolicyDenied("browser_apply_job requires 'resume_path'")
+                self.resolve_read_path(action.params["resume_path"])
+
+            if action.kind == "browser_upload_file":
+                if "file_path" not in action.params:
+                    raise PolicyDenied("browser_upload_file requires 'file_path'")
+                self.resolve_read_path(action.params["file_path"])
+
+            if action.kind == "browser_download_file":
+                if "output_path" not in action.params:
+                    raise PolicyDenied("browser_download_file requires 'output_path'")
+                self.resolve_write_path(action.params["output_path"])
+
             # ----------------------------------------------------------
             # NETWORK ACCESS
             # ----------------------------------------------------------
@@ -550,7 +568,7 @@ class Policy:
                 in action.params
             ):
 
-                if action.kind == "open_url":
+                if action.kind in {"open_url", "browser_open_url", "browser_open_new_tab"}:
                     self.check_browser_url(action.params["url"])
                 elif action.kind == "launch_app":
                     raise PolicyDenied(

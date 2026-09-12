@@ -305,7 +305,32 @@ whatsapp_send_message {"recipient": "<contact>", "message": "<text>"}
 whatsapp_search_contact {"query": "<contact or text>"}
 gmail_send_email     {"recipient": "<email>", "subject": "<subject>", "body": "<text>", "cc": "", "bcc": ""}
 gmail_search_mail    {"query": "<gmail search query>"}
-gmail_read_mail      {"query": "<message search query>"}"""
+gmail_read_mail      {"query": "<message search query>"}
+browser_open_url     {"url": "https://...", "expected_url": "https://..."}
+browser_search       {"query": "<text>"}
+browser_get_current_page {"tab_id": null}
+browser_list_tabs    {"scope": "agent|user|all"}
+browser_open_new_tab {"url": "https://..."}
+browser_switch_tab   {"tab_id": 123}
+browser_close_tab    {"tab_id": 123}
+browser_go_back      {"confirm": false}
+browser_go_forward   {"confirm": false}
+browser_refresh      {"confirm": false}
+browser_page_state   {"confirm": false}
+browser_extract_text {"confirm": false}
+browser_click        {"target": "@e1"}
+browser_type         {"target": "@e1", "text": "..."}
+browser_press_key    {"key": "Enter", "target": "@e1"}
+browser_scroll       {"amount": 600}
+browser_scroll_to    {"target": "@e1"}
+browser_select       {"target": "@e1", "value": "option-value"}
+browser_upload_file  {"target": "@e1", "file_path": "<abs path>", "mode": "input|drop"}
+browser_download_file {"target": "@e1", "output_path": "<abs path>", "overwrite": false}
+browser_wait         {"seconds": 1.0}
+browser_borrow_tab   {"tab_id": 123}
+browser_return_tab   {"tab_id": 123}
+browser_play_song    {"query": "<song or artist>"}
+browser_apply_job    {"job_url": "https://...", "resume_path": "<abs path>", "answers": {}, "submit": true}"""
 
 
 SYSTEM_PROMPT = f"""\
@@ -317,7 +342,9 @@ You do not observe, execute, verify, or grant permissions. Deterministic runtime
 components perform those responsibilities and can overrule your plan.
 
 You cannot see the screen. You are given machine-readable state such as
-filesystem, process, window, and environment information.
+filesystem, process, window, environment, and browser observations. Browser
+actions must use fresh semantic refs such as @e1 from the latest observation;
+never invent coordinates or raw browser protocol calls.
 
 Emit ONLY these semantic actions, with exactly these parameter shapes:
 
@@ -369,10 +396,11 @@ YOUTUBE PLAYBACK:
     "play the latest song by arijit singh"
     "play believer on youtube"
     "play bringus studio on youtube"
-- For these requests, use open_url with a YouTube search/results URL:
-  https://www.youtube.com/results?search_query=<URL-encoded query>
-- The browser backend is responsible for selecting the first normal video
-  result and starting playback.
+- For these requests, use browser_play_song with:
+  {{"query": "<song or artist>"}}
+- Do NOT use browser_open_url or browser_search for a media playback request.
+- browser_play_song owns the complete playback workflow: it searches YouTube,
+  selects the first actual video result, opens it, and starts playback.
 - Do NOT stop at the YouTube results page when the user explicitly requested
   playback.
 - Do NOT require a separate "open YouTube" action first.
@@ -451,7 +479,32 @@ class OpenAICompatPlanner:
         state: dict,
         history: list[dict],
     ) -> PlannerStep:
-        """Generate one structured planner step."""
+        """Generate one structured planner step.
+
+        Explicit WhatsApp-send commands are normalized deterministically before
+        calling the LLM.  This is intentional: the planner must not be able to
+        turn a clear side-effecting command into an empty conversational plan.
+        Policy/approval and the BrowserSkill workflow still execute and verify
+        the resulting action downstream.
+        """
+
+        whatsapp = _parse_whatsapp_send_goal(goal)
+        if whatsapp is not None:
+            recipient, message = whatsapp
+            return PlannerStep(
+                actions=[
+                    Action(
+                        kind="whatsapp_send_message",
+                        params={
+                            "recipient": recipient,
+                            "message": message,
+                        },
+                        rationale="deterministic WhatsApp send intent",
+                    )
+                ],
+                done=False,
+                reasoning="recognized explicit WhatsApp send request",
+            )
 
         messages = [
             {
@@ -521,6 +574,81 @@ class OpenAICompatPlanner:
             indent=2,
             default=str,
         )
+
+
+_WHATSAPP_COMMAND_WORDS = (
+    "send",
+    "whatsapp",
+    "message",
+    "to",
+    "on",
+    "saying",
+    "telling",
+)
+
+
+def _closest_whatsapp_word(token: str) -> str | None:
+    """Return a known command word when the typo is small and unambiguous."""
+
+    from difflib import get_close_matches
+
+    token = token.lower()
+    if token in _WHATSAPP_COMMAND_WORDS:
+        return token
+    if len(token) < 4:
+        return None
+
+    matches = get_close_matches(
+        token,
+        _WHATSAPP_COMMAND_WORDS,
+        n=2,
+        cutoff=0.8,
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _normalize_whatsapp_command(text: str) -> str:
+    """Normalize only bounded WhatsApp command vocabulary, never message text."""
+
+    tokens = text.split()
+    if not tokens:
+        return text
+
+    # Find the message delimiter first; everything after it is user content.
+    delimiter_index = None
+    for index, token in enumerate(tokens):
+        word = _closest_whatsapp_word(token.strip(" \"'.,!?;:"))
+        if word in {"saying", "telling"}:
+            delimiter_index = index
+            tokens[index] = word
+            break
+
+    prefix_end = delimiter_index if delimiter_index is not None else len(tokens)
+    for index in range(prefix_end):
+        word = _closest_whatsapp_word(tokens[index].strip(" \"'.,!?;:"))
+        if word is not None:
+            tokens[index] = word
+
+    return " ".join(tokens)
+
+def _parse_whatsapp_send_goal(goal: str) -> tuple[str, str] | None:
+    """Extract an explicit WhatsApp send command without using the LLM."""
+
+    text = " ".join(str(goal or "").strip().split())
+    text = _normalize_whatsapp_command(text)
+    match = re.fullmatch(
+        r"send\s+(?:a\s+)?(?:whatsapp(?:\s+message)?|message)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?\s+(?:saying|telling)\s+(.+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    recipient = match.group(1).strip(" \"'.,!?;:")
+    message = match.group(2).strip()
+    if not recipient or not message:
+        return None
+    return recipient, message
 
 
 def _parse_step(text: str) -> PlannerStep:

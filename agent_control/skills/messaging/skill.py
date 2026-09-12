@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ...types import Action, ActionResult, FailureClass
+from ..browser.backend import BrowserSkillError
 from ..base import Skill, SkillAction, SkillExecutor, SkillInfo, SkillVerifier
 from ..manifest import SkillManifest
 from ..security import Capability
@@ -15,7 +16,7 @@ class MessagingExecutor:
     def __init__(self, backend: MessagingBackend) -> None:
         self._backend = backend
 
-    def execute(self, action: MessagingAction) -> Any:
+    def execute(self, action: MessagingAction) -> ActionResult:
         p = action.params
         try:
             if action.kind.value == "whatsapp_send_message":
@@ -23,20 +24,25 @@ class MessagingExecutor:
             elif action.kind.value == "whatsapp_search_contact":
                 detail = self._backend.search_whatsapp(str(p["query"]))
             elif action.kind.value == "gmail_send_email":
-                detail = self._backend.send_gmail(
-                    str(p["recipient"]), str(p["subject"]), str(p["body"]),
-                    str(p.get("cc", "")), str(p.get("bcc", "")),
-                )
+                detail = self._backend.send_gmail(str(p["recipient"]), str(p["subject"]), str(p["body"]), str(p.get("cc", "")), str(p.get("bcc", "")))
             elif action.kind.value == "gmail_search_mail":
                 detail = self._backend.search_gmail(str(p["query"]))
             elif action.kind.value == "gmail_read_mail":
                 detail = self._backend.read_gmail(str(p["query"]))
             else:
                 raise ValueError(f"unsupported messaging action: {action.kind.value}")
-            return ActionResult(action=Action(kind=action.kind.value, params=dict(action.params)), ok=True, detail=detail)
+            return ActionResult(Action(kind=action.kind.value, params=dict(action.params)), ok=True, detail=detail)
+        except BrowserSkillError as exc:
+            error = f"{exc.code}: {exc}"
+            return ActionResult(
+                Action(kind=action.kind.value, params=dict(action.params)),
+                ok=False,
+                error=error,
+                failure_class=FailureClass.ACTION_FAILED,
+            )
         except Exception as exc:
             return ActionResult(
-                action=Action(kind=action.kind.value, params=dict(action.params)),
+                Action(kind=action.kind.value, params=dict(action.params)),
                 ok=False,
                 error=f"{type(exc).__name__}: {exc}",
                 failure_class=FailureClass.ACTION_FAILED,
@@ -46,13 +52,10 @@ class MessagingExecutor:
 class MessagingSkill(Skill):
     _INFO = SkillInfo(
         name="messaging",
-        version="1.0.0",
-        description="WhatsApp and Gmail messaging through the isolated DEIMOS browser profile.",
+        version="2.0.0",
+        description="Gmail and WhatsApp workflows through Tencent BrowserSkill and the user's authenticated browser state.",
         actions=tuple(SkillAction(kind=k, description=k.replace("_", " ")) for k in sorted(MESSAGING_ACTION_KINDS)),
-        manifest=SkillManifest(
-            capabilities=frozenset({Capability.BROWSER, Capability.NETWORK}),
-            side_effecting=True,
-        ),
+        manifest=SkillManifest(capabilities=frozenset({Capability.BROWSER, Capability.NETWORK, Capability.SUBPROCESS}), side_effecting=True),
     )
 
     def __init__(self, backend: MessagingBackend) -> None:
@@ -73,6 +76,10 @@ class MessagingSkill(Skill):
     def adapt_action(self, action: Any) -> MessagingAction:
         if not isinstance(action, Action):
             raise TypeError("messaging skill expects a core Action")
-        if not self.supports(action.kind):
-            raise ValueError(f"messaging skill does not support {action.kind!r}")
         return MessagingAction.from_core(action)
+
+    def close_session(self) -> None:
+        browser = getattr(self._backend, "_browser", None)
+        close = getattr(browser, "close_session", None)
+        if callable(close):
+            close()

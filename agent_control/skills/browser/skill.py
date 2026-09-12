@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..manifest import SkillManifest
-from ..security import Capability
 from ..base import (
     Skill,
     SkillAction,
@@ -11,11 +9,14 @@ from ..base import (
     SkillInfo,
     SkillVerifier,
 )
+from ..manifest import SkillManifest
+from ..security import Capability
+
 from .actions import (
     BROWSER_ACTION_KINDS,
     BrowserAction,
 )
-from .backend import PlaywrightChromeBackend
+from .backend import BrowserSkillAdapter
 from .executor import (
     BrowserBackend,
     BrowserExecutionResult,
@@ -28,39 +29,35 @@ from .browser_verifiers import (
 
 
 class BrowserSkill(Skill):
-    """Browser automation capability.
-
-    BrowserSkill exposes semantic browser actions while keeping execution and
-    verification separate.
-
-    Policy is intentionally not implemented here. The central DEIMOS policy
-    layer decides whether a browser action is permitted before execution.
-
-    The skill also exposes ``adapt_action()`` so the central control loop can
-    convert a core Action into the skill-specific BrowserAction without
-    importing browser-specific action types.
-    """
-
     _INFO = SkillInfo(
         name="browser",
+        version="2.0.0",
         description=(
-            "Navigate and interact with web browsers using semantic "
-            "browser actions."
+            "Operate the user's real authenticated "
+            "Chromium browser through Tencent "
+            "BrowserSkill's Agent Window."
+        ),
+        actions=tuple(
+            SkillAction(
+                kind=k,
+                description=k.replace(
+                    "_",
+                    " ",
+                ),
+            )
+            for k in sorted(
+                BROWSER_ACTION_KINDS
+            )
         ),
         manifest=SkillManifest(
             capabilities=frozenset(
                 {
                     Capability.BROWSER,
                     Capability.NETWORK,
+                    Capability.SUBPROCESS,
                 }
-            )
-        ),
-        actions=tuple(
-            SkillAction(
-                kind=kind,
-                description=kind.replace("_", " "),
-            )
-            for kind in sorted(BROWSER_ACTION_KINDS)
+            ),
+            side_effecting=True,
         ),
     )
 
@@ -68,101 +65,80 @@ class BrowserSkill(Skill):
         self,
         backend: BrowserBackend,
     ) -> None:
-        """Initialize the browser skill."""
         self._backend = backend
-        self._executor = BrowserExecutor(backend)
-
-        # BrowserVerifier requires the backend to provide the read-only
-        # browser inspection methods expected by the verifier.
+        self._executor = BrowserExecutor(
+            backend
+        )
         self._verifier = BrowserVerifier(
             backend
-        )  # type: ignore[arg-type]
-
-    def supports(self, kind: str) -> bool:
-        """Return whether the skill owns a core or browser-specific action."""
-        if kind == "open_url":
-            return True
-        return super().supports(kind)
+        )
 
     @property
     def info(self) -> SkillInfo:
-        """Return immutable metadata describing the browser skill."""
         return self._INFO
 
+    def supports(
+        self,
+        kind: str,
+    ) -> bool:
+        return (
+            kind in BROWSER_ACTION_KINDS
+            or kind == "open_url"
+        )
+
     def executor(self) -> SkillExecutor:
-        """Return the browser execution backend."""
         return self._executor
 
     def verifier(self) -> SkillVerifier:
-        """Return the browser verification backend."""
         return self._verifier
 
     def adapt_action(
         self,
         action: Any,
     ) -> BrowserAction:
-        """Convert a core DEIMOS Action into a BrowserAction.
-
-        This keeps browser-specific action conversion inside BrowserSkill,
-        allowing the central control loop to remain skill-agnostic.
-        """
-
-        if action is None:
-            raise TypeError(
-                "browser skill cannot adapt a null action"
-            )
-
-        action_kind = getattr(
+        kind = getattr(
             action,
             "kind",
             None,
         )
 
-        if not isinstance(action_kind, str):
-            raise TypeError(
-                "browser skill requires an action with "
-                "a string 'kind'"
-            )
+        if kind == "open_url":
+            kind = "browser_open_url"
 
-        # ``open_url`` is the core DEIMOS semantic action. The browser skill
-        # owns that action at runtime while retaining its browser-prefixed
-        # internal action vocabulary for backwards compatibility.
-        if action_kind == "open_url":
-            action_kind = "browser_open_url"
-        elif not self.supports(action_kind):
+        if kind not in BROWSER_ACTION_KINDS:
             raise ValueError(
-                "browser skill does not support "
-                f"{action_kind!r}"
+                f"browser skill does not support "
+                f"{kind!r}"
             )
 
-        params = getattr(
-            action,
-            "params",
-            {},
+        params = dict(
+            getattr(
+                action,
+                "params",
+                {},
+            )
+            or {}
         )
 
-        if params is None:
-            params = {}
-
-        if not isinstance(params, dict):
-            try:
-                params = dict(params)
-            except (TypeError, ValueError) as exc:
-                raise TypeError(
-                    "browser action params must be mapping-like"
-                ) from exc
-
-        rationale = getattr(
-            action,
-            "rationale",
-            "",
-        )
+        if (
+            kind == "browser_open_url"
+            and "expected_url" not in params
+        ):
+            params["expected_url"] = params.get(
+                "url"
+            )
 
         return BrowserAction.from_json(
             {
-                "kind": action_kind,
-                "params": dict(params),
-                "rationale": str(rationale),
+                "kind": kind,
+                "params": params,
+                "rationale": str(
+                    getattr(
+                        action,
+                        "rationale",
+                        "",
+                    )
+                ),
             }
         )
 
@@ -170,73 +146,25 @@ class BrowserSkill(Skill):
         self,
         action: BrowserAction,
     ) -> BrowserExecutionResult:
-        """Execute a browser action.
-
-        This is a convenience API for direct skill use. The central runner
-        normally routes execution through ``executor()`` after policy approval.
-        """
-
-        if not isinstance(
-            action,
-            BrowserAction,
-        ):
-            raise TypeError(
-                "BrowserSkill.execute() expects "
-                "a BrowserAction"
-            )
-
-        if not self.supports(
-            action.kind.value
-        ):
-            raise ValueError(
-                "browser skill does not support "
-                f"{action.kind.value!r}"
-            )
-
         return self._executor.execute(
             action
         )
 
-    def verify_url(
-        self,
-        expected_url: str,
-    ) -> BrowserVerificationResult:
-        """Independently verify the current browser URL."""
-        return self._verifier.verify_url(
-            expected_url
+    def close_session(self) -> None:
+        close = getattr(
+            self._backend,
+            "close_session",
+            None,
         )
 
-    def verify_url_contains(
-        self,
-        expected_fragment: str,
-    ) -> BrowserVerificationResult:
-        """Verify that the current browser URL contains a fragment."""
-        return self._verifier.verify_url_contains(
-            expected_fragment
-        )
-
-    def verify_title(
-        self,
-        expected_title: str,
-    ) -> BrowserVerificationResult:
-        """Verify the current page title."""
-        return self._verifier.verify_title(
-            expected_title
-        )
-
-    def verify_text(
-        self,
-        expected_text: str,
-    ) -> BrowserVerificationResult:
-        """Verify visible text on the current page."""
-        return self._verifier.verify_text(
-            expected_text
-        )
+        if callable(close):
+            close()
 
     def describe(self) -> dict[str, Any]:
-        """Return metadata useful for discovery and debugging."""
         return {
-            "name": self.info.name,
-            "description": self.info.description,
-            "action_kinds": list(self.action_kinds),
+            "name": self.name,
+            "description": self.description,
+            "action_kinds": list(
+                self.action_kinds
+            ),
         }

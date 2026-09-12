@@ -337,6 +337,19 @@ def _requested_effect_kinds(request: str) -> frozenset[str]:
     if re.search(r"\b(open|launch|start|run)\b.*\b(vscode|vs code|chrome|app|application)\b", text):
         kinds.add("launch_app")
 
+    # Browser effects are verified by the BrowserSkill verifier rather than
+    # the filesystem/app effect ledger.  Keep this intentionally narrow: a
+    # request must clearly ask to play something before a browser playback
+    # verification can satisfy the goal.
+    if re.search(
+        r"\b(play|listen to|start playing)\b.*\b(song|track|music)\b",
+        text,
+    ) or re.search(
+        r"^\s*(play|listen to|start playing)\b",
+        text,
+    ):
+        kinds.add("browser_play_song")
+
     return frozenset(kinds)
 
 @dataclass
@@ -366,6 +379,10 @@ class GeneralTask:
     #: current world before it is skipped.
     _verified_effects: dict[tuple, Effect] = field(default_factory=dict)
     _completion_uncertain: str = ""
+    #: Skill-level effects that passed an independent verifier but are not
+    #: represented by the filesystem/app effect ledger above.  These are
+    #: completion evidence only; ``verify_final`` still re-observes the world.
+    _verified_external_effects: set[str] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.task_id:
@@ -538,10 +555,26 @@ class GeneralTask:
         self._verified_effects.pop(effect.replay_identity, None)
         return None
 
+    def record_verified_external_action(self, action: Action) -> None:
+        """Record a skill-level PASS as completion evidence.
+
+        This is deliberately separate from ``_verified_effects``.  Some skills
+        own their verification domain (for example the browser owns live media
+        playback), so forcing those effects through the filesystem-oriented
+        ledger would be incorrect.  The runner calls this only after the skill
+        verifier has independently returned PASS.  Final verification still
+        re-observes the live world and therefore this method never turns a
+        planner/executor claim into success by itself.
+        """
+        kind = getattr(action, "kind", "")
+        if kind == "browser_play_song":
+            self._verified_external_effects.add(kind)
+
     def requested_effects_complete(self) -> bool:
-        """Whether every explicitly named tracked effect has a checkpoint PASS."""
+        """Whether every explicitly requested effect has independent PASS evidence."""
         expected = _requested_effect_kinds(self.request)
         verified = {effect.kind for effect in self._verified_effects.values()}
+        verified.update(self._verified_external_effects)
         return bool(expected) and expected.issubset(verified)
 
     def mark_completion_uncertain(self, reason: str) -> None:
@@ -597,6 +630,22 @@ class GeneralTask:
                 "browser_select",
                 "browser_wait",
                 "browser_close_tab",
+                "browser_get_current_page",
+                "browser_list_tabs",
+                "browser_open_new_tab",
+                "browser_switch_tab",
+                "browser_go_back",
+                "browser_go_forward",
+                "browser_refresh",
+                "browser_page_state",
+                "browser_extract_text",
+                "browser_scroll_to",
+                "browser_upload_file",
+                "browser_download_file",
+                "browser_borrow_tab",
+                "browser_return_tab",
+                "browser_play_song",
+                "browser_apply_job",
             })
             if self._untracked and set(self._untracked).issubset(browser_kinds):
                 return VerificationResult(
@@ -604,15 +653,15 @@ class GeneralTask:
                     checks=[
                         Check(
                             name="browser_execution",
-                            verdict=Verdict.PASS,
+                            verdict=Verdict.UNKNOWN,
                             evidence={
                                 "effects": [],
                                 "browser_actions": dict(self._untracked),
-                                "state_verification": "disabled",
+                                "state_verification": "not_proven",
                             },
                             reason=(
-                                "browser executor completed the requested "
-                                "operation; browser state verification is disabled"
+                                "browser actions were attempted but no independent "
+                                "task-level browser postcondition proves the goal"
                             ),
                         )
                     ],

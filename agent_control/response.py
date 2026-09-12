@@ -443,6 +443,11 @@ class DeimosPresentation:
         request = " ".join((result.request or "").lower().split())
         obj = _object(result)
 
+        if result.status is TaskStatus.NEEDS_INPUT:
+            if result.question is not None and result.question.question:
+                return result.question.question
+            return "I need your go-ahead before doing that."
+
         if result.status is TaskStatus.POLICY_BLOCKED:
             if obj:
                 return f"Nope — I’m not allowed to do that with {obj}. That one stays behind the velvet rope. "

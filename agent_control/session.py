@@ -42,6 +42,7 @@ from . import api
 from .api import AgentResult, TaskStatus
 from .types import Action
 from .task import Task
+from .skills.browser import BrowserSkillAdapter
 from .response import (
     DeimosPresentation,
     Narrator,
@@ -481,6 +482,11 @@ _ACTION_VERBS = (
     "install", "download", "fetch",
     "find", "search", "look", "browse", "list", "show",
     "pick", "choose", "select", "play",
+    # Messaging / communication actions. These must be routed to the
+    # computer-action pipeline so the planner/policy/approval/skill layers
+    # can execute side effects instead of the conversation model merely
+    # echoing an action-shaped JSON object as text.
+    "send", "message",
     # Read-only investigation verbs. Without these, "analyze this project" has
     # no action verb at all, _requires_computer_action returns False, and the
     # request is classified CONVERSATION -- routed to the LLM chit-chat engine
@@ -751,6 +757,13 @@ class Session:
     pending: Pending | None = None
     pending_approval: PendingApproval | None = None
     recent_context: RecentContext = field(default_factory=RecentContext)
+    #: Browser state belongs to the lifetime of the conversational Session,
+    #: not to an individual task turn. This keeps one Agent Window/browser
+    #: session alive across turns while giving the application explicit
+    #: ownership of its lifetime.
+    _browser_backend: BrowserSkillAdapter | None = field(
+        default=None, repr=False, compare=False,
+    )
     #: General actions in one conversation share one policy write root.  This is
     #: the authority that makes a verified folder writable on the following
     #: turn; the remembered path itself grants nothing.
@@ -782,7 +795,23 @@ class Session:
         return self.narrator.set_speaking(enabled)
 
     def close(self, timeout_s: float = 15.0) -> None:
-        self.narrator.close(timeout_s)
+        """Close interface-owned resources exactly once.
+
+        BrowserSkill sessions intentionally live across conversational turns,
+        so they are closed here at Session lifetime end rather than by task
+        teardown. Cleanup is best-effort because the external browser may already
+        have stopped.
+        """
+        try:
+            self.narrator.close(timeout_s)
+        finally:
+            backend = self._browser_backend
+            self._browser_backend = None
+            if backend is not None:
+                try:
+                    backend.close_session()
+                except Exception:
+                    pass
 
     # -- input -------------------------------------------------------------
     def listen(self, *, max_seconds: float = 30.0,
@@ -862,12 +891,12 @@ class Session:
         normalized_raw = (raw or "").strip().lower()
         if approval is not None and normalized_raw in {"yes", "y", "approve", "approved", "send it", "do it", "confirm"}:
             from .skills.messaging.task import ApprovedMessagingTask
-            from .skills.builtin import _BROWSER_BACKEND
-            if _BROWSER_BACKEND is None:
-                return self._refused(UserTask(raw=raw, text=approval.request, source=source, status="dropped"), "The messaging browser is not available, so nothing was sent.")
+            from .skills.messaging import BrowserMessagingBackend
+            if self._browser_backend is None:
+                self._browser_backend = BrowserSkillAdapter()
             approved_task = ApprovedMessagingTask(
                 Action(kind=str(approval.action["kind"]), params=dict(approval.action.get("params", {}))),
-                __import__("agent_control.skills.messaging", fromlist=["BrowserMessagingBackend"]).BrowserMessagingBackend(_BROWSER_BACKEND),
+                BrowserMessagingBackend(self._browser_backend),
             )
             return self._run(Prepared(
                 task=UserTask(raw=raw, text=approval.request, source=source, task_id=approved_task.task_id, status="accepted"),
@@ -1135,6 +1164,12 @@ class Session:
             self.narrator.note(f"[{task.task_id}] running{aside} ...")
         lines: list[str] = []
 
+        # The conversational Session owns one browser backend for its whole
+        # lifetime. It is created lazily so sessions that never use browser
+        # capabilities do not start a browser.
+        if self._browser_backend is None:
+            self._browser_backend = BrowserSkillAdapter()
+
         try:
             result = api.run_agent_task(
                 task.text,
@@ -1153,6 +1188,7 @@ class Session:
                 recent_context=self.recent_context.planner_state(),
                 approved_action=prepared.approved_action,
                 on_event=self._watcher(lines),
+                browser_backend=self._browser_backend,
             )
 
         except Exception as exc:
@@ -1180,7 +1216,17 @@ class Session:
                 except Exception:
                     pass
 
-        reply = self._action_reply(task, result)
+        # A run suspended on a question (NEEDS_INPUT) is not a failure and
+        # must not be handed to the free-form conversational reply path: that
+        # path only ever describes an action as having succeeded or failed,
+        # so a pending approval could be worded back to the user as "I
+        # couldn't send the message" even though nothing has failed and the
+        # pending action above was preserved correctly. Ask the question
+        # directly instead.
+        if result.needs_input and result.question is not None:
+            reply = result.question.question
+        else:
+            reply = self._action_reply(task, result)
         turn = Turn(task=task, reply=reply, result=result,
                     status_lines=lines)
         self.narrator.reply(turn.reply)

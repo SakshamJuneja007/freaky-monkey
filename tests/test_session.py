@@ -172,6 +172,17 @@ def test_empty_input_runs_nothing(blank: str, chat: Session, calls: list[dict]):
     assert calls == []
 
 
+def test_messaging_requests_are_routed_to_computer_action(chat: Session, calls: list[dict]):
+    """A messaging command must reach GeneralTask, not the conversation LLM."""
+    turn = chat.submit("send whatsapp to papa saying test message")
+
+    assert len(calls) == 1
+    assert calls[0]["request"] == "send whatsapp to papa saying test message"
+    assert calls[0]["task_obj"] is not None
+    assert calls[0]["task_id"].startswith("general-")
+    assert turn.task.intent is sess.IntentCategory.ACTION
+
+
 def test_a_request_with_no_capability_behind_it_claims_nothing(
     chat: Session, calls: list[dict], printed: list[str],
 ):

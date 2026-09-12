@@ -1932,6 +1932,7 @@ def run_agent_task(
     approved_action: dict[str, Any] | None = None,
     recent_context: dict[str, str] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
+    browser_backend: Any | None = None,
 ) -> AgentResult:
     """Run a task through the single execution pipeline.
 
@@ -2172,7 +2173,14 @@ def run_agent_task(
 
     outcome: RunOutcome | None = None
 
-    skills = build_builtin_registry(policy)
+    # Conversational Session instances own a long-lived browser backend.
+    # Direct API callers omit it and receive a temporary legacy backend that
+    # this function owns and cleans up.
+    skills = build_builtin_registry(
+        policy,
+        browser_backend=browser_backend,
+    )
+    owns_browser_backend = browser_backend is None
 
     try:
         outcome = run_task(
@@ -2237,6 +2245,15 @@ def run_agent_task(
     finally:
         if own_trace:
             active.close()
+
+        if owns_browser_backend:
+            try:
+                from .skills.builtin import close_builtin_browser_session
+
+                close_builtin_browser_session()
+            except Exception:
+                # Browser cleanup must never replace the actual task result.
+                pass
 
     if outcome is None:
         return AgentResult(

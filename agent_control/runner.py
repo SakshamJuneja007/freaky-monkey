@@ -22,6 +22,7 @@ also allowing individual components to evolve independently.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -38,6 +39,7 @@ from .recovery import (
 )
 from .skills.registry import SkillRegistry
 from .task import Task, oldest_age_s, state_fingerprint
+from .general_task import GeneralTask
 from .trace import Trace
 from .types import (
     Action,
@@ -514,6 +516,7 @@ def _skill_action_from_core(
 
 def _skill_verification_is_deferred(
     skill_action: Any,
+    verification: Any = None,
 ) -> bool:
     """Return whether skill-level verification should be deferred.
 
@@ -524,6 +527,10 @@ def _skill_verification_is_deferred(
     This compatibility helper can later be replaced by an explicit
     PASS/FAIL/DEFERRED verification result.
     """
+
+    verification_status = getattr(verification, "status", None)
+    if isinstance(verification_status, str):
+        return verification_status.upper() == "DEFERRED"
 
     explicit = getattr(
         skill_action,
@@ -576,6 +583,20 @@ def _normalize_skill_verification(
     )
 
     return ok, str(detail or "")
+
+
+def _skill_action_key(action: Any) -> str:
+    """Stable per-action key for final independent skill verification."""
+    try:
+        params = json.dumps(
+            getattr(action, "params", {}),
+            sort_keys=True,
+            default=str,
+            ensure_ascii=False,
+        )
+    except Exception:
+        params = repr(getattr(action, "params", {}))
+    return f"{getattr(action, 'kind', '')!s}:{params}"
 
 
 def _execute_skill_action(
@@ -729,6 +750,19 @@ def _execute_skill_action(
             )
         )
 
+        # Keep the skill verifier itself available for the final task check.
+        # The final check calls the verifier again, so this is not cached
+        # evidence: the browser/world is re-observed at completion.
+        skill_records = loop.extra_state.setdefault(
+            "skill_verification_records", {}
+        )
+        skill_records[_skill_action_key(skill_action)] = {
+            "action": skill_action,
+            "verifier": verifier,
+            "execution": execution,
+            "execution_ok": execution_ok,
+        }
+
         # Current BrowserVerifier semantics:
         #
         #   ok=True
@@ -742,7 +776,8 @@ def _execute_skill_action(
         deferred = (
             not verification_ok
             and _skill_verification_is_deferred(
-                skill_action
+                skill_action,
+                verification,
             )
         )
 
@@ -1294,8 +1329,6 @@ def _drive(
     completion.
     """
 
-    from .general_task import GeneralTask
-
     steps_used = 0
 
     for index in range(
@@ -1540,6 +1573,14 @@ def _drive(
                         checkpoint=True,
                     )
 
+                    record_external = getattr(
+                        loop.task,
+                        "record_verified_external_action",
+                        None,
+                    )
+                    if callable(record_external):
+                        record_external(action)
+
                     loop.checkpoints.append(
                         already
                     )
@@ -1576,6 +1617,21 @@ def _drive(
                 action,
             )
 
+            if (
+                result is not None
+                and result.ok
+                and isinstance(loop.task, GeneralTask)
+                and isinstance(result.detail, dict)
+                and result.detail.get("skill_verified") is True
+            ):
+                record_external = getattr(
+                    loop.task,
+                    "record_verified_external_action",
+                    None,
+                )
+                if callable(record_external):
+                    record_external(action)
+
             history.append(
                 _history_entry(
                     action,
@@ -1601,6 +1657,29 @@ def _drive(
                 False,
                 steps_used,
                 "",
+            )
+
+        # A skill-level verifier can establish the user's requested effect
+        # without another planner round.  Check deterministic completion before
+        # asking the external planner for another step.  The public
+        # ``run_task()`` path will still perform final fresh verification, so
+        # this is only a decision to stop replanning, never proof of success.
+        if (
+            isinstance(loop.task, GeneralTask)
+            and loop.task.requested_effects_complete()
+        ):
+            loop.trace.note(
+                "goal_completed_from_verified_effects",
+                step=index,
+            )
+            loop.decide(
+                DecisionKind.VERIFY,
+                "all explicitly requested effects already passed independent verification",
+            )
+            return (
+                True,
+                steps_used,
+                step.reasoning or "",
             )
 
         # IMPORTANT:
@@ -1656,6 +1735,75 @@ def _drive(
         False,
         steps_used,
         "",
+    )
+
+
+def _final_skill_verification(
+    loop: _Loop,
+) -> VerificationResult | None:
+    """Re-run successful skill verifiers against the final live world state.
+
+    This is a fallback only for GeneralTask runs whose task-level verifier has
+    no native effect ledger entry for the skill action. Each verifier observes
+    the world again; the executor's old return value is used only to satisfy
+    the verifier interface and is never treated as evidence of the effect.
+    """
+    records = loop.extra_state.get("skill_verification_records")
+    if not isinstance(records, dict) or not records:
+        return None
+
+    checks: list[Check] = []
+    for key, record in records.items():
+        if not isinstance(record, dict):
+            return None
+        if not bool(record.get("execution_ok", False)):
+            return VerificationResult(
+                label=f"skill-final:{loop.task.task_id}",
+                checks=[
+                    Check(
+                        name="skill_execution",
+                        verdict=Verdict.FAIL,
+                        evidence={"action": key},
+                        reason="a skill action did not execute successfully",
+                    )
+                ],
+            )
+
+        verifier = record.get("verifier")
+        action = record.get("action")
+        execution = record.get("execution")
+        verify = getattr(verifier, "verify", None)
+        if not callable(verify):
+            return None
+
+        try:
+            current = verify(action, execution)
+        except Exception as exc:
+            return VerificationResult(
+                label=f"skill-final:{loop.task.task_id}",
+                checks=[
+                    Check(
+                        name="skill_final_observation",
+                        verdict=Verdict.FAIL,
+                        evidence={"action": key},
+                        reason=f"final skill observation raised {type(exc).__name__}: {exc}",
+                    )
+                ],
+            )
+
+        ok, detail = _normalize_skill_verification(current)
+        checks.append(
+            Check(
+                name="skill_final_observation",
+                verdict=Verdict.PASS if ok else Verdict.FAIL,
+                evidence={"action": key, "detail": detail},
+                reason=detail or ("final skill observation passed" if ok else "final skill observation failed"),
+            )
+        )
+
+    return VerificationResult(
+        label=f"skill-final:{loop.task.task_id}",
+        checks=checks,
     )
 
 
@@ -1845,6 +1993,24 @@ def run_task(
                 trace,
             )
 
+            # GeneralTask deliberately has no native effect ledger for browser
+            # actions. When the task-level result is UNKNOWN, give the skill
+            # verifiers one final fresh observation before declaring failure.
+            # This does not bypass verification: the skill verifier runs again
+            # against the live browser state.
+            if (
+                final.verdict is Verdict.UNKNOWN
+                and isinstance(task, GeneralTask)
+                and not task.effects()
+            ):
+                skill_final = _final_skill_verification(loop)
+                if skill_final is not None:
+                    final = skill_final
+                    trace.note(
+                        "skill_final_verification_fallback",
+                        verdict=final.verdict.value,
+                    )
+
             trace.verification(
                 final,
                 checkpoint=False,
@@ -1952,6 +2118,11 @@ def run_task(
             and not awaiting
         ):
             try:
+                # Task teardown must not close long-lived skill sessions.
+                # BrowserSkill owns a persistent BrowserSkill/Agent Window
+                # session that is shared across conversational turns. The
+                # application/session lifecycle is responsible for stopping
+                # it when DEIMOS itself exits.
                 task.teardown(
                     policy
                 )
@@ -1963,8 +2134,6 @@ def run_task(
                         f"{type(exc).__name__}: {exc}"
                     ),
                 )
-
-    from .general_task import GeneralTask
 
     inspection_completed = (
         isinstance(

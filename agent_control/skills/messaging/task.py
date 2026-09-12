@@ -33,11 +33,31 @@ class ApprovedMessagingTask:
         return None
 
     def verify_final(self, policy: Policy, trace: Trace | None = None) -> VerificationResult:
-        # Final independent verification is intentionally performed by the skill
-        # verifier during execution; this task-level check is a structural guard.
+        """Re-run the messaging verifier against the live world.
+
+        Never report PASS merely because the executor returned or because the
+        approved task reached its final state. The verifier performs a fresh
+        browser observation and returns PASS/FAIL/UNKNOWN independently.
+        """
+        verification = self._verifier.verify(self._verifier_action(), None)
+        status = str(verification.status).upper()
+        if status == "PASS" and verification.ok:
+            verdict = Verdict.PASS
+        elif status == "FAIL":
+            verdict = Verdict.FAIL
+        else:
+            verdict = Verdict.UNKNOWN
         return VerificationResult([
-            Check("approved_messaging_action", Verdict.PASS, {"action_kind": self._action.kind}, "approved action completed through the skill verifier")
+            Check(
+                "approved_messaging_action",
+                verdict,
+                {"action_kind": self._action.kind, "status": status},
+                verification.detail or "messaging action independently verified",
+            )
         ], label="approved messaging")
+
+    def _verifier_action(self) -> MessagingAction:
+        return MessagingAction.from_core(self._action)
 
     def teardown(self, policy: Policy) -> None:
         return None
