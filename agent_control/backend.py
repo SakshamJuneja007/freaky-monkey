@@ -527,100 +527,26 @@ class BrowserSkillAdapter:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _browser_profile_score(item: dict[str, Any]) -> tuple[int, int, int]:
-        """Rank connected Chromium profiles for the normal user browser.
-
-        BrowserSkill can see more than one connected Chrome profile.  DEIMOS
-        should prefer the user's normal ``Default`` profile, while still
-        falling back safely when an older BrowserSkill build does not expose
-        profile metadata.
-        """
-        values = []
-        for key in ("profile", "profile_name", "profileName", "name", "label", "title"):
-            value = item.get(key)
-            if isinstance(value, str):
-                values.append(value.strip().casefold())
-        text = " ".join(values)
-        browser_text = " ".join(
-            str(item.get(key) or "").strip().casefold()
-            for key in ("browser", "browser_name", "browserName", "type", "name", "label")
-        )
-        is_chrome = int("chrome" in browser_text and "edge" not in browser_text)
-        is_default = int(any(v == "default" or "default" in v for v in values))
-        looks_user_profile = int(any(
-            marker in text for marker in ("default", "personal", "main")
-        ))
-        return (is_default, is_chrome, looks_user_profile)
-
-    @classmethod
-    def _select_default_chrome_browser(cls, result: BrowserSkillResult) -> str | None:
-        """Return the connected BrowserSkill browser id for Chrome Default."""
-        candidates: list[dict[str, Any]] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, dict):
-                if any(key in value for key in ("id", "browser_id", "browserId")):
-                    candidates.append(value)
-                for child in value.values():
-                    collect(child)
-            elif isinstance(value, (list, tuple)):
-                for child in value:
-                    collect(child)
-
-        collect(result)
-        unique: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in candidates:
-            browser_id = next((
-                item.get(key) for key in ("id", "browser_id", "browserId")
-                if isinstance(item.get(key), str) and item.get(key).strip()
-            ), None)
-            if not browser_id or browser_id in seen:
-                continue
-            seen.add(browser_id)
-            unique.append(item)
-
-        chrome = [
-            item for item in unique
-            if "chrome" in " ".join(
-                str(item.get(key) or "").casefold()
-                for key in ("browser", "browser_name", "browserName", "type", "name", "label", "profile", "profile_name")
-            )
-            and "edge" not in " ".join(
-                str(item.get(key) or "").casefold()
-                for key in ("browser", "browser_name", "browserName", "type")
-            )
-        ]
-        if not chrome:
-            return None
-
-        selected = max(chrome, key=cls._browser_profile_score)
-        return next((
-            selected.get(key) for key in ("id", "browser_id", "browserId")
-            if isinstance(selected.get(key), str) and selected.get(key).strip()
-        ), None)
-
     def session_start(self) -> BrowserSkillResult:
-        """Start a BrowserSkill session on the user's normal Chrome profile.
+        """Start a BrowserSkill session on the user's preferred Chrome browser.
 
-        BrowserSkill, rather than ``subprocess.Popen(chrome.exe)``, owns the
-        browser lifecycle.  This preserves the user's real Chrome cookies,
-        logins and tabs while keeping DEIMOS inside BrowserSkill's Agent Window
-        boundary.
+        When more than one connected browser/profile is available, prefer a
+        Chrome connection whose metadata identifies the Default profile. This
+        keeps WhatsApp/Gmail/browser workflows on the user's real Chrome
+        profile instead of accidentally selecting another connected profile.
+        If the daemon exposes no usable browser metadata, fall back to the
+        BrowserSkill default selection.
         """
-        arguments = ["session", "start"]
+        arguments = ["session", "start", "--no-focus"]
         try:
             browsers = self.browsers()
-            browser_id = self._select_default_chrome_browser(browsers)
+            browser_id = self._preferred_browser_id(browsers)
+            if browser_id:
+                arguments.extend(["--browser", browser_id])
         except Exception:
-            # Older BrowserSkill installations may not expose ``browsers``.
-            # Plain session start still uses the extension's normal browser.
-            browser_id = None
-
-        if browser_id:
-            arguments.extend(["--browser", browser_id])
-        arguments.append("--no-focus")
+            # Browser discovery is a preference, not a prerequisite. Let the
+            # official BrowserSkill default selection handle older daemons.
+            pass
 
         result = self._run(arguments)
 
@@ -630,6 +556,40 @@ class BrowserSkillAdapter:
             self.session = session_id
 
         return result
+
+    @staticmethod
+    def _preferred_browser_id(result: BrowserSkillResult) -> str | None:
+        """Pick Chrome/Default from a BrowserSkill ``browsers`` response."""
+        candidates: list[dict[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, list):
+                for item in value:
+                    collect(item)
+            elif isinstance(value, dict):
+                # A browser record normally contains id/browser_id plus label/name
+                # and may nest profile metadata. Treat nested browser arrays too.
+                if any(k in value for k in ("id", "browser_id", "browserId")):
+                    candidates.append(value)
+                for key in ("browsers", "items", "data", "result"):
+                    if key in value:
+                        collect(value[key])
+
+        collect(result)
+        if not candidates:
+            return None
+
+        def text(item: dict[str, Any]) -> str:
+            return json.dumps(item, ensure_ascii=False).casefold()
+
+        chrome = [item for item in candidates if "chrome" in text(item)]
+        preferred = [item for item in chrome if "default" in text(item)] or chrome
+        item = preferred[0] if preferred else candidates[0]
+        for key in ("id", "browser_id", "browserId"):
+            value = item.get(key)
+            if isinstance(value, (str, int)) and str(value).strip():
+                return str(value).strip()
+        return None
 
     def session_stop(
         self,

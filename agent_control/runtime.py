@@ -7,6 +7,7 @@ registry or state machine.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -19,22 +20,24 @@ from .runtime_persistence import RuntimePersistence, safe_json
 STATES = frozenset({
     "CREATED", "PLANNING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER",
     "WAITING_FOR_HUMAN", "RUNNING", "VERIFYING", "COMPLETED", "FAILED",
-    "CANCELLED", "BLOCKED", "RECOVERY_REQUIRED",
+    "CANCELLED", "BLOCKED", "RECOVERY_REQUIRED", "RECOVERING", "EXPIRED",
 })
-TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+TERMINAL = frozenset({"COMPLETED", "FAILED", "CANCELLED", "EXPIRED"})
+WAITING = frozenset({"WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN"})
 _RECOVERABLE_ON_RESTART = frozenset({"PLANNING", "RUNNING", "VERIFYING"})
 
 _ALLOWED: dict[str, frozenset[str]] = {
     "CREATED": frozenset({"PLANNING", "RUNNING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "BLOCKED", "CANCELLED", "FAILED"}),
     "PLANNING": frozenset({"RUNNING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "BLOCKED", "FAILED", "CANCELLED", "RECOVERY_REQUIRED"}),
-    "WAITING_FOR_APPROVAL": frozenset({"RUNNING", "CANCELLED", "FAILED"}),
-    "WAITING_FOR_USER": frozenset({"RUNNING", "WAITING_FOR_APPROVAL", "CANCELLED", "FAILED"}),
-    "WAITING_FOR_HUMAN": frozenset({"RUNNING", "CANCELLED", "FAILED"}),
+    "WAITING_FOR_APPROVAL": frozenset({"RUNNING", "CANCELLED", "FAILED", "EXPIRED"}),
+    "WAITING_FOR_USER": frozenset({"RUNNING", "WAITING_FOR_APPROVAL", "CANCELLED", "FAILED", "EXPIRED"}),
+    "WAITING_FOR_HUMAN": frozenset({"RUNNING", "CANCELLED", "FAILED", "EXPIRED"}),
     "RUNNING": frozenset({"PLANNING", "VERIFYING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "COMPLETED", "FAILED", "CANCELLED", "RECOVERY_REQUIRED", "BLOCKED"}),
     "VERIFYING": frozenset({"COMPLETED", "FAILED", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "RECOVERY_REQUIRED", "CANCELLED", "RUNNING"}),
     "BLOCKED": frozenset({"RUNNING", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "CANCELLED", "FAILED", "RECOVERY_REQUIRED"}),
-    "RECOVERY_REQUIRED": frozenset({"RUNNING", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "CANCELLED", "FAILED"}),
-    "COMPLETED": frozenset(), "FAILED": frozenset(), "CANCELLED": frozenset(),
+    "RECOVERY_REQUIRED": frozenset({"RUNNING", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "CANCELLED", "FAILED", "RECOVERING"}),
+    "RECOVERING": frozenset({"RUNNING", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "COMPLETED", "FAILED", "CANCELLED"}),
+    "COMPLETED": frozenset(), "FAILED": frozenset(), "CANCELLED": frozenset(), "EXPIRED": frozenset(),
 }
 
 
@@ -98,18 +101,48 @@ class RuntimeEvent:
 
 
 class RuntimeManager:
-    """The one authoritative live registry, backed by optional SQLite durability."""
+    """The one authoritative live registry, backed by optional SQLite durability.
+
+    Runtime retention is deliberately owned here, alongside lifecycle validation.
+    Persistence only performs mutations explicitly authorized by this manager.
+    """
+
+    DEFAULT_TERMINAL_RETENTION_S = 24 * 60 * 60
+    DEFAULT_WAITING_TIMEOUT_S = 48 * 60 * 60
+    DEFAULT_CLEANUP_INTERVAL_S = 5 * 60
+
+    @staticmethod
+    def _duration(name: str, default: float) -> float:
+        raw = os.environ.get(name)
+        if raw is None:
+            return float(default)
+        try:
+            value = float(raw)
+        except ValueError:
+            return float(default)
+        return max(0.0, value)
 
     def __init__(self, persistence: RuntimePersistence | None = None,
-                 *, persistence_path: str | Path | None = None) -> None:
+                 *, persistence_path: str | Path | None = None,
+                 terminal_retention_s: float | None = None,
+                 waiting_timeout_s: float | None = None,
+                 cleanup_interval_s: float | None = None) -> None:
         self._lock = threading.RLock()
         self._tasks: dict[str, RuntimeTask] = {}
         self._events: list[RuntimeEvent] = []
         self._approvals: dict[str, dict[str, Any]] = {}
         self._resources: dict[str, dict[str, Any]] = {}
         self._focused_task_id: str | None = None
+        self._terminal_retention_s = self._duration("DEIMOS_RUNTIME_TERMINAL_RETENTION_S", self.DEFAULT_TERMINAL_RETENTION_S) if terminal_retention_s is None else max(0.0, float(terminal_retention_s))
+        self._waiting_timeout_s = self._duration("DEIMOS_RUNTIME_WAITING_TIMEOUT_S", self.DEFAULT_WAITING_TIMEOUT_S) if waiting_timeout_s is None else max(0.0, float(waiting_timeout_s))
+        self._cleanup_interval_s = self._duration("DEIMOS_RUNTIME_CLEANUP_INTERVAL_S", self.DEFAULT_CLEANUP_INTERVAL_S) if cleanup_interval_s is None else max(0.0, float(cleanup_interval_s))
+        self._cleanup_stop = threading.Event()
+        self._cleanup_thread: threading.Thread | None = None
         self._persistence = persistence if persistence is not None else RuntimePersistence(persistence_path or ":memory:")
         self._load()
+        if self._cleanup_interval_s > 0:
+            self._cleanup_thread = threading.Thread(target=self._cleanup_loop, name="deimos-runtime-gc", daemon=True)
+            self._cleanup_thread.start()
 
     @property
     def persistence(self) -> RuntimePersistence:
@@ -164,8 +197,73 @@ class RuntimeManager:
             if self._tasks:
                 self._focused_task_id = next(iter(self._tasks))
 
+        self._garbage_collect(time.time())
         self._rehydrate_approval_states()
         self._recover_after_restart()
+
+    def _cleanup_loop(self) -> None:
+        while not self._cleanup_stop.wait(self._cleanup_interval_s):
+            try:
+                self._garbage_collect(time.time())
+            except Exception:
+                # Background cleanup must never terminate the runtime worker or
+                # mask an operational failure. The next interval retries.
+                continue
+
+    def _garbage_collect(self, now: float | None = None) -> dict[str, list[str]]:
+        """Expire stale waiting work and remove old terminal history safely.
+
+        RuntimeManager decides which states are operational/terminal. The
+        persistence adapter receives only the already-authorized terminal IDs.
+        No checkpoint or approval store outside RuntimePersistence is touched.
+        """
+        now = time.time() if now is None else float(now)
+        expired: list[str] = []
+        with self._lock:
+            # Waiting is operational until its own inactivity timeout. A waiting
+            # task is never expired merely because it was created long ago.
+            if self._waiting_timeout_s >= 0:
+                for task in list(self._tasks.values()):
+                    if task.state not in WAITING:
+                        continue
+                    if now - task.updated_at <= self._waiting_timeout_s:
+                        continue
+                    try:
+                        self.transition_task(
+                            task.task_id, "EXPIRED",
+                            event_type="TASK_EXPIRED",
+                            current_phase="expired",
+                            approval_state="EXPIRED",
+                            failure_state="waiting timeout",
+                            failure_category="EXPIRATION",
+                            remove_approval=True,
+                        )
+                        expired.append(task.task_id)
+                    except (KeyError, ValueError):
+                        # State changed concurrently; preserving it is safer than
+                        # deleting or expiring an ambiguous record.
+                        continue
+
+            cutoff = now - self._terminal_retention_s
+            candidates = [
+                task.task_id for task in self._tasks.values()
+                if task.state in TERMINAL and task.updated_at <= cutoff
+            ]
+            removed = self._persistence.delete_terminal_tasks(candidates, allowed_states=TERMINAL)
+            for task_id in removed:
+                self._tasks.pop(task_id, None)
+                self._approvals.pop(task_id, None)
+                self._events = [event for event in self._events if event.task_id != task_id]
+                for key, resource in list(self._resources.items()):
+                    if resource.get("task_id") == task_id:
+                        self._resources.pop(key, None)
+                if self._focused_task_id == task_id:
+                    self._focused_task_id = next(iter(self._tasks), None)
+            return {"expired": expired, "removed": removed}
+
+    def cleanup(self) -> dict[str, list[str]]:
+        """Run an immediate idempotent lifecycle cleanup pass."""
+        return self._garbage_collect(time.time())
 
     def _rehydrate_approval_states(self) -> None:
         """Reconcile persisted approval ownership with the task lifecycle.
@@ -274,6 +372,7 @@ class RuntimeManager:
             return updated
 
     def get_task(self, task_id: str) -> RuntimeTask | None:
+        self._garbage_collect()
         with self._lock:
             return self._tasks.get(task_id)
 
@@ -312,7 +411,7 @@ class RuntimeManager:
             self._tasks[task_id] = updated
             return updated
 
-    def transition_task(self, task_id: str, state: str, *, event_type: str | None = None, **changes: Any) -> RuntimeTask:
+    def transition_task(self, task_id: str, state: str, *, event_type: str | None = None, remove_approval: bool = False, **changes: Any) -> RuntimeTask:
         if state not in STATES:
             raise ValueError(f"unknown runtime state: {state}")
         with self._lock:
@@ -330,13 +429,22 @@ class RuntimeManager:
             updated = replace(current, **{k: v for k, v in changes.items() if k in RuntimeTask.__dataclass_fields__ and k not in {"task_id", "created_at"}}, updated_at=now)
             event = self._make_event(task_id, event_type or ("TASK_STATE_CHANGED" if current.state != state else "TASK_STATE_UPDATED"),
                                      {"from": current.state, "to": state} if current.state != state else None)
-            self._persistence.commit(updated, event)
+            self._persistence.commit(updated, event, remove_approval=remove_approval)
             self._tasks[task_id] = updated
+            if remove_approval:
+                self._approvals.pop(task_id, None)
             self._events.append(event)
             return updated
 
     def cancel_task(self, task_id: str, *, reason: str = "") -> RuntimeTask:
-        return self.transition_task(task_id, "CANCELLED", event_type="TASK_CANCELLED", failure_state=reason, current_phase="cancelled")
+        # Cancellation is the existing lifecycle operation for explicit delete/
+        # cancel controls.  A cancelled waiting task must also lose its durable
+        # approval owner; otherwise the task disappears from the active view but
+        # its approval could still be selected by a later bare ``yes``.
+        return self.transition_task(
+            task_id, "CANCELLED", event_type="TASK_CANCELLED",
+            failure_state=reason, current_phase="cancelled", remove_approval=True,
+        )
 
     def set_focus(self, task_id: str | None) -> None:
         with self._lock:
@@ -402,11 +510,13 @@ class RuntimeManager:
             self._tasks[task_id] = task; self._approvals[task_id] = approval; self._events.append(event)
 
     def get_approval(self, task_id: str) -> dict[str, Any] | None:
+        self._garbage_collect()
         with self._lock:
             value = self._approvals.get(task_id)
             return dict(value) if value is not None else None
 
     def resolve_approval(self, task_id: str, approved: bool, *, approval_request_id: str | None = None) -> None:
+        self._garbage_collect()
         with self._lock:
             current = self._require(task_id)
             existing = self._approvals.get(task_id)
@@ -438,8 +548,11 @@ class RuntimeManager:
     def event(self, task_id: str, event_type: str, metadata: dict[str, Any] | None = None) -> RuntimeEvent:
         with self._lock:
             self._require(task_id)
+            current = self._require(task_id)
+            updated = replace(current, updated_at=time.time())
             event = self._make_event(task_id, event_type, metadata)
-            self._persistence.commit(self._require(task_id), event)
+            self._persistence.commit(updated, event)
+            self._tasks[task_id] = updated
             self._events.append(event)
             return event
 
@@ -448,30 +561,37 @@ class RuntimeManager:
             return list(self._events if task_id is None else [e for e in self._events if e.task_id == task_id])
 
     def list_active_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return [t for t in self._tasks.values() if t.state not in TERMINAL]
 
     def list_waiting_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return [t for t in self._tasks.values() if t.state.startswith("WAITING_")]
 
     def list_running_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return [t for t in self._tasks.values() if t.state in {"RUNNING", "PLANNING", "VERIFYING"}]
 
     def list_completed_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return [t for t in self._tasks.values() if t.state == "COMPLETED"]
 
     def list_failed_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return [t for t in self._tasks.values() if t.state == "FAILED"]
 
     def list_tasks(self) -> list[RuntimeTask]:
+        self._garbage_collect()
         with self._lock:
             return list(self._tasks.values())
 
     def snapshot(self) -> dict[str, Any]:
+        self._garbage_collect()
         with self._lock:
             tasks = [t.public() for t in self._tasks.values()]
             return {
@@ -487,7 +607,35 @@ class RuntimeManager:
                 "resources": [dict(v) for v in self._resources.values()],
             }
 
+    def clear_history(self) -> list[str]:
+        """Remove only terminal runtime history through the persistence layer.
+
+        RuntimeManager is authoritative for classification. Active, waiting,
+        recovery, and unknown states are never candidates for deletion.
+        Pending approvals are an additional hard safety check in persistence.
+        LangGraph checkpoints are stored separately and are intentionally not
+        touched by this runtime-history operation.
+        """
+        with self._lock:
+            candidates = [task_id for task_id, task in self._tasks.items() if task.state in TERMINAL]
+            removed = self._persistence.delete_terminal_tasks(candidates, allowed_states=TERMINAL)
+            for task_id in removed:
+                self._tasks.pop(task_id, None)
+                self._approvals.pop(task_id, None)
+                self._events = [event for event in self._events if event.task_id != task_id]
+                for key, resource in list(self._resources.items()):
+                    if resource.get("task_id") == task_id:
+                        self._resources.pop(key, None)
+                if self._focused_task_id == task_id:
+                    self._focused_task_id = next(iter(self._tasks), None)
+            return removed
+
     def close(self) -> None:
+        self._cleanup_stop.set()
+        thread = self._cleanup_thread
+        self._cleanup_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=min(1.0, max(0.0, self._cleanup_interval_s)))
         self._persistence.close()
 
     def _require(self, task_id: str) -> RuntimeTask:

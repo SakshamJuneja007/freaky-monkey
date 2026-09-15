@@ -191,10 +191,11 @@ def _failure_clause(result: AgentResult) -> str:
 
 
 def phrase_accepted(task_id: str, goal: str, *, debug: bool = False) -> str:
-    """Said once, before execution: what the agent understood."""
-    if debug:
-        return f"Understood. Starting {task_id.replace('_', ' ')}: {_shorten(goal)}"
-    return f"DEIMOS is understanding your request: {_shorten(goal)}"
+    """Said once, before execution: describe the request, never its internal id."""
+    # task_id/runtime ids are implementation details (for example fast-8f49)
+    # and must never leak into normal or debug user-facing narration. Debug
+    # traces already have their own diagnostic channel for identifiers.
+    return f"Understood. I’ll handle this: {_shorten(goal)}"
 
 
 def phrase_unsupported() -> str:

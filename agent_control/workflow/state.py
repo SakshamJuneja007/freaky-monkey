@@ -20,3 +20,6 @@ class WorkflowGraphState(TypedDict, total=False):
     recovery_attempts: int
     resume_value: Any
     result: dict[str, Any] | None
+    ready_step_ids: list[str]
+    pending_approval_step_id: str | None
+    branch_results: dict[str, dict[str, Any]]

@@ -223,6 +223,51 @@ class RuntimePersistence:
         resources = [dict(r) for r in conn.execute("SELECT * FROM runtime_resources ORDER BY resource_key")]
         return tasks, events, approvals, resources
 
+    def delete_terminal_tasks(self, task_ids: list[str], *, allowed_states: set[str] | frozenset[str] | None = None) -> list[str]:
+        """Delete only explicitly selected terminal tasks with no pending approval.
+
+        RuntimeManager performs the state classification; this persistence method
+        only executes the already-authorized storage mutation atomically. The
+        allowed state set is supplied by RuntimeManager so this adapter does not
+        maintain a second lifecycle vocabulary.
+        """
+        if not task_ids:
+            return []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            marks = ",".join("?" for _ in task_ids)
+            rows = conn.execute(
+                f"SELECT task_id, state FROM tasks WHERE task_id IN ({marks})",
+                tuple(task_ids),
+            ).fetchall()
+            allowed = frozenset(allowed_states or ())
+            deletable = []
+            for row in rows:
+                task_id = str(row["task_id"])
+                state = str(row["state"])
+                if state not in allowed:
+                    continue
+                approval = conn.execute(
+                    "SELECT 1 FROM runtime_approvals WHERE task_id=?", (task_id,)
+                ).fetchone()
+                if approval is not None:
+                    continue
+                deletable.append(task_id)
+            if not deletable:
+                conn.commit()
+                return []
+            marks = ",".join("?" for _ in deletable)
+            params = tuple(deletable)
+            conn.execute(f"DELETE FROM runtime_events WHERE task_id IN ({marks})", params)
+            conn.execute(f"DELETE FROM runtime_resources WHERE task_id IN ({marks})", params)
+            conn.execute(f"DELETE FROM tasks WHERE task_id IN ({marks})", params)
+            conn.commit()
+            return deletable
+        except Exception:
+            conn.rollback()
+            raise
+
     def close(self) -> None:
         conn = getattr(self._local, "connection", None)
         if conn is not None:

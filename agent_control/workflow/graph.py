@@ -10,6 +10,7 @@ from .nodes import (
     approval,
     decompose,
     execute,
+    execute_ready_batch,
     load_workflow,
     next_step,
     observe,
@@ -17,6 +18,7 @@ from .nodes import (
     recover,
     route_after_policy,
     route_after_select,
+    route_after_batch,
     route_after_verify,
     select_next_step,
     verify,
@@ -58,6 +60,7 @@ def build_graph(runtime: WorkflowRuntimeAdapter, checkpointer: Any):
     builder.add_node("approval", lambda s: approval(s, runtime))
     builder.add_node("workflow_input", lambda s: workflow_input(s, runtime))
     builder.add_node("execute", lambda s: execute(s, runtime))
+    builder.add_node("execute_batch", lambda s: execute_ready_batch(s, runtime))
     builder.add_node("verify", lambda s: verify(s, runtime))
     builder.add_node("recover", lambda s: recover(s, runtime))
     builder.add_node("next_step", lambda s: next_step(s, runtime))
@@ -66,8 +69,9 @@ def build_graph(runtime: WorkflowRuntimeAdapter, checkpointer: Any):
     builder.add_edge(START, "load_workflow")
     builder.add_edge("load_workflow", "decompose")
     builder.add_edge("decompose", "select_next_step")
-    builder.add_conditional_edges("select_next_step", route_after_select, {"observe": "observe", "done": END})
+    builder.add_conditional_edges("select_next_step", route_after_select, {"observe": "observe", "batch": "execute_batch", "done": END})
     builder.add_edge("observe", "policy")
+    builder.add_conditional_edges("execute_batch", route_after_batch, {"approval": "approval", "next": "next_step", "wait": "workflow_input", "done": END})
     builder.add_conditional_edges("policy", route_after_policy, {
         "execute": "execute", "approval": "approval", "workflow_input": "workflow_input", "failed": "failed",
     })

@@ -26,11 +26,12 @@ true by construction rather than by a code path that happens to exist.
 """
 
 from __future__ import annotations
-from .conversation import ConversationEngine
+from .conversation import ConversationEngine, ConversationTransportError
 from .conversation_memory import ConversationMemory
 from .planner.openai_compat import LLMUnavailable
 
 import re
+import os
 import json
 import time
 import threading
@@ -44,19 +45,18 @@ from typing import Any, Callable
 from . import api
 from .api import AgentResult, TaskStatus
 from .types import Action, Clarification, Verdict
-from .fast_interaction import classify_fast, FastInteractionTask
+from .fast_interaction import classify_fast, FastInteractionTask, FastMessagingTask
 from .task import Task
 from .workflow import Workflow, WorkflowStepTask
 from .workflow.graph import WorkflowOrchestrator
 from .workflow.session_adapter import SessionWorkflowRuntime
 from .skills.browser import BrowserSkillAdapter
 from .runtime import RuntimeManager
-from .runtime_control import RuntimeControlKind, RuntimeControlCommand, classify_runtime_control
+from .runtime_control import RuntimeControlKind, RuntimeControlCommand, classify_runtime_control, classify_runtime_controls
 from .presentation import (
     completion_message,
     is_explicit_task_id_request,
     recovery_message,
-    runtime_snapshot_for_user,
     sanitize_tts_text,
     approval_prompt,
 )
@@ -624,7 +624,7 @@ def _corrects_previous_action(text: str) -> bool:
     )
 
 
-_LOCAL_COMMANDS = frozenset({"cls", "clear", "/help", "/tasks", "/quit"})
+_LOCAL_COMMANDS = frozenset({"cls", "clear", "/help", "/tasks", "/clear-history", "/quit"})
 _CANCEL_WORDS = frozenset({"cancel", "drop", "forget it", "never mind", "nevermind"})
 _CONTEXT_REFERENCES = (
     "that folder", "that directory", "that file", "there", "put it there",
@@ -896,6 +896,7 @@ class Session:
     #: Durable runtime database path. Tests/embedders may use ":memory:"; the CLI
     #: supplies the durable default under .agent_state.
     runtime_persistence_path: str | Path | None = ":memory:"
+    _session_owner_id: str = field(default_factory=lambda: f"session-{uuid.uuid4().hex[:12]}", repr=False, compare=False)
     history: list[Turn] = field(default_factory=list)
     #: The one question awaiting an answer, or ``None``. This is not
     #: conversational memory: :meth:`submit` takes and clears it on its first
@@ -903,8 +904,12 @@ class Session:
     #: and :func:`choose` can only ever return a path it already contains.
     pending: Pending | None = None
     pending_approval: PendingApproval | None = None
+    #: When ``resume task N`` reaches an approval gate, bare approval responses
+    #: belong to that explicitly resumed workflow even if other approvals exist.
+    _approval_context_task_id: str | None = field(default=None, repr=False, compare=False)
     pending_workflow_input: dict[str, Any] | None = None
     pending_input: PendingInput | None = field(default=None, repr=False, compare=False)
+    _runtime_resume_choices: tuple[str, ...] = field(default_factory=tuple, repr=False, compare=False)
     recent_context: RecentContext = field(default_factory=RecentContext)
     #: Browser resources are task-scoped. Each independent browser task gets
     #: its own BrowserSkill session so selecting/navigating one task cannot
@@ -943,6 +948,9 @@ class Session:
     _conversation_executor: ThreadPoolExecutor | None = field(
         default=None, repr=False, compare=False,
     )
+    _conversation_executor_retired: ThreadPoolExecutor | None = field(
+        default=None, repr=False, compare=False,
+    )
     _background: dict[str, BackgroundTask] = field(
         default_factory=dict, repr=False, compare=False,
     )
@@ -965,14 +973,33 @@ class Session:
             self._runtime = RuntimeManager(persistence_path=self.runtime_persistence_path)
         self._restore_runtime_views()
 
+    def _owned_pending_approval_records(self) -> list[dict[str, Any]]:
+        """Return pending approvals owned by this Session when ownership is known."""
+        records = self._pending_approval_records() if hasattr(self, "_pending_approval_records") else list(self._runtime.snapshot().get("pending_approvals", []) or [])
+        owned = []
+        for item in records:
+            task_id = item.get("task_id")
+            task = self._runtime.get_task(task_id) if task_id else None
+            metadata = task.metadata if task is not None and isinstance(task.metadata, dict) else {}
+            if metadata.get("session_owner_id") == self._session_owner_id:
+                owned.append(item)
+        return owned
+
     def _rehydrate_approval_owner(self) -> PendingApproval | None:
         """Rebuild the durable approval owner before dispatching user input."""
         if self.pending_approval is not None:
             return self.pending_approval
-        approvals = self._runtime.snapshot().get("pending_approvals", [])
-        if len(approvals) != 1:
+        approvals = self._pending_approval_records()
+        owned = self._owned_pending_approval_records()
+        if len(owned) == 1:
+            item = owned[0]
+        elif len(owned) > 1 or len(approvals) != 1:
             return None
-        item = approvals[0]
+        else:
+            # Restart compatibility: an older persisted task may predate the
+            # session-owner marker. With exactly one global approval, it is safe
+            # to rehydrate it; ambiguity still fails closed.
+            item = approvals[0]
         task_id = item.get("task_id")
         task = self._runtime.get_task(task_id) if task_id else None
         payload = item.get("payload") or {}
@@ -989,6 +1016,8 @@ class Session:
             step_id=payload.get("step_id"),
             approval_request_id=payload.get("approval_request_id"),
         )
+        if payload.get("explicit_resume_context"):
+            self._approval_context_task_id = task.task_id
         self.pending_approval = approval
         return approval
 
@@ -1002,17 +1031,18 @@ class Session:
         """
         if self.pending_approval is not None:
             return self.pending_approval
-        approvals = self._runtime.snapshot().get("pending_approvals", [])
+        approvals = self._pending_approval_records()
         if not approvals:
             return None
-
-        # A durable approval is safe to auto-bind only when it is unique. A
-        # focused task is presentation state, not consent, so it cannot silently
-        # select one of several approvals. Explicit task-id routing is handled by
-        # the dispatcher before this method is called.
-        if len(approvals) != 1:
+        owned = self._owned_pending_approval_records()
+        if len(owned) == 1:
+            item = owned[0]
+        elif len(owned) > 1 or len(approvals) != 1:
             return None
-        item = approvals[0]
+        else:
+            # Restart compatibility for a single legacy approval without an
+            # owner marker. Multiple approvals remain ambiguous.
+            item = approvals[0]
         task_id = item.get("task_id")
         task = self._runtime.get_task(task_id) if task_id else None
         payload = item.get("payload") or {}
@@ -1102,12 +1132,24 @@ class Session:
             # abandon a live browser mutation halfway through an operation.
             executor.shutdown(wait=True, cancel_futures=True)
         conversation_executor = self._conversation_executor
+        retired_conversation_executor = self._conversation_executor_retired
         self._conversation_executor = None
+        self._conversation_executor_retired = None
+        for executor in (conversation_executor, retired_conversation_executor):
+            if executor is not None and executor is not conversation_executor:
+                executor.shutdown(wait=True, cancel_futures=True)
         if conversation_executor is not None:
             conversation_executor.shutdown(wait=True, cancel_futures=True)
         try:
             self.narrator.close(timeout_s)
         finally:
+            try:
+                client = getattr(self._conversation, "client", None) if self._conversation is not None else None
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+            except Exception:
+                pass
             backends = list(self._browser_tasks.values())
             self._browser_tasks.clear()
             legacy = self._browser_backend
@@ -1134,6 +1176,12 @@ class Session:
         if self._closing:
             raise RuntimeError("session is shutting down")
         if self._conversation_executor is None:
+            retired = self._conversation_executor_retired
+            if retired is not None:
+                # A transport failure retires the public lane, but work already
+                # queued on that single-worker lane must finish in order. Do not
+                # create a second conversation lane while it is still draining.
+                return retired
             self._conversation_executor = ThreadPoolExecutor(
                 max_workers=1, thread_name_prefix="deimos-conversation"
             )
@@ -1144,7 +1192,7 @@ class Session:
             raise RuntimeError("session is shutting down")
         if self._executor is None:
             self._executor = ThreadPoolExecutor(
-                max_workers=1,
+                max_workers=max(2, min(4, int(os.getenv("DEIMOS_TASK_CONCURRENCY", "4")))),
                 thread_name_prefix="deimos-task",
             )
         return self._executor
@@ -1162,10 +1210,12 @@ class Session:
         continuation is allowed to mint a second identity.
         """
         task_id = runtime_task_id or workflow_task_id or f"task-{uuid.uuid4().hex[:12]}"
+        task_metadata = dict(metadata or {})
+        task_metadata.setdefault("session_owner_id", self._session_owner_id)
         self._runtime.create_task(
             goal, task_id=task_id, task_type=task_type,
             source_input_id=source_input_id, parent_task_id=parent_task_id,
-            metadata=metadata,
+            metadata=task_metadata,
         )
         return task_id
 
@@ -1436,6 +1486,24 @@ class Session:
         self._emit_reply(reply, goal=goal, state=detail)
         return Turn(task=task, reply=reply, result=result)
 
+    @staticmethod
+    def _looks_like_compound_action(text: str) -> bool:
+        """Detect likely multi-action requests without turning conversation into workflows."""
+        normalized = " ".join((text or "").casefold().split())
+        if not normalized:
+            return False
+        if re.search(r"\bthen\b|\bafter that\b", normalized):
+            return True
+        if not re.search(r"\band\b|,", normalized):
+            return False
+        verbs = (
+            "open ", "launch ", "play ", "send ", "type ", "click ", "search ",
+            "write ", "read ", "close ", "refresh ", "go to ", "create ", "run ",
+        )
+        # Count action occurrences, not distinct verb spellings: ``open A and
+        # open B`` has one verb kind but two executable clauses.
+        return sum(len(re.findall(re.escape(verb), normalized)) for verb in verbs) >= 2
+
     def _start_workflow(self, goal: str, *, source: str = "text", workflow_id: str | None = None) -> Turn:
         workflow_id = workflow_id or self._workflow_id_from_goal()
         self._runtime_create(goal, workflow_id, runtime_task_id=workflow_id, task_type="workflow", metadata={"workflow_orchestration": "langgraph"})
@@ -1467,11 +1535,51 @@ class Session:
         return self._workflow_turn(workflow_id, goal, result, source=source)
 
     def _resume_workflow_graph(self, workflow_id: str, value: Any, *, source: str = "text") -> Turn:
+        """Resume a durable workflow checkpoint, with a safe state-based fallback.
+
+        Some LangGraph/checkpointer versions raise ``KeyError`` while resuming an
+        interrupt whose checkpoint was created by an earlier graph schema.  That
+        must not turn an already-approved action into a submission error.  The
+        persisted RuntimeManager workflow is the authoritative recovery source:
+        consume the exact approval, mark only the waiting step runnable, and send
+        it back through the normal workflow-step runner.
+        """
         task = self._runtime.get_task(workflow_id)
         if task is None:
             return self._refused(UserTask(raw=str(value), text=str(value), source=source, status="dropped"), "That workflow is no longer available.")
-        result = self._workflow_engine().resume(workflow_id, value)
-        return self._workflow_turn(workflow_id, task.goal, result, source=source)
+        try:
+            result = self._workflow_engine().resume(workflow_id, value)
+            return self._workflow_turn(workflow_id, task.goal, result, source=source)
+        except KeyError as exc:
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            workflow_data = metadata.get("workflow")
+            if not isinstance(workflow_data, dict):
+                raise
+            workflow = Workflow.from_json(workflow_data)
+            step = next((item for item in workflow.steps if item.step_id == workflow.current_step_id), None)
+            if step is None:
+                step = next((item for item in workflow.steps if item.status.value == "WAITING_FOR_APPROVAL" or str(item.status) == "WAITING_FOR_APPROVAL"), None)
+            if step is None:
+                raise
+            approval = self._runtime.get_approval(workflow_id)
+            approved = bool(value) if not isinstance(value, dict) else bool(value.get("approved"))
+            if approval is not None:
+                self._runtime.resolve_approval(workflow_id, approved, approval_request_id=approval.get("approval_request_id"))
+            if not approved:
+                step.status = __import__("agent_control.workflow.models", fromlist=["StepStatus"]).StepStatus.CANCELLED
+                workflow.status = __import__("agent_control.workflow.models", fromlist=["WorkflowStatus"]).WorkflowStatus.CANCELLED
+                self._runtime.update_workflow(workflow_id, workflow.to_json(), event_type="APPROVAL_DENIED")
+                return self._workflow_turn(workflow_id, task.goal, {"result": {"status": "CANCELLED"}}, source=source)
+            step.status = __import__("agent_control.workflow.models", fromlist=["StepStatus"]).StepStatus.PENDING
+            workflow.status = __import__("agent_control.workflow.models", fromlist=["WorkflowStatus"]).WorkflowStatus.RUNNING
+            workflow.current_step_id = step.step_id
+            updated = dict(task.metadata)
+            updated["workflow_approval_granted"] = True
+            updated["workflow_approval_granted_step"] = step.step_id
+            updated["workflow"] = workflow.to_json()
+            self._runtime.update_task(workflow_id, metadata=updated)
+            self._runtime.update_workflow(workflow_id, workflow.to_json(), event_type="APPROVAL_GRANTED_FALLBACK")
+            return self._resume_workflow(workflow, source=source)
 
     def _resume_workflow(self, workflow: Workflow, *, source: str = "text", background: bool = False) -> Turn:
         """Run the next durable sequential step through the existing execution pipeline."""
@@ -1520,13 +1628,23 @@ class Session:
                 candidates.append(task.task_id)
         return len(candidates) > 1
 
-    def _resolve_workflow_input(self, raw: str, *, source: str) -> Turn:
+    def _resolve_workflow_input(self, raw: str, *, source: str, task_id: str | None = None) -> Turn:
         """Resolve the next value against the exact durable workflow/step owner."""
-        if self._has_multiple_pending_workflow_inputs():
-            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I need the task ID because more than one workflow is waiting for input.")
-        pending_data = self._rehydrate_workflow_input()
-        if pending_data is None:
-            return self._route_without_owned_input(raw, source=source)
+        if task_id is not None:
+            runtime_task_for_input = self._runtime.get_task(task_id)
+            metadata = runtime_task_for_input.metadata if runtime_task_for_input is not None and isinstance(runtime_task_for_input.metadata, dict) else {}
+            pending_data = metadata.get("pending_input") if isinstance(metadata.get("pending_input"), dict) else None
+            if pending_data is None:
+                return self._refused(
+                    UserTask(raw=raw, text=raw, source=source, task_id=task_id, status="dropped"),
+                    "That task is not waiting for your input.",
+                )
+        else:
+            if self._has_multiple_pending_workflow_inputs():
+                return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I need the task number because more than one workflow is waiting for input.")
+            pending_data = self._rehydrate_workflow_input()
+            if pending_data is None:
+                return self._route_without_owned_input(raw, source=source)
 
         try:
             pending = PendingInput.from_dict({
@@ -1598,21 +1716,50 @@ class Session:
         return list(self._runtime.snapshot().get("pending_approvals", []) or [])
 
     def _has_multiple_pending_approvals(self) -> bool:
-        return len(self._pending_approval_records()) > 1
+        records = self._pending_approval_records()
+        owned = self._owned_pending_approval_records()
+        return len(owned) > 1 or (not owned and len(records) > 1)
+
+    @staticmethod
+    def _approval_label(task: Any, payload: dict[str, Any]) -> str:
+        action = payload.get("action") if isinstance(payload.get("action"), dict) else {}
+        kind = str(action.get("kind") or "")
+        params = action.get("params") if isinstance(action.get("params"), dict) else {}
+        if kind == "whatsapp_send_message":
+            recipient = str(params.get("recipient") or params.get("to") or "the recipient").strip()
+            message = str(params.get("message") or "").strip()
+            return f'Send "{message}" to {recipient} on WhatsApp' if message else f"Send a WhatsApp message to {recipient}"
+        if kind == "gmail_send_email":
+            recipient = str(params.get("recipient") or params.get("to") or "the recipient").strip()
+            subject = str(params.get("subject") or "").strip()
+            return f'Send an email to {recipient}' + (f' about "{subject}"' if subject else "")
+        if kind in {"browser_play_song", "youtube_play", "browser_play_video"}:
+            query = str(params.get("query") or params.get("song") or "the video").strip()
+            return f"Play {query} on YouTube"
+        return str(getattr(task, "goal", "") or payload.get("request") or "the requested action").strip()
+
+    def _approval_candidates(self) -> list[dict[str, Any]]:
+        records = self._pending_approval_records()
+        owned = self._owned_pending_approval_records()
+        return owned if owned else records
 
     def _approval_owner_for_input(self, raw: str) -> PendingApproval | None:
-        records = self._pending_approval_records()
-        if not records:
+        candidates = self._approval_candidates()
+        if not candidates:
             return None
+        records = self._pending_approval_records()
         match = re.search(r"\b(?:fast|task)-[a-z0-9]+(?:-[a-z0-9]+)?\b", str(raw or ""), re.I)
         selected = None
         if match:
             selected = next((x for x in records if str(x.get("task_id", "")).casefold() == match.group(0).casefold()), None)
-            if selected is None:
-                return None
-        elif len(records) == 1:
-            selected = records[0]
+        elif len(candidates) == 1:
+            selected = candidates[0]
         else:
+            choices = tuple(api.Choice(path=str(item.get("task_id", "")), label=self._approval_label(self._runtime.get_task(item.get("task_id")), item.get("payload") or {}), detail="") for item in candidates)
+            picked = choose(Pending(query="Which one do you approve?", task_id="approval-selection", choices=choices, asked_at=time.time()), raw)
+            if picked:
+                selected = next((x for x in candidates if str(x.get("task_id", "")) == picked), None)
+        if selected is None:
             return None
         task_id = selected.get("task_id")
         task = self._runtime.get_task(task_id) if task_id else None
@@ -1629,26 +1776,38 @@ class Session:
         self.pending_approval = approval
         return approval
 
-    def _resolve_approval_input(self, raw: str, *, source: str, background: bool) -> Turn:
-        """Consume one approval response for the exact pending task.
+    def _multiple_approval_prompt(self) -> str:
+        lines = ["There are multiple actions waiting for approval:"]
+        for index, item in enumerate(self._approval_candidates(), start=1):
+            task = self._runtime.get_task(item.get("task_id"))
+            lines.append(f"{index}. {self._approval_label(task, item.get('payload') or {})}")
+        lines.append("Which one do you approve?")
+        return "\n".join(lines)
 
-        The durable RuntimeManager is consulted before falling back to normal
-        routing.  Therefore a restarted Session cannot turn a valid ``yes`` into
-        conversation merely because its local PendingApproval object was not yet
-        populated.
-        """
+    def _resolve_approval_input(self, raw: str, *, source: str, background: bool) -> Turn:
         with self._background_lock:
             approval = self.pending_approval
+        targeted_context = bool(approval is not None and self._approval_context_task_id == approval.task_id)
+        multiple = len(self._approval_candidates()) > 1 and not targeted_context
+        resolution = "resumed_task_owner" if targeted_context else ("single_pending_owner" if approval is not None and not multiple else ("session_pending_owner" if approval is not None else None))
         if approval is None:
             approval = self._approval_owner_for_input(raw)
+            if approval is not None:
+                resolution = "single_pending_owner" if not multiple else "human_selection"
         if approval is None:
-            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I need the task ID because more than one approval is waiting.") if self._has_multiple_pending_approvals() else self.submit(raw, source=source)
+            if multiple:
+                if self.debug:
+                    workflows = [str((x.get("payload") or {}).get("workflow_id") or x.get("task_id") or "unknown") for x in self._approval_candidates()]
+                    self.narrator.note(f"APPROVAL: resolution=ambiguous pending_workflows={workflows} result=NEEDS_TASK_ID")
+                return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), self._multiple_approval_prompt())
+            return self.submit(raw, source=source)
         if approval.expired:
             with self._background_lock:
                 self.pending_approval = None
             return self._approval_turn(raw, source, "That approval expired. Nothing was sent.", approval)
-
         decision = parse_approval_response(raw)
+        if decision == "AMBIGUOUS" and multiple and resolution == "human_selection":
+            decision = "APPROVE"
         decision = "APPROVE" if decision == "APPROVE" else "REJECT" if decision == "REJECT" else "AMBIGUOUS"
         if decision == "AMBIGUOUS":
             if self.debug:
@@ -1657,26 +1816,23 @@ class Session:
 
         with self._background_lock:
             self.pending_approval = None
+        self._approval_context_task_id = None
         action = Action(kind=str(approval.action["kind"]), params=dict(approval.action.get("params", {})))
         task_id = approval.task_id or f"approved-messaging-{uuid.uuid4().hex[:12]}"
         runtime_task_id = approval.runtime_task_id
         if self.debug:
-            self.narrator.note(f"APPROVAL: workflow={approval.workflow_id or 'none'} step={approval.step_id or 'none'} approval={approval.approval_request_id or 'unknown'} response={'YES' if decision == 'APPROVE' else 'NO'} result={'APPROVED' if decision == 'APPROVE' else 'REJECTED'} resumed_workflow={approval.workflow_id or 'none'}")
-        resource_key = (
-            "whatsapp" if action.kind == "whatsapp_send_message"
-            else "gmail" if action.kind == "gmail_send_email"
-            else None
-        )
+            self.narrator.note(f"APPROVAL: workflow={approval.workflow_id or 'none'} step={approval.step_id or 'none'} resolution={resolution or 'explicit_task_id'} response={'YES' if decision == 'APPROVE' else 'NO'} result={'APPROVED' if decision == 'APPROVE' else 'REJECTED'} resumed_workflow={approval.workflow_id or 'none'}")
+        resource_key = ("whatsapp" if action.kind == "whatsapp_send_message" else "gmail" if action.kind == "gmail_send_email" else None)
         if decision == "REJECT":
             if approval.workflow_id:
                 try:
-                    self._runtime.resolve_approval(approval.workflow_id, False)
+                    self._runtime.resolve_approval(approval.workflow_id, False, approval_request_id=approval.approval_request_id)
                 except (KeyError, ValueError):
                     self._runtime_transition(approval.workflow_id, "CANCELLED", event_type="APPROVAL_DENIED", approval_state="DENIED")
                 return self._approval_turn(raw, source, "Cancelled. Nothing was sent.", approval)
             if runtime_task_id:
                 try:
-                    self._runtime.resolve_approval(runtime_task_id, False)
+                    self._runtime.resolve_approval(runtime_task_id, False, approval_request_id=approval.approval_request_id)
                 except (KeyError, ValueError):
                     self._runtime_transition(runtime_task_id, "CANCELLED", event_type="APPROVAL_DENIED", approval_state="DENIED")
             if approval.background_task_id:
@@ -1689,35 +1845,26 @@ class Session:
 
         if approval.workflow_id:
             if decision == "APPROVE":
-                # Do not consume RuntimeManager approval here. The graph's
-                # resumed approval node consumes it before execution, which
-                # keeps the LangGraph interrupt/checkpoint the durable owner.
-                with self._background_lock:
-                    self.pending_approval = None
+                # The workflow graph owns consumption of the durable approval and
+                # resumes its existing checkpoint; no new task is created here.
                 return self._resume_workflow_graph(approval.workflow_id, True, source=source)
-            self._runtime.resolve_approval(approval.workflow_id, False)
+            self._runtime.resolve_approval(approval.workflow_id, False, approval_request_id=approval.approval_request_id)
             return self._resume_workflow_graph(approval.workflow_id, False, source=source)
         else:
             from .skills.messaging.task import ApprovedMessagingTask
             from .skills.messaging import BrowserMessagingBackend
             approved_task = ApprovedMessagingTask(
-                action,
-                BrowserMessagingBackend(self._browser_for_task(task_id, resource_key=resource_key)),
-                task_id=task_id,
+                action, BrowserMessagingBackend(self._browser_for_task(task_id, resource_key=resource_key)), task_id=task_id,
             )
             prepared = Prepared(
                 task=UserTask(raw=raw, text=approval.request, source=source, task_id=task_id, status="accepted"),
-                goal=approval.goal or approved_task.goal,
-                kind="approved messaging action",
+                goal=approval.goal or approved_task.goal, kind="approved messaging action", workspace=self.workspace,
+                approved_action=approval.action, browser_resource_key=resource_key, runtime_task_id=runtime_task_id,
                 task_obj=approved_task,
-                workspace=self.workspace,
-                approved_action=approval.action,
-                browser_resource_key=resource_key,
-                runtime_task_id=runtime_task_id,
             )
         if runtime_task_id:
             try:
-                self._runtime.resolve_approval(runtime_task_id, True)
+                self._runtime.resolve_approval(runtime_task_id, True, approval_request_id=approval.approval_request_id)
             except (KeyError, ValueError):
                 self._runtime_transition(runtime_task_id, "RUNNING", event_type="APPROVAL_GRANTED", approval_state="GRANTED", execution_state="RUNNING")
         if background and approval.background_task_id:
@@ -1725,9 +1872,7 @@ class Session:
             with self._background_lock:
                 record = self._background.get(bg_id)
                 if record is not None:
-                    record.state = "QUEUED"
-                    record.result = None
-                    record.failure = ""
+                    record.state = "QUEUED"; record.result = None; record.failure = ""
             future = self._background_executor().submit(self._resume_approved_background, bg_id, prepared)
             with self._background_lock:
                 record = self._background.get(bg_id)
@@ -1735,12 +1880,6 @@ class Session:
                     record.future = future
             return self._approval_turn(raw, source, "Approved. I’m continuing the original task.", approval)
         turn = self._run(prepared)
-        if approval.workflow_id and turn.result is not None and turn.result.ok:
-            runtime_task = self._runtime.get_task(approval.workflow_id)
-            workflow_data = runtime_task.metadata.get("workflow") if runtime_task else None
-            if isinstance(workflow_data, dict):
-                workflow = Workflow.from_json(workflow_data)
-                return self._resume_workflow(workflow, source=source, background=background)
         return turn
 
     def _resume_approved_background(self, background_task_id: str, prepared: Prepared) -> None:
@@ -1806,11 +1945,73 @@ class Session:
         if owner is InputOwner.CONVERSATION:
             self.narrator.note("CONVERSATION: task_created=false planner_task=false")
 
-    def _conversation_background_run(self, event: InputEvent) -> None:
+    def _conversation_background_run(self, event: InputEvent, route_s: float = 0.0) -> None:
         try:
             self.submit(event.text, source=event.source)
+            if self.debug:
+                metrics = getattr(self._conversation_engine(), "last_metrics", {}) or {}
+                self.narrator.note(
+                    "CONVERSATION_LATENCY "
+                    f"route={route_s:.3f}s "
+                    f"context_build={float(metrics.get('context_build_s', 0.0)):.3f}s "
+                    f"model_request={float(metrics.get('model_request_s', 0.0)):.3f}s "
+                    f"ttft={float(metrics.get('ttft_s', 0.0)):.3f}s "
+                    f"generation={float(metrics.get('generation_s', 0.0)):.3f}s "
+                    "response_processing=0.000s "
+                    "tts=0.000s "
+                    f"total={float(metrics.get('total_s', 0.0)) + route_s:.3f}s"
+                )
+        except ConversationTransportError as exc:
+            self._reset_conversation_executor()
+            self._safe_note(f"⚠ [{event.event_id}] conversation failed: {exc}")
         except Exception as exc:  # noqa: BLE001
             self._safe_note(f"⚠ [{event.event_id}] conversation failed: {type(exc).__name__}: {exc}")
+
+    @staticmethod
+    def _looks_like_owned_response(text: str) -> bool:
+        lowered = _WHITESPACE.sub(" ", (text or "").strip().casefold())
+        if re.search(r"\b(?:fast|task)-[a-z0-9]+(?:-[a-z0-9]+)?\b", lowered):
+            return True
+        if re.search(r"\btask\s+\d+\b", lowered):
+            return True
+        return lowered in {
+            "yes", "no", "y", "n", "okay", "ok", "do it", "continue",
+            "resume", "retry", "try again", "recover", "cancel", "stop",
+            "go ahead", "approve", "reject", "that one", "the first one",
+        }
+
+    def _approval_response_is_explicit(self, raw: str) -> bool:
+        """Return whether this utterance is actually an approval response.
+
+        Pending approval state is intentionally *not* part of new-task routing.
+        This lexical gate is the only reason approval state is consulted before
+        normal task/conversation classification.  An arbitrary action such as
+        ``open notepad and open chrome`` is therefore never inspected against
+        the pending-approval registry.
+        """
+        normalized = _WHITESPACE.sub(" ", str(raw or "").strip().casefold())
+        if not normalized:
+            return False
+        return parse_approval_response(normalized) != "AMBIGUOUS" or normalized in {
+            "that one", "the first one", "the second one", "the third one",
+        } or bool(re.fullmatch(r"\d+", normalized))
+
+    def _debug_route(self, route: str, *, control: str | None = None,
+                     approval: str | None = None, display_task: int | None = None,
+                     resolved_workflow: str | None = None, checkpoint_resume: bool = False) -> None:
+        if not self.debug:
+            return
+        self.narrator.note(f"ROUTE: {route}")
+        if control is not None:
+            self.narrator.note(f"CONTROL: {control}")
+        if approval is not None:
+            self.narrator.note(f"APPROVAL: resolution={approval}")
+        if display_task is not None:
+            self.narrator.note(f"DISPLAY_TASK={display_task}")
+        if resolved_workflow is not None:
+            self.narrator.note(f"RESOLVED_WORKFLOW={resolved_workflow}")
+        if checkpoint_resume:
+            self.narrator.note("CHECKPOINT_RESUME=true")
 
     def submit_background(self, raw: str, *, source: str = "text") -> str:
         """Dispatch one input without making conversation wait behind task work.
@@ -1821,6 +2022,7 @@ class Session:
         input still uses the exact existing ``submit`` pipeline on the background
         lane.
         """
+        dispatch_started = time.perf_counter()
         event = InputEvent(text=raw or "", source=source)
         # Rehydrate durable ownership at the dispatcher boundary.  This is the
         # critical restart invariant: pending approval outranks conversation and
@@ -1828,33 +2030,36 @@ class Session:
         # Approval is a distinct owned interaction and must be rehydrated first.
         # Workflow-input rehydration is deliberately separate; calling only that
         # method here allowed a durable approval to fall through to conversation.
-        self._rehydrate_pending_input_owner()
-        self._rehydrate_approval_owner()
-        with self._background_lock:
-            approval_pending = self.pending_approval is not None
-        if approval_pending or self._has_multiple_pending_approvals():
-            if self.debug:
-                self._debug_input(event, IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=self.pending_approval.task_id if self.pending_approval is not None else None)
-            resolved = self._resolve_approval_input(event.text, source=event.source, background=True)
-            return resolved.task.task_id
-        workflow_input_owner = self._rehydrate_workflow_input()
-        if workflow_input_owner is not None or self._has_multiple_pending_workflow_inputs():
-            if self.debug:
-                self._debug_input(event, IntentCategory.CLARIFICATION_RESPONSE, InputOwner.TASK, task_created=False, task_id=str(workflow_input_owner.get("workflow_id", "")) if workflow_input_owner else None)
-            resolved = self._resolve_workflow_input(event.text, source=event.source)
-            return resolved.task.task_id
-
-        text = _WHITESPACE.sub(" ", event.text.strip()).strip(_TRAILING)
-        control = classify_runtime_control(text)
-        if control is not None:
-            resolved = self._handle_runtime_control(control, raw=event.text, source=event.source, background=True)
+        # Avoid durable runtime scans for ordinary conversation. Session-local
+        # pending owners remain authoritative; ambiguous approval/workflow
+        # answers still trigger the existing durable rehydration path.
+        if self.pending_approval is not None or self.pending_input is not None or self.pending_workflow_input is not None or self._looks_like_owned_response(event.text):
+            self._rehydrate_pending_input_owner()
+            self._rehydrate_approval_owner()
+        controls = classify_runtime_controls(event.text)
+        if controls:
+            resolved = self._handle_runtime_controls(controls, raw=event.text, source=event.source, background=True)
             return resolved.task.task_id if resolved.task.task_id else event.event_id
 
+        if self._approval_response_is_explicit(event.text):
+            with self._background_lock:
+                approval_pending = self.pending_approval is not None
+            if approval_pending or self._has_multiple_pending_approvals():
+                if self.debug:
+                    self._debug_input(event, IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=self.pending_approval.task_id if self.pending_approval is not None else None)
+                resolved = self._resolve_approval_input(event.text, source=event.source, background=True)
+                return resolved.task.task_id
+
+        # Pending workflow input is passive here as well.  The normal submit
+        # path will classify this utterance and resolve an owned input only when
+        # it is not a fresh task.
+
+        text = _WHITESPACE.sub(" ", event.text.strip()).strip(_TRAILING)
         # Runtime-status questions are answered from the authoritative registry
         # before normal conversation/task classification. This keeps /chat usable
         # for runtime inspection even when the optional benchmark task catalog is
         # unavailable in a checkout.
-        runtime_reply = self._runtime_query_reply(text)
+        runtime_reply = self._runtime_query_reply(text) if self._is_runtime_query(text) else None
         if runtime_reply is not None:
             turn = Turn(
                 task=UserTask(raw=event.text, text=text, source=event.source, status="conversation"),
@@ -1874,8 +2079,9 @@ class Session:
             # Conversation has its own lightweight response lane. It therefore
             # cannot sit behind a long-running browser/planner task, while still
             # reusing the existing Session._converse response mechanism.
+            route_s = time.perf_counter() - dispatch_started
             self._conversation_background_executor().submit(
-                self._conversation_background_run, event
+                self._conversation_background_run, event, route_s
             )
             return event.event_id
 
@@ -2121,28 +2327,38 @@ class Session:
         # turns out to be -- which is what keeps this from becoming context the
         # agent accumulates.
         pending, self.pending = self.pending, None
-        approval = self.pending_approval or self._rehydrate_approval_owner()
-        workflow_input_owner = self.pending_workflow_input or self._rehydrate_workflow_input()
-        if approval is not None and approval.expired:
-            self.pending_approval = None
-            approval = None
+        approval = None
+        workflow_input_owner = None
 
-        # Runtime ownership is resolved before lexical intent. The local fields
-        # are only cached views; the rehydration calls above read RuntimeManager.
-        # Never let a normal conversation turn outrank an owned interaction.
-        if approval is not None or self._has_multiple_pending_approvals():
-            if self.debug:
-                self._debug_input(InputEvent(text=raw or "", source=source), IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=approval.task_id if approval is not None else None)
-            return self._resolve_approval_input(raw, source=source, background=False)
+        # Explicit slash controls and deterministic natural-language controls
+        # always win.  They are intent, not state, so pending approvals are not
+        # consulted to decide what the user meant.
+        explicit_control = classify_runtime_control(raw) if str(raw or "").lstrip().startswith("/") else None
+        if explicit_control is not None:
+            return self._handle_runtime_control(explicit_control, raw=raw, source=source, background=False)
 
-        if workflow_input_owner is not None or self._has_multiple_pending_workflow_inputs():
-            if self.debug:
-                self._debug_input(InputEvent(text=raw or "", source=source), IntentCategory.CLARIFICATION_RESPONSE, InputOwner.TASK, task_created=False, task_id=str(workflow_input_owner.get("workflow_id", "")))
-            return self._resolve_workflow_input(raw, source=source)
+        controls = classify_runtime_controls(raw)
+        if controls:
+            return self._handle_runtime_controls(controls, raw=raw, source=source, background=False)
 
-        control = classify_runtime_control(raw)
-        if control is not None:
-            return self._handle_runtime_control(control, raw=raw, source=source, background=False)
+        # A pending multi-resume selection is also an explicit interaction.  It
+        # is consulted only for selection-like input; a fresh task still wins.
+        if self._runtime_resume_choices and self._approval_response_is_explicit(raw):
+            return self._resolve_runtime_resume_selection(raw, source=source)
+
+        # A bare yes/no (or another explicit approval phrase) is the only case
+        # where pending approval state participates in routing.  A new task is
+        # otherwise classified first, so old approvals remain passive.
+        approval_response = self._approval_response_is_explicit(raw)
+        if approval_response:
+            approval = self.pending_approval or self._rehydrate_approval_owner()
+            if approval is not None and approval.expired:
+                self.pending_approval = None
+                approval = None
+            if approval is not None or self._has_multiple_pending_approvals():
+                if self.debug:
+                    self._debug_input(InputEvent(text=raw or "", source=source), IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=approval.task_id if approval is not None else None)
+                return self._resolve_approval_input(raw, source=source, background=False)
 
         if pending is not None and pending.expired:
             self.narrator.note(
@@ -2181,6 +2397,9 @@ class Session:
             IntentCategory.LOCAL_COMMAND,
         }
 
+        if fresh:
+            self._debug_route("TASK", approval="not_considered")
+
         if pending is not None and intent in {
             IntentCategory.CLARIFICATION_RESPONSE,
             IntentCategory.CANCEL,
@@ -2216,7 +2435,9 @@ class Session:
                 IntentCategory.FOLLOW_UP_ACTION,
                 IntentCategory.CORRECTION,
             }:
-                return self._general_action(task, runtime_task_id=getattr(self._thread_state, "runtime_task_id", None))
+                
+                runtime_id = getattr(self._thread_state, "runtime_task_id", None)
+                return self._general_action(task, runtime_task_id=runtime_id) if runtime_id else self._general_action(task)
 
             # ``resolve_request`` covers every request shape the assistant knows
             # -- a named file, a named project folder, and a project to create --
@@ -2228,9 +2449,42 @@ class Session:
                 workflow_id = getattr(self._thread_state, "runtime_task_id", None) or self._workflow_id_from_goal()
                 return self._start_workflow(task.text, source=source, workflow_id=workflow_id)
 
+            # P2.5: never let a single-intent fast route consume the first
+            # actionable clause of a compound request. Preserve the entire
+            # utterance for workflow decomposition.
+            if self._looks_like_compound_action(task.text):
+                workflow_id = getattr(self._thread_state, "runtime_task_id", None) or self._workflow_id_from_goal(prefix="workflow")
+                return self._start_workflow(task.text, source=source, workflow_id=workflow_id)
+
             fast = classify_fast(task.text)
             if fast.route is not None:
                 fast_task_id = getattr(self._thread_state, "runtime_task_id", None) or f"fast-{uuid.uuid4().hex[:12]}"
+                if fast.route.action_kind == "whatsapp_send_message":
+                    from .fast_interaction import FastMessagingTask
+                    action = Action(
+                        kind="whatsapp_send_message",
+                        params=dict(fast.route.params),
+                        consequential=True,
+                        rationale=fast.route.reason,
+                    )
+                    fast_task = FastMessagingTask(task.text, action)
+                    fast_task.task_id = fast_task_id
+                    resource_key = "whatsapp"
+                    browser = self._browser_for_task(fast_task_id, resource_key=resource_key)
+                    fast_task.browser = browser
+                    self.narrator.note(f"  fast route: whatsapp_send_message ({fast.latency_seconds * 1000:.2f}ms classification)") if self.debug else None
+                    runtime_task_id = self._runtime_create(fast_task.goal, fast_task.task_id, runtime_task_id=getattr(task, "runtime_task_id", None), task_type="messaging")
+                    return self._run(Prepared(
+                        task=replace(task, task_id=fast_task.task_id, status="accepted"),
+                        goal=fast_task.goal,
+                        kind="fast messaging",
+                        task_obj=fast_task,
+                        workspace=self.workspace,
+                        fast_route=fast.route,
+                        fast_latency_seconds=fast.latency_seconds,
+                        browser_resource_key=resource_key,
+                        runtime_task_id=runtime_task_id,
+                    ))
                 resource_key = (
                     "youtube"
                     if (
@@ -2272,7 +2526,8 @@ class Session:
                 # (general computer action) and Route 3 (pure conversation) both
                 # live here, and which applies is decided by one lexical question.
                 if intent is IntentCategory.ACTION:
-                    return self._general_action(task, runtime_task_id=getattr(self._thread_state, "runtime_task_id", None))
+                    runtime_id = getattr(self._thread_state, "runtime_task_id", None)
+                    return self._general_action(task, runtime_task_id=runtime_id) if runtime_id else self._general_action(task)
 
                 return self._converse(task)
 
@@ -2714,6 +2969,149 @@ class Session:
             for key, value in self.recent_context.planner_state().items():
                 self.narrator.note(f"  recent_context.{key} = {value}")
 
+    def _runtime_task_view_entries(self) -> list[dict[str, Any]]:
+        """Build the one authoritative, ephemeral mapping behind ``/tasks``.
+
+        The presentation number is deliberately not persisted.  Every call
+        rebuilds it from the current RuntimeManager state, so ``task 7`` always
+        means row 7 of the current task view rather than an internal ID derived
+        from the number.  Both CLI rendering and runtime-control resolution use
+        this exact list.
+        """
+        state_map = {
+            "CREATED": "ACTIVE", "PLANNING": "ACTIVE", "RUNNING": "ACTIVE", "VERIFYING": "ACTIVE",
+            "WAITING_FOR_APPROVAL": "WAITING FOR YOU", "WAITING_FOR_HUMAN": "WAITING FOR YOU", "WAITING_FOR_USER": "WAITING FOR YOU",
+            "RECOVERY_REQUIRED": "RECOVERY", "RECOVERING": "RECOVERY",
+            "COMPLETED": "COMPLETED", "FAILED": "FAILED", "CANCELLED": "CANCELLED", "EXPIRED": "EXPIRED",
+        }
+        sections = ("ACTIVE", "WAITING FOR YOU", "RECOVERY", "COMPLETED", "FAILED", "CANCELLED", "EXPIRED")
+        grouped: dict[str, list[Any]] = {section: [] for section in sections}
+        for task in self._runtime.list_tasks():
+            section = state_map.get(task.state)
+            if section is not None:
+                grouped[section].append(task)
+
+        entries: list[dict[str, Any]] = []
+        display_number = 1
+        for section in sections:
+            for task in grouped[section]:
+                entries.append({"display_number": display_number, "task": task, "section": section})
+                display_number += 1
+        return entries
+
+    def _resolve_runtime_task_ref(self, task_ref: int) -> Any | None:
+        """Resolve a human ``/tasks`` number through the current view mapping."""
+        entries = self._runtime_task_view_entries()
+        for entry in entries:
+            if entry["display_number"] == int(task_ref):
+                return entry["task"]
+        return None
+
+    def _runtime_task_view_bounds(self) -> tuple[int, int]:
+        """Return the current human-facing task-number range."""
+        count = len(self._runtime_task_view_entries())
+        return (1, count)
+
+    def _resolve_runtime_control_command(self, command: RuntimeControlCommand) -> RuntimeControlCommand | None:
+        if command.task_ref is None:
+            return command
+        task = self._resolve_runtime_task_ref(command.task_ref)
+        if task is None:
+            return None
+        return replace(command, task_id=task.task_id)
+
+    def _handle_runtime_controls(self, commands: list[RuntimeControlCommand], *, raw: str, source: str, background: bool) -> Turn:
+        """Resolve a deterministic runtime-control sentence before conversation."""
+        resolved: list[RuntimeControlCommand] = []
+        invalid: list[str] = []
+        for command in commands:
+            if command.task_ref is None and command.task_id is None:
+                resolved.append(command)
+                continue
+            item = self._resolve_runtime_control_command(command)
+            if item is None or not item.task_id:
+                if command.task_ref is not None:
+                    _first, last = self._runtime_task_view_bounds()
+                    invalid.append(
+                        f"Task {command.task_ref} could not be found in the current task list (1–{last})."
+                        if last else f"Task {command.task_ref} could not be found in the current task list."
+                    )
+                else:
+                    invalid.append("One referenced task could not be found.")
+                continue
+            if self.debug and command.task_ref is not None:
+                self.narrator.note(
+                    f"RUNTIME_CONTROL: operation={command.kind.value} "
+                    f"display_task={command.task_ref} resolved_task={item.task_id}"
+                )
+            resolved.append(item)
+
+        if invalid and len(commands) == 1:
+            return self._refused(
+                UserTask(raw=raw, text=raw, source=source, status="dropped"),
+                invalid[0] + " Use /tasks and tell me the correct task number.",
+            )
+        if not resolved:
+            return self._refused(
+                UserTask(raw=raw, text=raw, source=source, status="dropped"),
+                " ".join(invalid) or "I couldn't safely identify the referenced tasks.",
+            )
+
+        if self.debug and len(resolved) > 1:
+            if all(command.kind is RuntimeControlKind.CANCEL for command in resolved):
+                self.narrator.note("ROUTE: RUNTIME_CONTROL")
+                self.narrator.note("CONTROL: DELETE_TASKS")
+                self.narrator.note(f"DISPLAY_TASKS={[command.task_ref for command in commands]}")
+                self.narrator.note(f"RESOLVED_WORKFLOWS={[command.task_id for command in resolved]}")
+
+        if len(resolved) == 1 and len(commands) == 1:
+            command = resolved[0]
+            if command.kind is RuntimeControlKind.APPROVE:
+                if command.task_id:
+                    approval = self._approval_owner_for_input(command.task_id)
+                    if approval is None:
+                        target = self._runtime.get_task(command.task_id)
+                        if target is not None and target.state in {"WAITING_FOR_USER", "WAITING_FOR_HUMAN"}:
+                            return self._resolve_workflow_input("yes", source=source, task_id=command.task_id)
+                        return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "That task is not waiting for an approval.")
+                    return self._resolve_approval_input("yes", source=source, background=background)
+                if not self._approval_candidates():
+                    return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "There are no pending approvals right now.")
+                approval = self._approval_owner_for_input(raw)
+                if approval is None:
+                    return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I couldn't safely identify the approval. Please review the pending actions and choose one.")
+                return self._resolve_approval_input("yes", source=source, background=background)
+            return self._handle_runtime_control(command, raw=raw, source=source, background=background)
+
+        # Resolve every target before executing any operation, so an ambiguous
+        # reference cannot cause a partially applied multi-operation sentence.
+        results: list[Turn] = []
+        for command in resolved:
+            if command.kind is RuntimeControlKind.APPROVE:
+                if command.task_id:
+                    approval = self._approval_owner_for_input(command.task_id)
+                    if approval is None:
+                        target = self._runtime.get_task(command.task_id)
+                        if target is not None and target.state in {"WAITING_FOR_USER", "WAITING_FOR_HUMAN"}:
+                            results.append(self._resolve_workflow_input("yes", source=source, task_id=command.task_id))
+                            continue
+                        return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "One of the referenced tasks is not waiting for approval.")
+                    results.append(self._resolve_approval_input("yes", source=source, background=background))
+                else:
+                    if not self._approval_candidates():
+                        return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "There are no pending approvals right now.")
+                    approval = self._approval_owner_for_input(raw)
+                    if approval is None:
+                        return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I couldn't safely identify the approval. Please review the pending actions and choose one.")
+                    results.append(self._resolve_approval_input("yes", source=source, background=background))
+            else:
+                results.append(self._handle_runtime_control(command, raw=raw, source=source, background=background))
+        replies = [result.reply for result in results if result.reply]
+        replies.extend(invalid)
+        reply = "\n".join(replies)
+        last = results[-1]
+        return replace(last, reply=reply)
+
     def _runtime_control_task(self, command: RuntimeControlCommand):
         snapshot = self.runtime_snapshot()
         tasks = self._runtime.list_tasks()
@@ -2729,7 +3127,7 @@ class Session:
             return active[0], None
         if not active:
             return None, "There are no active tasks right now."
-        return None, "I need a task ID because multiple active tasks need attention."
+        return None, "I found multiple active tasks. Tell me which one you mean."
 
     @staticmethod
     def _runtime_task_reply(task) -> str:
@@ -2742,6 +3140,8 @@ class Session:
             return "The task is waiting for your input."
         if state == "RECOVERY_REQUIRED":
             return "The task needs recovery before it can continue."
+        if state == "RECOVERING":
+            return "The task is being recovered."
         if state == "RUNNING":
             return "The task is already running."
         if state == "COMPLETED":
@@ -2750,13 +3150,31 @@ class Session:
             return "The task failed; I will not replay it without an explicit retry."
         if state == "CANCELLED":
             return "The task was cancelled and will not be replayed."
+        if state == "EXPIRED":
+            return "The task expired and will not be resumed."
         return f"The task is {state.casefold()}."
 
     def _resume_runtime_task(self, task, *, source: str, background: bool) -> Turn:
         if task is None:
             return Turn(task=UserTask(raw="", text="", source=source, status="dropped"), reply="There are no matching runtime tasks to continue.")
         state = str(task.state)
-        if state in {"WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "RECOVERY_REQUIRED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}:
+        if state == "WAITING_FOR_APPROVAL":
+            approval = self._approval_owner_for_input(task.task_id)
+            if approval is None:
+                return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "That task is waiting for approval, but its approval owner could not be recovered safely.")
+            self._approval_context_task_id = task.task_id
+            try:
+                payload = dict(self._runtime.get_approval(task.task_id) or {})
+                payload["explicit_resume_context"] = True
+                self._runtime.request_approval(task.task_id, payload)
+            except Exception:
+                pass
+            if self.debug:
+                self._debug_route("RUNTIME_CONTROL", control="RESUME_TASK", resolved_workflow=task.task_id, checkpoint_resume=True)
+            reply = f"Task needs approval: {task.goal}\nApprove?"
+            self._emit_reply(reply, goal=task.goal, state="WAITING_FOR_APPROVAL")
+            return Turn(task=UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), reply=reply, result=None)
+        if state in {"WAITING_FOR_USER", "WAITING_FOR_HUMAN", "RECOVERY_REQUIRED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}:
             reply = self._runtime_task_reply(task)
             return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), reply)
         workflow_data = task.metadata.get("workflow") if isinstance(task.metadata, dict) else None
@@ -2775,9 +3193,96 @@ class Session:
             return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "The task has an incomplete prerequisite, so I will not skip ahead.")
         if workflow.steps[idx].state != "PENDING":
             return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), self._runtime_task_reply(task))
-        return self._resume_workflow(workflow, source=source, background=background)
+        # Explicit resume is a continuation of the durable workflow, not a new
+        # execution of its current step.  Re-enter the existing LangGraph thread
+        # by canonical workflow id so completed branches/checkpoints are retained.
+        if self.debug:
+            self._debug_route("RUNTIME_CONTROL", control="RESUME_TASK", resolved_workflow=workflow.workflow_id, checkpoint_resume=True)
+        return self._resume_workflow_graph(workflow.workflow_id, None, source=source)
+
+    def runtime_tasks_for_display(self) -> dict[str, list[dict[str, Any]]]:
+        """Return the current human-facing task view, without internal IDs.
+
+        Ordering is inherited from ``_runtime_task_view_entries`` so the same
+        numbered presentation is authoritative for both ``/tasks`` and natural
+        language runtime-control references.
+        """
+        groups = {"ACTIVE": [], "WAITING FOR YOU": [], "RECOVERY": [], "COMPLETED": [], "FAILED": [], "CANCELLED": [], "EXPIRED": []}
+        for number, entry in enumerate(self._runtime_task_view_entries(), 1):
+            task = entry["task"]
+            section = entry["section"]
+            item = {"display_number": number, "goal": task.goal, "state": task.state}
+            metadata = task.metadata if isinstance(task.metadata, dict) else {}
+            workflow = metadata.get("workflow")
+            if isinstance(workflow, dict):
+                steps = workflow.get("steps") if isinstance(workflow.get("steps"), list) else []
+                current = workflow.get("current_step")
+                if isinstance(current, int) and 0 <= current < len(steps):
+                    step = steps[current] if isinstance(steps[current], dict) else {}
+                    action = step.get("action") if isinstance(step.get("action"), dict) else {}
+                    params = action.get("params") if isinstance(action.get("params"), dict) else {}
+                    kind = str(action.get("kind") or "")
+                    if kind == "whatsapp_send_message":
+                        recipient = str(params.get("recipient") or params.get("to") or "")
+                        item["step"] = f"Step {current + 1} of {len(steps)}: Send a WhatsApp message to {recipient}" if recipient else f"Step {current + 1} of {len(steps)}"
+                    elif kind in {"browser_play_song", "youtube_play", "browser_play_video"}:
+                        query = str(params.get("query") or params.get("song") or "")
+                        item["step"] = f"Step {current + 1} of {len(steps)}: Play {query} on YouTube" if query else f"Step {current + 1} of {len(steps)}"
+                    elif steps:
+                        item["step"] = f"Step {current + 1} of {len(steps)}"
+            groups[section].append(item)
+        return groups
+
+    def _resumable_runtime_tasks(self) -> list[Any]:
+        candidates = []
+        for task in self._runtime.list_tasks():
+            if task.state not in {"CREATED", "PLANNING"}:
+                continue
+            workflow_data = task.metadata.get("workflow") if isinstance(task.metadata, dict) else None
+            if not isinstance(workflow_data, dict):
+                continue
+            try:
+                workflow = Workflow.from_json(workflow_data)
+            except Exception:
+                continue
+            idx = workflow.current_step
+            if 0 <= idx < len(workflow.steps) and workflow.steps[idx].state == "PENDING" and all(step.state == "COMPLETED" for step in workflow.steps[:idx]):
+                candidates.append(task)
+        return candidates
+
+    def _resume_selection_prompt(self, candidates: list[Any]) -> str:
+        lines = ["I found multiple tasks that can be resumed:"]
+        lines.extend(f"{i}. {task.goal}" for i, task in enumerate(candidates, 1))
+        lines.append("Which one should I resume?")
+        return "\n".join(lines)
+
+    def _resolve_runtime_resume_selection(self, raw: str, *, source: str) -> Turn:
+        candidates = [self._runtime.get_task(task_id) for task_id in self._runtime_resume_choices]
+        candidates = [task for task in candidates if task is not None]
+        if not candidates:
+            self._runtime_resume_choices = ()
+            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "There are no resumable tasks right now.")
+        choices = tuple(api.Choice(path=task.task_id, label=task.goal, detail="") for task in candidates)
+        picked = choose(Pending(query="Which task should I resume?", task_id="resume-selection", choices=choices, asked_at=time.time()), raw)
+        if not picked:
+            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), self._resume_selection_prompt(candidates))
+        task = next((task for task in candidates if task.task_id == picked), None)
+        self._runtime_resume_choices = ()
+        return self._resume_runtime_task(task, source=source, background=False)
 
     def _handle_runtime_control(self, command: RuntimeControlCommand, *, raw: str, source: str, background: bool) -> Turn:
+        if command.kind in {RuntimeControlKind.CONTINUE, RuntimeControlKind.RESUME} and not command.task_id:
+            candidates = self._resumable_runtime_tasks()
+            if len(candidates) == 1:
+                return self._resume_runtime_task(candidates[0], source=source, background=background)
+            if len(candidates) > 1:
+                choices = tuple(api.Choice(path=task.task_id, label=task.goal, detail="") for task in candidates)
+                picked = choose(Pending(query="Which task should I resume?", task_id="resume-selection", choices=choices, asked_at=time.time()), raw)
+                if picked:
+                    selected = next(task for task in candidates if task.task_id == picked)
+                    return self._resume_runtime_task(selected, source=source, background=background)
+                self._runtime_resume_choices = tuple(task.task_id for task in candidates)
+                return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), self._resume_selection_prompt(candidates))
         if self.debug:
             owner = InputOwner.TASK
             self._debug_input(InputEvent(text=raw, source=source), None, owner, task_created=False, task_id=command.task_id)
@@ -2785,8 +3290,19 @@ class Session:
         task, error = self._runtime_control_task(command)
         if error:
             return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=command.task_id or "", status="accepted"), error)
+        if command.kind is RuntimeControlKind.CLEAR_HISTORY:
+            removed = self._runtime.clear_history()
+            active = len(self._runtime.list_active_tasks())
+            if removed:
+                reply = f"History cleared: {len(removed)} inactive workflows/tasks removed. Active workflows preserved: {active}."
+            else:
+                reply = "No inactive workflow history to clear."
+            return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), reply)
+
         if command.kind is RuntimeControlKind.STATUS:
-            reply = self._runtime_query_reply("what tasks are running") or "There are no active tasks right now."
+            if self.debug:
+                self._debug_route("RUNTIME_CONTROL", control="LIST_PENDING_TASKS")
+            reply = self._runtime_query_reply("what tasks are pending") or "There are no pending tasks right now."
             return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id if task else "", status="accepted"), reply)
         if command.kind is RuntimeControlKind.CANCEL:
             if task is None:
@@ -2794,10 +3310,12 @@ class Session:
             if task.state in {"COMPLETED", "FAILED", "CANCELLED"}:
                 return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), self._runtime_task_reply(task))
             self._runtime.cancel_task(task.task_id, reason="cancelled by user")
-            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task was cancelled.")
+            if self.debug:
+                self._debug_route("RUNTIME_CONTROL", control="DELETE_TASKS")
+            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task was deleted.")
         if command.kind is RuntimeControlKind.RETRY:
             if task is None:
-                return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I need a task ID because multiple tasks are available.")
+                return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I found multiple failed tasks. Tell me which one you mean.")
             if task.state != "FAILED":
                 return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task is not failed, so I will not retry it.")
             # The existing recovery pipeline owns retries; this control command
@@ -2829,31 +3347,49 @@ class Session:
             return self._resume_runtime_task(task, source=source, background=background)
         return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I could not resolve that runtime command safely.")
 
-    def _runtime_query_reply(self, text: str) -> str | None:
-        """Answer runtime-status questions from RuntimeManager truth.
+    @staticmethod
+    def _is_runtime_query(text: str) -> bool:
+        lowered = _WHITESPACE.sub(" ", (text or "").strip().casefold())
+        if is_explicit_task_id_request(text):
+            return True
+        return any(phrase in lowered for phrase in (
+            "what are you doing", "what task is running", "what tasks are running",
+            "what is running", "what are your pending tasks",
+            "what are the pending tasks", "what tasks are pending",
+            "which tasks are pending", "what is pending", "show my tasks",
+            "what tasks do i have", "show my pending tasks", "show pending tasks",
+            "list my pending tasks", "list pending tasks",
+            "what went wrong", "what task went wrong", "what failed",
+        ))
 
-        Technical task IDs are exposed only for an explicit task-ID request.
-        Ordinary status questions receive semantic descriptions suitable for TTS.
-        """
+    def _runtime_query_reply(self, text: str) -> str | None:
+        """Answer explicit runtime-status questions without touching runtime state otherwise."""
+        if not self._is_runtime_query(text):
+            return None
         lowered = _WHITESPACE.sub(" ", (text or "").strip().casefold())
         snapshot = self.runtime_snapshot()
         active = snapshot["active_tasks"]
         failed = snapshot["failed_tasks"]
 
         if is_explicit_task_id_request(text):
-            focused_id = snapshot.get("focused_task_id")
-            task_id = focused_id if isinstance(focused_id, str) else None
-            if not task_id and active:
-                task_id = active[0].get("task_id")
-            if task_id:
-                return sanitize_tts_text(f"The task ID is {task_id}.", allow_internal=True)
-            return "There is no active task with a task ID right now."
+            return "I keep internal task identifiers private. Use /tasks to see your tasks."
 
         status_query = (
             "what are you doing" in lowered
             or "what task is running" in lowered
             or "what tasks are running" in lowered
             or "what is running" in lowered
+            or "what are your pending tasks" in lowered
+            or "what are the pending tasks" in lowered
+            or "what tasks are pending" in lowered
+            or "which tasks are pending" in lowered
+            or "what is pending" in lowered
+            or "show my tasks" in lowered
+            or "what tasks do i have" in lowered
+            or "show my pending tasks" in lowered
+            or "show pending tasks" in lowered
+            or "list my pending tasks" in lowered
+            or "list pending tasks" in lowered
         )
         failure_query = (
             "what went wrong" in lowered
@@ -2861,19 +3397,27 @@ class Session:
             or "what failed" in lowered
         )
         if status_query:
-            if not active:
-                return "There are no active tasks right now."
-            parts = []
-            for item in active:
-                goal = item.get("goal") or "the requested task"
-                state = str(item.get("state") or "")
+            entries = [
+                entry for entry in self._runtime_task_view_entries()
+                if entry["section"] in {"ACTIVE", "WAITING FOR YOU", "RECOVERY"}
+            ]
+            if not entries:
+                return "There are no pending tasks right now."
+            lines = ["I currently have these pending tasks:"]
+            for entry in entries:
+                number = entry["display_number"]
+                task = entry["task"]
+                state = str(task.state or "")
                 if state == "WAITING_FOR_APPROVAL":
-                    parts.append(f"{goal} is waiting for your approval")
+                    detail = "waiting for your approval"
+                elif state in {"WAITING_FOR_USER", "WAITING_FOR_HUMAN"}:
+                    detail = "waiting for your input"
                 elif state == "RECOVERY_REQUIRED":
-                    parts.append(f"{goal} was interrupted and needs recovery")
+                    detail = "interrupted and needs recovery"
                 else:
-                    parts.append(f"{goal} is {_friendly_runtime_state(state)}")
-            return "I currently have " + "; ".join(parts) + "."
+                    detail = _friendly_runtime_state(state)
+                lines.append(f"{number} - {task.goal} — {detail}")
+            return "\n".join(lines)
         if failure_query:
             if not failed:
                 return "I don't have any failed tasks in the current runtime."
@@ -2904,17 +3448,34 @@ class Session:
             return turn
 
         try:
-            runtime = self.runtime_snapshot()
-            context = dict(self.recent_context.planner_state())
-            context["runtime"] = runtime
-            reply = self._conversation_engine().reply(
-                task.text,
-                history=self.history,
-                recent_context=context,
-                memories=self._conversation_memory().search(task.text, limit=8),
+            # Pure conversation gets only conversational state. Runtime state and
+            # persistent memory are opt-in for turns that actually need them.
+            needs_runtime_context = _references_recent_context(task.text, self.recent_context)
+            context = dict(self.recent_context.planner_state()) if needs_runtime_context else None
+            memories = None
+            if self._conversation_needs_persistent_memory(task.text):
+                memories = self._conversation_memory().search(task.text, limit=4)
+
+            engine = self._conversation_engine()
+            # Keep the known-good NVIDIA/OpenAI-compatible request path as the
+            # default. The experimental SSE transport is intentionally not
+            # selected automatically because it regressed gpt-oss-20b TTFT.
+            # Conversation still stays on its dedicated fast lane and uses one
+            # real model request.
+            streamed = False
+            reply = engine.reply(
+                task.text, history=self.history,
+                recent_context=context, memories=memories,
             )
-            reply = guard_conversation_runtime_claim(reply, runtime)
+
+            # Most conversational replies need no runtime lookup. Only invoke
+            # the existing safety guard when the model actually makes an
+            # execution-state claim.
+            if re.search(r"\b(?:i(?:'m)?|we(?:'re)?|deimos|the task|it)\s+(?:am|are|is|was|were|has|have)?\s*(?:now\s+)?(?:sending|sent|started|resumed|running|completed|finished|failed|stopped|cancelled|canceled|playing)\b", reply, re.I):
+                reply = guard_conversation_runtime_claim(reply, self.runtime_snapshot())
         except (LLMUnavailable, RuntimeError) as exc:
+            if isinstance(exc, ConversationTransportError):
+                self._reset_conversation_executor()
             return self._refused(
                 task,
                 f"I could not reach the conversation model ({exc}), so I have "
@@ -2923,16 +3484,59 @@ class Session:
 
         turn = Turn(task=replace(task, status="conversation"), reply=reply,
                     result=None)
-        self._emit_reply(reply)
+        if not streamed:
+            self._emit_reply(reply)
         self.history.append(turn)
         self._remember_turn(turn)
         return turn
+
+    @staticmethod
+    def _conversation_needs_persistent_memory(text: str) -> bool:
+        lowered = _WHITESPACE.sub(" ", (text or "").strip().casefold())
+        # Recent in-session history is the normal memory mechanism. Persistent
+        # search is reserved for requests that clearly ask for remembered/past
+        # information, avoiding a full JSONL scan for "hey".
+        return any(marker in lowered for marker in (
+            "remember", "forgot", "previous", "earlier", "before",
+            "yesterday", "last time", "do you recall", "what did i",
+        ))
+
+    @staticmethod
+    def _conversation_streaming_supported(engine: Any) -> bool:
+        client = getattr(engine, "client", None)
+        return callable(getattr(client, "chat_stream", None))
+
+    def _stream_conversation_reply(
+        self, engine: Any, task: UserTask, context: dict[str, str] | None,
+        memories: list[dict[str, Any]] | None,
+    ) -> str:
+        chunks: list[str] = []
+        first = True
+        for chunk in engine.reply_stream(
+            task.text, history=self.history, recent_context=context, memories=memories,
+        ):
+            if not chunk:
+                continue
+            chunks.append(chunk)
+            if first:
+                self.narrator.write(chunk)
+                first = False
+            else:
+                self.narrator.write(chunk)
+        if not chunks:
+            raise RuntimeError("Conversation model returned an empty response.")
+        reply = "".join(chunks).strip()
+        if first:
+            raise RuntimeError("Conversation model returned an empty response.")
+        self.narrator.write("\n")
+        # TTS is deliberately queued only after the complete text is visible.
+        self.narrator.say(sanitize_tts_text(reply, goal=task.text))
+        return reply
 
     def _action_reply(self, task: UserTask, result: AgentResult) -> str:
         memory = self._conversation_memory()
         memories = memory.search(task.text, limit=8)
         context = dict(self.recent_context.planner_state())
-        context["runtime"] = runtime_snapshot_for_user(self.runtime_snapshot())
         event = {
             "request": task.text,
             "status": result.status.value,
@@ -2967,6 +3571,14 @@ class Session:
         if self._conversation is None:
             self._conversation = ConversationEngine.from_env()
         return self._conversation
+
+    def _reset_conversation_executor(self) -> None:
+        """Retire the public lane after a transport fault without reordering queued turns."""
+        with self._background_lock:
+            executor = self._conversation_executor
+            self._conversation_executor = None
+            if executor is not None:
+                self._conversation_executor_retired = executor
 
     def _refused(self, task: UserTask, reply: str) -> Turn:
         """Record a turn that ran nothing. ``result`` stays ``None``."""

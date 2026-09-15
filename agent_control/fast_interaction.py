@@ -104,6 +104,9 @@ _COMPLEX_MARKERS = (
     "find ", "compare ", "choose ", "pick the best", "summarize", "explain",
     "organize ", "why ", "fix ", "do whatever", "research ", "and then", " after ",
 )
+
+# Compound requests must reach decomposition intact.
+_COMPOUND_ACTION_RE = re.compile(r"\band\b")
 _NUMBER = r"(?:first|second|third|fourth|fifth|sixth|\d+(?:st|nd|rd|th)?)"
 
 
@@ -112,7 +115,11 @@ def classify_fast(request: str) -> FastClassification:
     text = " ".join((request or "").strip().lower().split())
     route: FastRoute | None = None
 
-    if text and not any(marker in f" {text} " for marker in _COMPLEX_MARKERS):
+    # This is one semantic browser workflow even though it contains the word
+    # "and"; do not let the generic compound guard swallow it.
+    if re.fullmatch(r"open\s+youtube\s+and\s+play\s+.+", text):
+        route = FastRoute("browser_play_song", {"query": text.split(" and play ", 1)[1]}, "semantic YouTube song playback")
+    elif text and not any(marker in f" {text} " for marker in _COMPLEX_MARKERS) and not _COMPOUND_ACTION_RE.search(text):
         route = _classify_simple(text)
 
     return FastClassification(route, time.perf_counter() - started)
@@ -211,6 +218,19 @@ def _classify_simple(text: str) -> FastRoute | None:
         if text in {f"open {phrase}", f"go to {phrase}", phrase}:
             return FastRoute("browser_open_url", {"url": url, "expected_url": url}, "explicit site navigation")
 
+    # WhatsApp shorthand is deterministic and must not invoke the LLM merely
+    # to discover recipient/message fields.  Keep this deliberately strict so
+    # uncertain messaging requests still use the normal planner.
+    m = re.fullmatch(r"send\s+(?:a\s+)?(?:whatsapp\s+)?(?:message\s+)?to\s+(.+?)\s+(?:on\s+whatsapp\s+)?(?:saying|telling)\s+(.+)", text)
+    if m:
+        recipient, message = m.group(1).strip(), m.group(2).strip()
+        return FastRoute("whatsapp_send_message", {"recipient": recipient, "message": message}, "deterministic WhatsApp send")
+    m = re.fullmatch(r"send\s+(.+?)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?", text)
+    if m:
+        message, recipient = m.group(1).strip(), m.group(2).strip()
+        if message and recipient and recipient.casefold() not in {"whatsapp", "a whatsapp"}:
+            return FastRoute("whatsapp_send_message", {"recipient": recipient, "message": message}, "deterministic WhatsApp shorthand")
+
     return None
 
 
@@ -294,6 +314,73 @@ def _youtube_short(
         if "/shorts/" in normalized or "youtube.com/shorts" in normalized or "youtu.be/shorts" in normalized:
             return True
     return False
+
+
+
+class FastMessagingTask:
+    """Deterministic one-shot messaging task.
+
+    The action is known from the user's exact utterance, so there is no reason
+    to spend an LLM round planning it.  Policy still runs normally and can
+    suspend the task for approval.  After approval Session resumes the exact
+    structured action through ApprovedMessagingTask/BrowserSkill.
+    """
+    bucket = "fast_messaging"
+
+    def __init__(self, request: str, action: Action) -> None:
+        self.request = request
+        self.goal = request
+        self.task_id = f"fast-{abs(hash((request, time.time_ns()))) & 0xffffffff:08x}"
+        self.action = action
+
+    def action_template(self) -> Action:
+        return self.action
+
+    def resolve_current_action(self) -> Action:
+        return self.action
+
+    def setup(self, policy: Any) -> None:
+        return None
+
+    def observe(self, policy: Any, trace: Any = None) -> dict[str, Observation]:
+        return {"messaging": Observation(Source.BROWSER, "messaging target", {
+            "action": self.action.kind,
+            "recipient": self.action.params.get("recipient", ""),
+        })}
+
+    def reference_plan(self, policy: Any) -> list[Action]:
+        return [self.action]
+
+    def verify_checkpoint(self, policy: Any, action: Action, trace: Any = None) -> VerificationResult | None:
+        return None
+
+    def verify_final(self, policy: Any, trace: Any = None) -> VerificationResult:
+        try:
+            from .skills.messaging import BrowserMessagingBackend
+            from .skills.messaging.verifier import MessagingVerifier
+            # Use the same task-scoped browser session that the approved action
+            # will use.  Verification is fresh and never assumes click success.
+            browser = getattr(self, "browser", None)
+            if browser is None:
+                return VerificationResult([
+                    Check("fast_messaging", Verdict.UNKNOWN, {}, "messaging browser was not attached")
+                ], label="fast messaging")
+            verification = MessagingVerifier(BrowserMessagingBackend(browser)).verify(
+                __import__("agent_control.skills.messaging.actions", fromlist=["MessagingAction"]).MessagingAction.from_core(self.action),
+                None,
+            )
+            status = str(getattr(verification, "status", "UNKNOWN")).upper()
+            verdict = {"PASS": Verdict.PASS, "FAIL": Verdict.FAIL}.get(status, Verdict.UNKNOWN)
+            return VerificationResult([
+                Check("fast_messaging", verdict, {"action": self.action.to_json()}, getattr(verification, "detail", ""))
+            ], label="fast messaging")
+        except Exception as exc:
+            return VerificationResult([
+                Check("fast_messaging", Verdict.UNKNOWN, {"action": self.action.to_json()}, f"messaging verification unavailable: {type(exc).__name__}: {exc}")
+            ], label="fast messaging")
+
+    def teardown(self, policy: Any) -> None:
+        return None
 
 
 class FastInteractionTask:

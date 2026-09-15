@@ -5,6 +5,7 @@ from typing import Any
 
 from ..planner.base import Planner
 from .models import Workflow
+from .scheduler import DependencyScheduler
 
 
 class WorkflowDecomposer:
@@ -19,4 +20,6 @@ class WorkflowDecomposer:
             raise RuntimeError(planned.error)
         if not planned.actions:
             raise RuntimeError("planner produced no executable actions and did not claim completion")
-        return Workflow.from_actions(workflow_id, goal, list(planned.actions))
+        workflow = Workflow.from_actions(workflow_id, goal, list(planned.actions))
+        DependencyScheduler.validate(workflow)
+        return workflow

@@ -1487,20 +1487,16 @@ def launch_app(
         app = normalized_app
 
     if app == "chrome":
-        chrome_profile = (
-            _chrome_agent_profile(policy)
-        )
-
-        argv.extend(
-            [
-                (
-                    "--user-data-dir="
-                    f"{chrome_profile}"
-                ),
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-        )
+        # IMPORTANT: never force DEIMOS into its isolated .hermes profile.
+        # Chrome itself owns the user's normal profile selection, including
+        # the Default profile and any already-open windows/tabs. BrowserSkill
+        # is then used for browser-page automation/authenticated web tasks.
+        # Launching chrome.exe without --user-data-dir lets Chrome reuse the
+        # normal installed profile instead of opening a blank agent profile.
+        argv.extend([
+            "--no-first-run",
+            "--no-default-browser-check",
+        ])
 
     # launch_app is intentionally application-only. File paths and URLs have
     # their own semantic action kinds so the planner cannot accidentally turn a
@@ -1521,12 +1517,13 @@ def launch_app(
         shell=False,
     )
 
+    # Keep Chrome's existing behavior untouched. Other GUI startup actions do
+    # not need a six-second artificial sleep: Popen returning is enough to hand
+    # control back, while verification can establish the window/process state.
+    default_settle = 6.0 if app == "chrome" else 0.35
     settle = _bounded_float(
-        action.params.get(
-            "settle_s",
-            6.0,
-        ),
-        default=6.0,
+        action.params.get("settle_s", default_settle),
+        default=default_settle,
         minimum=0.0,
         maximum=_MAX_APP_SETTLE_SECONDS,
     )
@@ -1543,9 +1540,7 @@ def launch_app(
     }
 
     if app == "chrome":
-        detail["profile"] = str(
-            _chrome_agent_profile(policy)
-        )
+        detail["profile"] = "default-chrome-profile"
 
     return _result(
         action,

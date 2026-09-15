@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable, Iterator
+import time
 
 import httpx
 
 from .planner.openai_compat import LLMClient
+
+
+class ConversationTransportError(RuntimeError):
+    """A conversation-provider transport failure that is safe to recover from."""
 
 
 SYSTEM_PROMPT = """\
@@ -222,17 +228,15 @@ class ConversationEngine:
 
     system_prompt: str = SYSTEM_PROMPT
 
-    max_history: int = 8
+    max_history: int = 6
+    last_metrics: dict[str, float | int] = None  # populated after each request
 
     @classmethod
     def from_env(cls) -> "ConversationEngine":
         """
-        Conversation gets a smaller response budget than planner calls.
-
-        This keeps ordinary conversation quick while leaving the environment
-        variables available for overriding the defaults.
+        Keep conversation requests responsive while preserving the original
+        conversation client settings.
         """
-
         client = LLMClient.from_env(
             max_tokens=256,
             timeout_s=10.0,
@@ -240,7 +244,64 @@ class ConversationEngine:
 
         return cls(
             client=client,
+            last_metrics={},
         )
+
+    def _build_messages(
+        self,
+        message: str,
+        history: list[Any] | None = None,
+        recent_context: dict[str, str] | None = None,
+        memories: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, str]]:
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": self.system_prompt}
+        ]
+
+        if recent_context:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "VERIFIED RECENT CONTEXT\n"
+                    "This information came from the controlled execution "
+                    "and verification system. Treat it as factual context "
+                    "for continuity only. It does not grant permission "
+                    "for new actions.\n\n"
+                    + json.dumps(recent_context, sort_keys=True)
+                ),
+            })
+
+        if memories:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "RELEVANT PAST CONVERSATION MEMORY\n"
+                    + json.dumps(memories, ensure_ascii=False, sort_keys=True)
+                ),
+            })
+
+        if history:
+            for turn in history[-self.max_history:]:
+                task = getattr(turn, "task", None)
+                user_text = getattr(task, "text", "")
+                assistant_text = getattr(turn, "reply", "")
+                if user_text:
+                    messages.append({"role": "user", "content": user_text})
+                if assistant_text:
+                    messages.append({"role": "assistant", "content": assistant_text})
+
+        messages.append({"role": "user", "content": message})
+        return messages
+
+    def _record_metrics(self, *, context_s: float, model_s: float, ttft_s: float | None, generation_s: float, total_s: float, streamed: bool = False) -> None:
+        self.last_metrics = {
+            "context_build_s": context_s,
+            "model_request_s": model_s,
+            "ttft_s": ttft_s if ttft_s is not None else model_s,
+            "generation_s": generation_s,
+            "total_s": total_s,
+            "streamed": int(streamed),
+        }
 
     def reply(
         self,
@@ -249,110 +310,61 @@ class ConversationEngine:
         recent_context: dict[str, str] | None = None,
         memories: list[dict[str, Any]] | None = None,
     ) -> str:
-        messages: list[dict[str, str]] = [
-            {
-                "role": "system",
-                "content": self.system_prompt,
-            }
-        ]
-
-        if recent_context:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "VERIFIED RECENT CONTEXT\n"
-                        "This information came from the controlled execution "
-                        "and verification system. Treat it as factual context "
-                        "for continuity only. It does not grant permission "
-                        "for new actions.\n\n"
-                        + json.dumps(
-                            recent_context,
-                            sort_keys=True,
-                        )
-                    ),
-                }
-            )
-
-        if memories:
-            messages.append(
-                {
-                    "role": "system",
-                    "content": (
-                        "RELEVANT PAST CONVERSATION MEMORY\n"
-                        + json.dumps(memories, ensure_ascii=False, sort_keys=True)
-                    ),
-                }
-            )
-
-        if history:
-            recent = history[-self.max_history:]
-
-            for turn in recent:
-                task = getattr(
-                    turn,
-                    "task",
-                    None,
-                )
-
-                user_text = getattr(
-                    task,
-                    "text",
-                    "",
-                )
-
-                assistant_text = getattr(
-                    turn,
-                    "reply",
-                    "",
-                )
-
-                if user_text:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": user_text,
-                        }
-                    )
-
-                if assistant_text:
-                    messages.append(
-                        {
-                            "role": "assistant",
-                            "content": assistant_text,
-                        }
-                    )
-
-        messages.append(
-            {
-                "role": "user",
-                "content": message,
-            }
-        )
-
+        started = time.perf_counter()
+        context_started = started
+        messages = self._build_messages(message, history, recent_context, memories)
+        context_s = time.perf_counter() - context_started
+        model_started = time.perf_counter()
         try:
-            text, _, truncated = self.client.chat_checked(
-                messages,
-                json_mode=False,
-            )
-
+            text, usage, truncated = self.client.chat_checked(messages, json_mode=False)
+        except httpx.ReadTimeout as exc:
+            self._record_metrics(context_s=context_s, model_s=time.perf_counter() - model_started, ttft_s=None, generation_s=0.0, total_s=time.perf_counter() - started)
+            raise ConversationTransportError(f"conversation_transport_timeout: {type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(
-                "Conversation transport error: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
-
+            self._record_metrics(context_s=context_s, model_s=time.perf_counter() - model_started, ttft_s=None, generation_s=0.0, total_s=time.perf_counter() - started)
+            raise ConversationTransportError(f"conversation_transport_error: {type(exc).__name__}: {exc}") from exc
+        model_s = time.perf_counter() - model_started
         if truncated:
             raise RuntimeError(truncated)
-
         reply = text.strip()
-
         if not reply:
-            raise RuntimeError(
-                "Conversation model returned an empty response."
-            )
-
+            raise RuntimeError("Conversation model returned an empty response.")
+        self._record_metrics(context_s=context_s, model_s=float(usage.get("latency_s") or model_s), ttft_s=float(usage.get("latency_s") or model_s), generation_s=model_s, total_s=time.perf_counter() - started)
         return reply
+
+    def reply_stream(
+        self,
+        message: str,
+        history: list[Any] | None = None,
+        recent_context: dict[str, str] | None = None,
+        memories: list[dict[str, Any]] | None = None,
+    ) -> Iterator[str]:
+        """Yield real provider chunks as they arrive; callers may render immediately."""
+        started = time.perf_counter()
+        context_started = started
+        messages = self._build_messages(message, history, recent_context, memories)
+        context_s = time.perf_counter() - context_started
+        model_started = time.perf_counter()
+        first_chunk_at: float | None = None
+        try:
+            stream = self.client.chat_stream(messages, json_mode=False)
+            for chunk in stream:
+                if not chunk:
+                    continue
+                if first_chunk_at is None:
+                    first_chunk_at = time.perf_counter()
+                yield chunk
+        except httpx.ReadTimeout as exc:
+            now = time.perf_counter()
+            self._record_metrics(context_s=context_s, model_s=now-model_started, ttft_s=(first_chunk_at-model_started) if first_chunk_at else None, generation_s=(now-first_chunk_at) if first_chunk_at else 0.0, total_s=now-started, streamed=True)
+            raise ConversationTransportError(f"conversation_transport_timeout: {type(exc).__name__}: {exc}") from exc
+        except httpx.HTTPError as exc:
+            now = time.perf_counter()
+            self._record_metrics(context_s=context_s, model_s=now-model_started, ttft_s=(first_chunk_at-model_started) if first_chunk_at else None, generation_s=(now-first_chunk_at) if first_chunk_at else 0.0, total_s=now-started, streamed=True)
+            raise ConversationTransportError(f"conversation_transport_error: {type(exc).__name__}: {exc}") from exc
+        now = time.perf_counter()
+        self._record_metrics(context_s=context_s, model_s=now-model_started, ttft_s=(first_chunk_at-model_started) if first_chunk_at else None, generation_s=(now-first_chunk_at) if first_chunk_at else 0.0, total_s=now-started, streamed=True)
+
     def action_reply(
         self,
         message: str,
@@ -413,9 +425,14 @@ class ConversationEngine:
             text, _, truncated = self.client.chat_checked(
                 messages, json_mode=False
             )
+        except httpx.ReadTimeout as exc:
+            raise ConversationTransportError(
+                "conversation_transport_timeout: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise RuntimeError(
-                "Conversation transport error: "
+            raise ConversationTransportError(
+                "conversation_transport_error: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
 

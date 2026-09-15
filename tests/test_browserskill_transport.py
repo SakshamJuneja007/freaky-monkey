@@ -82,3 +82,39 @@ def test_scroll_falls_back_to_supported_keyboard_primitive_when_wheel_is_unavail
     calls = [call[0] for call in cli.calls]
     assert any(c[:2] == ["wheel", "--session"] for c in calls)
     assert any(c[:2] == ["press", "--session"] and "PageDown" in c for c in calls)
+
+
+def test_session_start_prefers_default_chrome_profile(monkeypatch):
+    from agent_control.skills.browser.backend import BrowserSkillAdapter
+
+    class CLI:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, args):
+            self.calls.append(list(args))
+            if args[:1] == ["browsers"]:
+                return {
+                    "browsers": [
+                        {"id": "work", "browser": "Chrome", "profile": "Profile 3"},
+                        {"id": "default", "browser": "Chrome", "profile": "Default"},
+                        {"id": "edge", "browser": "Microsoft Edge", "profile": "Default"},
+                    ]
+                }
+            if args[:2] == ["session", "start"]:
+                return {"session_id": "abcd"}
+            raise AssertionError(args)
+
+    cli = CLI()
+    browser = BrowserSkillAdapter(cli)
+    browser.session_start()
+
+    assert cli.calls[1] == ["session", "start", "--browser", "default", "--no-focus"]
+
+
+def test_phrase_accepted_never_exposes_internal_task_id():
+    from agent_control.response import phrase_accepted
+
+    text = phrase_accepted("fast-1234", "open chrome", debug=True)
+    assert "fast-1234" not in text
+    assert "Starting fast" not in text

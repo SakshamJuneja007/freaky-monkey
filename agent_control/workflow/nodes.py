@@ -10,6 +10,8 @@ from typing import Any, Protocol
 from ..policy import Decision
 from .models import StepStatus, Workflow, WorkflowStatus
 from .resources import bind_resources
+from .scheduler import DependencyScheduler
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from .state import WorkflowGraphState
 
 
@@ -63,34 +65,42 @@ def decompose(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dic
 
 def select_next_step(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state)
-    current = workflow.steps[workflow.current_step] if workflow.steps else None
-    if current is not None and current.status is StepStatus.COMPLETED:
-        # A completed side-effecting step is terminal and must never be replayed.
-        runnable = _next_runnable_step(workflow)
-    else:
-        runnable = _next_runnable_step(workflow)
-
-    if runnable is not None:
-        workflow.current_step_id = runnable.step_id
+    scheduler = DependencyScheduler()
+    scheduler.validate(workflow)
+    ready = scheduler.ready_nodes(workflow)
+    if ready:
         workflow.status = WorkflowStatus.RUNNING
-        runtime.emit_workflow_event(workflow, "STEP_SELECTED", step_id=runnable.step_id, step_index=runnable.index)
-        return {"workflow": workflow.to_json(), "current_step_id": runnable.step_id}
-
+        ids = [node.step_id for node in ready]
+        workflow.current_step_id = ready[0].step_id
+        runtime.emit_workflow_event(workflow, "READY_NODES_SELECTED", step_ids=ids)
+        return {"workflow": workflow.to_json(), "current_step_id": ready[0].step_id, "ready_step_ids": ids}
     if all(step.status is StepStatus.COMPLETED for step in workflow.steps):
         workflow.status = WorkflowStatus.COMPLETED
         runtime.emit_workflow_event(workflow, "WORKFLOW_COMPLETED")
         return {"workflow": workflow.to_json(), "result": {"status": "COMPLETED"}}
-
-    # No runnable step and not all steps are complete means the workflow is
-    # blocked by a failure/recovery condition; never turn that into success.
-    workflow.status = WorkflowStatus.FAILED
-    runtime.emit_workflow_event(workflow, "WORKFLOW_FAILED", reason="no runnable step remains")
-    return {"workflow": workflow.to_json(), "decision": "FAILED"}
+    workflow.status = DependencyScheduler.aggregate(workflow)
+    runtime.emit_workflow_event(workflow, "WORKFLOW_NOT_READY", status=workflow.status.value)
+    return {"workflow": workflow.to_json(), "decision": "FAILED" if workflow.status in {WorkflowStatus.FAILED, WorkflowStatus.BLOCKED, WorkflowStatus.PARTIAL_FAILURE, WorkflowStatus.UNKNOWN} else "WAIT"}
 
 
 def route_after_select(state: WorkflowGraphState) -> str:
     workflow = _workflow(state)
-    return "done" if workflow.status is WorkflowStatus.COMPLETED else "observe"
+    if workflow.status is WorkflowStatus.COMPLETED:
+        return "done"
+    ready = state.get("ready_step_ids") or []
+    return "batch" if len(ready) > 1 else "observe"
+
+
+def route_after_batch(state: WorkflowGraphState) -> str:
+    decision = str(state.get("decision", "BATCH_DONE"))
+    if decision == "APPROVAL_REQUIRED":
+        return "approval"
+    if decision == "WAITING_FOR_USER":
+        return "wait"
+    workflow = _workflow(state)
+    if workflow.status is WorkflowStatus.COMPLETED:
+        return "done"
+    return "next"
 
 
 def observe(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
@@ -181,6 +191,91 @@ def workflow_input(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -
     return {"workflow": workflow.to_json(), "pending_input": None, "decision": "ALLOW"}
 
 
+def execute_ready_batch(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
+    """Run policy-approved ready branches concurrently through the existing adapter."""
+    workflow = _workflow(state)
+    ready_ids = list(state.get("ready_step_ids") or [n.step_id for n in DependencyScheduler.ready_nodes(workflow)])
+    pending_approval = None
+    executable = []
+    for node_id in ready_ids:
+        node = next((n for n in workflow.steps if n.step_id == node_id), None)
+        if node is None or node.status is StepStatus.COMPLETED:
+            continue
+        index = node.index
+        runtime.emit_workflow_event(workflow, "STEP_SELECTED", step_id=node.step_id, step_index=index)
+        observation = runtime.observe_workflow_step(workflow, index)
+        node.observation = dict(observation or {})
+        decision, reason, pending_input = runtime.workflow_policy(workflow, index)
+        if pending_input is not None:
+            node.status = StepStatus.WAITING_FOR_USER
+            workflow.status = WorkflowStatus.WAITING_FOR_USER
+            runtime.request_workflow_input(workflow, index, pending_input)
+            return {"workflow": workflow.to_json(), "decision": "WAITING_FOR_USER", "pending_input": pending_input}
+        if decision == Decision.CONFIRM.value:
+            node.status = StepStatus.WAITING_FOR_APPROVAL
+            pending_approval = node.step_id
+            continue
+        if decision == Decision.DENY.value:
+            node.status = StepStatus.FAILED
+            node.error = reason
+            continue
+        node.policy_state = "ALLOWED"
+        executable.append(node)
+
+    def run_branch(node):
+        node.status = StepStatus.RUNNING
+        node.attempt_count += 1
+        runtime.emit_workflow_event(workflow, "STEP_EXECUTION_STARTED", step_id=node.step_id, resource=node.resource_key)
+        result = runtime.execute_workflow_step(workflow, node.index, None)
+        return node, result
+
+    branch_results = dict(state.get("branch_results") or {})
+    scheduler = DependencyScheduler()
+    # Resource ownership is acquired per branch; no capability implementation is
+    # duplicated here. Different resources overlap, shared resources serialize.
+    futures = {}
+    with ThreadPoolExecutor(max_workers=scheduler.max_concurrency, thread_name_prefix="deimos-workflow") as pool:
+        for node in executable:
+            if not scheduler.resources.try_acquire(node.resource_key, node.step_id):
+                node.status = StepStatus.WAITING_RESOURCE
+                continue
+            futures[pool.submit(run_branch, node)] = node
+        for future in as_completed(futures):
+            node = futures[future]
+            try:
+                _, result = future.result()
+                normalized = dict(result or {})
+                verification = dict(normalized.get("verification") or {})
+                step_result = dict(normalized.get("result") or {})
+                branch_results[node.step_id] = normalized
+                if normalized.get("needs_input"):
+                    node.status = StepStatus.WAITING_FOR_USER
+                elif normalized.get("ok") and str(verification.get("verdict", "UNKNOWN")).upper() == "PASS":
+                    node.status = StepStatus.COMPLETED
+                    node.result = step_result
+                    node.verification = verification
+                elif str(verification.get("verdict", "")).upper() == "UNKNOWN":
+                    node.status = StepStatus.UNKNOWN
+                    node.verification = verification
+                else:
+                    node.status = StepStatus.FAILED
+                    node.error = str(normalized.get("error") or "workflow step failed")
+                    node.verification = verification
+            except Exception as exc:
+                node.status = StepStatus.FAILED
+                node.error = f"{type(exc).__name__}: {exc}"
+                branch_results[node.step_id] = {"status": "FAILED", "error": node.error}
+            finally:
+                scheduler.resources.release(node.resource_key, node.step_id)
+
+    workflow.status = DependencyScheduler.aggregate(workflow)
+    result = {"status": workflow.status.value, "branches": branch_results}
+    if pending_approval:
+        workflow.current_step_id = pending_approval
+        workflow.status = WorkflowStatus.WAITING_FOR_APPROVAL
+        return {"workflow": workflow.to_json(), "decision": "APPROVAL_REQUIRED", "pending_approval_step_id": pending_approval, "branch_results": branch_results, "result": result}
+    return {"workflow": workflow.to_json(), "decision": "BATCH_DONE", "branch_results": branch_results, "result": result}
+
 def execute(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state)
     index = workflow.current_step
@@ -268,25 +363,16 @@ def next_step(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dic
     if runnable is not None:
         workflow.current_step_id = runnable.step_id
         workflow.status = WorkflowStatus.RUNNING
-        runtime.emit_workflow_event(
-            workflow,
-            "STEP_ADVANCED",
-            from_step=previous_id,
-            to_step=runnable.step_id,
-        )
-        runtime.emit_workflow_event(
-            workflow,
-            "STEP_SELECTED",
-            step_id=runnable.step_id,
-            step_index=runnable.index,
-        )
+        runtime.emit_workflow_event(workflow, "STEP_ADVANCED", from_step=previous_id, to_step=runnable.step_id)
+        runtime.emit_workflow_event(workflow, "STEP_SELECTED", step_id=runnable.step_id, step_index=runnable.index)
         return {"workflow": workflow.to_json(), "current_step_id": runnable.step_id}
-    if all(step.status is StepStatus.COMPLETED for step in workflow.steps):
-        workflow.status = WorkflowStatus.COMPLETED
+    from .scheduler import DependencyScheduler
+    workflow.status = DependencyScheduler.aggregate(workflow)
+    if workflow.status is WorkflowStatus.COMPLETED:
         runtime.emit_workflow_event(workflow, "WORKFLOW_COMPLETED")
         return {"workflow": workflow.to_json(), "decision": "DONE", "result": {"status": "COMPLETED"}}
-    workflow.status = WorkflowStatus.FAILED
-    return {"workflow": workflow.to_json(), "decision": "FAILED"}
+    runtime.emit_workflow_event(workflow, "WORKFLOW_TERMINAL", status=workflow.status.value)
+    return {"workflow": workflow.to_json(), "decision": "FAILED", "result": {"status": workflow.status.value}}
 
 
 def recover(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:

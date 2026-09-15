@@ -1015,11 +1015,28 @@ def _permit_and_execute(
             context = {"action": action.to_json()}
             if loop.workflow is not None and loop.workflow_step_index >= 0:
                 _workflow_step(loop, loop.workflow_step_index, "WAITING_FOR_APPROVAL", reason="policy confirmation required")
-                context.update({
-                    "workflow_id": loop.workflow.workflow_id,
-                    "step_id": loop.workflow.steps[loop.workflow_step_index].step_id,
-                    "step_index": loop.workflow_step_index,
-                })
+                # GeneralTask builds a small internal workflow object for its
+                # planner loop. It is NOT a LangGraph checkpoint. Only expose
+                # workflow_id/step_id to Session when the owning RuntimeManager
+                # task explicitly identifies itself as LangGraph orchestration;
+                # otherwise approval must resume the exact action through the
+                # normal ApprovedMessagingTask path.
+                is_langgraph = False
+                runtime_manager = loop.config.runtime_manager
+                runtime_task_id = loop.config.runtime_task_id
+                if runtime_manager is not None and runtime_task_id:
+                    try:
+                        runtime_task = runtime_manager.get_task(runtime_task_id)
+                        metadata = getattr(runtime_task, "metadata", {}) if runtime_task is not None else {}
+                        is_langgraph = isinstance(metadata, dict) and metadata.get("workflow_orchestration") == "langgraph"
+                    except Exception:
+                        is_langgraph = False
+                if is_langgraph:
+                    context.update({
+                        "workflow_id": loop.workflow.workflow_id,
+                        "step_id": loop.workflow.steps[loop.workflow_step_index].step_id,
+                        "step_index": loop.workflow_step_index,
+                    })
             raise NeedUserInput(
                 Clarification(
                     question=f"Approve {action.kind.replace('_', ' ')}?",

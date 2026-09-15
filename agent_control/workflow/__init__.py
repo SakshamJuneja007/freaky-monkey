@@ -36,3 +36,6 @@ class WorkflowStepTask(GeneralTask):
         return {"workflow_step": Observation(Source.BROWSER, "workflow step", self.workflow_step.action.kind)}
 
 __all__.append("WorkflowStepTask")
+from .models import DependencyType, TaskNode
+from .scheduler import DependencyScheduler, ResourceLockManager, ScheduleResult, WorkflowGraphError, recover_failed_node
+__all__ += ["DependencyType", "TaskNode", "DependencyScheduler", "ResourceLockManager", "ScheduleResult", "WorkflowGraphError", "recover_failed_node"]

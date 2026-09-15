@@ -622,8 +622,10 @@ Type a message and press Enter -- or press Enter on an empty line to speak one.
 
   /memory <query>      look up remembered file locations; runs nothing
 
-  /tasks               list registered workflows and background task state
-  /cancel <task-id>    cancel a queued background task
+  /tasks               show current tasks and what they are waiting for
+  /resume              resume a task that can safely continue
+  /clear-history       remove inactive runtime history
+  /cancel              cancel a task when it can be identified safely
 
   cls | clear          clear the terminal locally; no model call
 
@@ -705,7 +707,7 @@ def _chat_voice(session) -> None:
 
     submitted = session.submit_capture(capture, background=True)
     if isinstance(submitted, str):
-        print(f"  [{submitted}] submitted")
+        print("  submitted")
 
 
 def _chat_memory(
@@ -799,68 +801,44 @@ def _chat_command(
             argument.strip(),
         )
 
+    elif name == "clear-history":
+
+        session.submit("/clear-history", source="text")
+
+    elif name == "resume":
+
+        session.submit(f"resume {argument.strip()}".strip(), source="text")
+
     elif name == "tasks":
 
-        print("RUNTIME TASKS")
-        snapshot = session.runtime_snapshot()
-        active = snapshot["active_tasks"]
-        waiting = snapshot["waiting_tasks"]
-        completed = snapshot["completed_tasks"]
-        failed = snapshot["failed_tasks"]
-
-        def show(title, items):
-            print(f"\n{title}")
+        groups = session.runtime_tasks_for_display()
+        shown = 0
+        print("TASKS")
+        for title, items in groups.items():
             if not items:
-                print("  (none)")
-                return
+                continue
+            print(f"\n{title}")
             for item in items:
-                print(f"  [{item['task_id']}] {item['state']:<20} {item['goal']}")
-                workflow = item.get("metadata", {}).get("workflow") if isinstance(item.get("metadata"), dict) else None
-                if isinstance(workflow, dict):
-                    for step in workflow.get("steps", []):
-                        capability = step.get("capability", "step")
-                        args = step.get("arguments", {}) if isinstance(step.get("arguments"), dict) else {}
-                        target = args.get("recipient") or args.get("query") or ""
-                        suffix = f" → {target}" if target else ""
-                        print(f"      Step {int(step.get('index', 0)) + 1}  {step.get('state', 'PENDING'):<20} {capability}{suffix}")
-
-        show("ACTIVE", active)
-        # Waiting tasks are also active; this separate section makes approval
-        # ownership visible without maintaining a second task registry.
-        show("WAITING", waiting)
-        show("COMPLETED", completed[-10:])
-        show("FAILED", failed[-10:])
-
-        show("RECOVERY_REQUIRED", snapshot.get("recovery_tasks", []))
-        show("CANCELLED", snapshot.get("cancelled_tasks", [])[-10:])
-
-        print("\nBACKGROUND TASK VIEW")
-        background_by_id = {}
-        for item in (active + waiting + completed + failed + snapshot.get("recovery_tasks", []) + snapshot.get("cancelled_tasks", [])):
-            if item.get("metadata", {}).get("background"):
-                background_by_id[item["task_id"]] = item
-        background = list(background_by_id.values())
-        if not background:
-            print("  (none)")
-        else:
-            for item in background[-20:]:
-                print(f"  [{item['task_id']}] {item['state']:<20} {item['goal']}")
-
-        print("\nREGISTERED / STRUCTURED")
-        try:
-            cmd_tasks(argparse.Namespace())
-        except ModuleNotFoundError:
-            print("  registered task catalog unavailable in this checkout")
+                shown += 1
+                number = item.get("display_number", shown)
+                print(f"  {number} - {item['goal']}")
+                state = item.get("state", "")
+                friendly = {
+                    "CREATED": "Starting", "PLANNING": "Planning", "RUNNING": "Running", "VERIFYING": "Verifying",
+                    "WAITING_FOR_APPROVAL": "Waiting for approval", "WAITING_FOR_USER": "Waiting for your input",
+                    "WAITING_FOR_HUMAN": "Waiting for your input", "RECOVERY_REQUIRED": "Recovery required",
+                    "RECOVERING": "Recovering", "COMPLETED": "Completed", "FAILED": "Failed",
+                    "CANCELLED": "Cancelled", "EXPIRED": "Expired",
+                }.get(state, "In progress")
+                print(f"     {friendly}")
+                if item.get("step"):
+                    print(f"     {item['step']}")
+        if shown == 0:
+            print("\nNo active or retained runtime tasks.")
 
     elif name == "cancel":
 
-        task_id = argument.strip()
-        if not task_id:
-            print("  usage: /cancel <task-id>")
-        elif session.cancel_background(task_id):
-            print(f"  [{task_id}] cancelled")
-        else:
-            print(f"  [{task_id}] could not be cancelled (not queued or not found)")
+        session.submit(f"cancel {argument.strip()}".strip(), source="text")
 
     else:
 
@@ -968,8 +946,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 continue
 
             try:
-                task_id = session.submit_background(line)
-                print(f"[{task_id}] submitted")
+                session.submit_background(line)
+                print("  submitted")
 
             except KeyboardInterrupt:
 
