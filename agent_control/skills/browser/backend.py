@@ -439,8 +439,21 @@ class BrowserSkillAdapter:
             )
 
         self._lock = RLock()
+        self.debug = False
         self._generation = 0
         self._last_observation: BrowserObservation | None = None
+
+    def new_task_session(self) -> "BrowserSkillAdapter":
+        """Create an independent BrowserSkill resource for one task.
+
+        The new adapter shares only the CLI transport configuration. It does
+        not share a BrowserSkill session, active tab, observation cache, or
+        semantic-ref generation with this adapter. BrowserSkill assigns the
+        actual session id when the child first executes a command.
+        """
+        return BrowserSkillAdapter(
+            cli=self.cli,
+        )
 
     @property
     def session_id(self) -> str | None:
@@ -954,7 +967,39 @@ class BrowserSkillAdapter:
         return self.press(target, str(key))
 
     def scroll(self, amount: int) -> BrowserSkillResult:
-        return self.wheel(int(amount))
+        """Scroll the active page using BrowserSkill's supported key primitive.
+
+        Some installed BrowserSkill CLI builds do not expose the newer ``wheel``
+        subcommand even though the browser adapter historically called it.  The
+        portable BrowserSkill contract already exposes global ``press`` and
+        Chromium treats PageDown/PageUp as real viewport scrolling.  Keep the
+        capability at this adapter boundary rather than guessing a CLI command
+        or bypassing BrowserSkill.
+        """
+        delta = int(amount)
+        if delta == 0:
+            return BrowserSkillResult({"ok": True, "amount": 0, "key": None})
+
+        # Newer BrowserSkill builds expose native wheel input.  Some installed
+        # Windows builds in the field do not; they return an explicit
+        # ``unrecognized subcommand 'wheel'`` error.  Try the native primitive
+        # first, then use the already-supported semantic keyboard primitive as a
+        # compatibility path.  Both stay inside BrowserSkill and both cause a
+        # real browser mutation; there is no fake success path.
+        try:
+            return self.wheel(delta)
+        except BrowserSkillError as exc:
+            message = str(exc).casefold()
+            if "unrecognized subcommand 'wheel'" not in message:
+                raise
+
+        key = "PageDown" if delta > 0 else "PageUp"
+        result = self._session_command("press", key)
+        if isinstance(result, BrowserSkillResult):
+            result.setdefault("scroll_amount", delta)
+            result.setdefault("scroll_key", key)
+            result.setdefault("scroll_fallback", "keyboard")
+        return result
 
     def upload_file(self, target: str | BrowserTarget, file_path: str, *, mode: str | None = None) -> BrowserSkillResult:
         return self.upload(target, file_path, mode=mode)
@@ -1583,7 +1628,46 @@ class BrowserSkillAdapter:
         *,
         timeout_s: float = _WHATSAPP_READY_TIMEOUT_S,
     ) -> BrowserSkillResult:
-        """Navigate to WhatsApp Web and wait for a safely classified state."""
+        """Ensure WhatsApp Web is ready without reopening an already-open page.
+
+        The BrowserSkill session is the reusable resource boundary. If this
+        resource is already on WhatsApp Web and authenticated, preserve that
+        live page/current chat and continue from it. Only navigate when the
+        existing resource is not already on WhatsApp Web.
+        """
+        if self.session:
+            try:
+                current_url = self.current_url()
+            except BrowserSkillError:
+                current_url = ""
+            if "web.whatsapp.com" in str(current_url).casefold():
+                state = self.wait_for_whatsapp_ready(timeout_s=timeout_s)
+                if state == "READY":
+                    return BrowserSkillResult({
+                        "ok": True,
+                        "provider": "whatsapp",
+                        "state": state,
+                        "url": current_url,
+                        "reused": True,
+                    })
+                if state == "LOGIN_REQUIRED":
+                    raise BrowserSkillError(
+                        "WhatsApp Web requires login/QR authentication",
+                        code="whatsapp_login_required",
+                        data={"state": state},
+                    )
+                if state == "LOADING":
+                    raise BrowserSkillError(
+                        "WhatsApp Web did not become ready before the bounded timeout",
+                        code="whatsapp_not_ready",
+                        data={"state": state},
+                    )
+                raise BrowserSkillError(
+                    "WhatsApp Web state could not be safely determined",
+                    code="whatsapp_state_unknown",
+                    data={"state": state},
+                )
+
         navigation = self.navigate("https://web.whatsapp.com/")
         if not navigation.ok:
             raise BrowserSkillError(
@@ -2037,7 +2121,7 @@ class BrowserSkillAdapter:
         if not click_search.ok:
             raise BrowserSkillError(
                 "WhatsApp search control could not be clicked",
-                code="whatsapp_search_not_ready",
+                code="whatsapp_chat_search_failed",
             )
 
         search = self._whatsapp_search_ref(
@@ -2078,7 +2162,18 @@ class BrowserSkillAdapter:
                     timeout_s=min(2.5, remaining_s),
                     poll_ms=150,
                 )
-                click_result = self.click(target)
+                try:
+                    click_result = self.click(target)
+                except BrowserSkillError as exc:
+                    if "stale" in str(exc).casefold():
+                        last_click_error = BrowserSkillError(
+                            "WhatsApp chat-result semantic target became stale before click",
+                            code="whatsapp_target_stale",
+                            data={"semantic_target_category": "chat_result"},
+                        )
+                        self.wait_ms(50)
+                        continue
+                    raise
                 if click_result.ok:
                     break
             except BrowserSkillError as exc:
@@ -2110,7 +2205,7 @@ class BrowserSkillAdapter:
         if click_result is None or not click_result.ok:
             raise BrowserSkillError(
                 "WhatsApp search result click was rejected",
-                code="whatsapp_chat_open_failed",
+                code="whatsapp_chat_search_failed",
                 data={
                     "contact": contact,
                     "result": target.name if target is not None else "",
@@ -2148,6 +2243,7 @@ class BrowserSkillAdapter:
             "selected_result": target.name if target is not None else "",
             "state": "CHAT_OPEN",
             "verification": "passed",
+            "telemetry": {"semantic_target_category": "chat_result"},
         })
 
     def _whatsapp_type_text(
@@ -2280,7 +2376,7 @@ class BrowserSkillAdapter:
 
         raise BrowserSkillError(
             "WhatsApp message composer was not ready",
-            code="whatsapp_composer_not_ready",
+            code="whatsapp_composer_not_found",
             data={"candidates": [e.ref for e in last_candidates]},
         )
 
@@ -2361,13 +2457,13 @@ class BrowserSkillAdapter:
             if len(candidates) > 1:
                 raise BrowserSkillError(
                     "WhatsApp send control was ambiguous",
-                    code="whatsapp_send_control_not_ready",
+                    code="whatsapp_send_control_not_found",
                     data={"matches": [e.name for e in candidates]},
                 )
             self.wait_ms(min(200, max(1, int((deadline - time.monotonic()) * 1000))))
         raise BrowserSkillError(
             "WhatsApp send control was not ready",
-            code="whatsapp_send_control_not_ready",
+            code="whatsapp_send_control_not_found",
         )
 
     def send_whatsapp_message(
@@ -2427,13 +2523,17 @@ class BrowserSkillAdapter:
                 self.wait_ms(150)
 
         if fill_result is None or not fill_result.ok:
+            fill_error_text = str(last_fill_error or "").casefold()
+            fill_code = "whatsapp_target_stale" if "stale" in fill_error_text else "whatsapp_composer_not_found"
             raise BrowserSkillError(
                 "WhatsApp message composer rejected the message",
-                code="whatsapp_send_failed",
+                code=fill_code,
                 data={
                     "contact": contact,
-                    "stage": "type",
+                    "stage": "message_composer",
+                    "message_body_length": len(message),
                     "error": last_fill_error,
+                    "semantic_target_category": "message_composer",
                 },
             )
 
@@ -2449,7 +2549,12 @@ class BrowserSkillAdapter:
                 "WhatsApp message composer did not confirm the typed message "
                 "before sending",
                 code="whatsapp_send_failed",
-                data={"contact": contact, "stage": "verify_before_send"},
+                data={
+                    "contact": contact,
+                    "stage": "verify_before_send",
+                    "message_body_length": len(message),
+                    "semantic_target_category": "message_composer",
+                },
             )
 
         # Typing mutates the UI and invalidates refs. Prefer the semantic Send
@@ -2467,7 +2572,7 @@ class BrowserSkillAdapter:
             )
             result = self.click(send)
         except BrowserSkillError as exc:
-            if exc.code != "whatsapp_send_control_not_ready":
+            if exc.code != "whatsapp_send_control_not_found":
                 raise
             if "\n" in message or "\r" in message:
                 raise BrowserSkillError(
@@ -2492,8 +2597,18 @@ class BrowserSkillAdapter:
             "ok": True,
             "provider": "whatsapp",
             "recipient": contact,
-            "message": message,
+            "message_length": len(message),
             "action": "send_requested",
+            "telemetry": {
+                "recipient_target": contact,
+                "message_body_length": len(message),
+                "semantic_target_categories": [
+                    "chat_search",
+                    "chat_result",
+                    "message_composer",
+                    "send_control",
+                ],
+            },
         })
 
     def verify_whatsapp_message(
@@ -2590,12 +2705,12 @@ class BrowserSkillAdapter:
         *,
         timeout_s: float = 15.0,
     ) -> BrowserSkillResult:
-        """Open a lyric video for the requested song and verify playback.
+        """Open the best non-Short result for the requested song and verify playback.
 
         The YouTube search always uses the user's original song query.
-        Selection is based only on the current semantic observation and only
-        lyric/lyrics-video results are eligible. Generic videos, official
-        music videos, remixes, Shorts, and speed variants are not selected.
+        Selection is based only on the current semantic observation. Lyrics/
+        lyrics-video results are preferred, while normal non-Short videos remain
+        eligible as fallback. Shorts and speed variants are not selected.
 
         BrowserSkill refs remain observation-scoped; no ``@eN`` reference is
         guessed, persisted, or selected from a previous observation.
@@ -2624,6 +2739,27 @@ class BrowserSkillAdapter:
             timeout_s=max(0.5, deadline - time.monotonic()),
         )
 
+        # Final pre-click safety boundary. Candidate filtering can never be the
+        # only defense because a fresh observation/race may change what a ref
+        # resolves to. Never click a resolved Shorts target.
+        if self._youtube_target_is_short(target):
+            if self.debug:
+                self._debug_note(f"YOUTUBE_SELECTION: candidate={target.name!r} url={self.current_url()!r} shorts=true duration=unknown selected=false")
+            raise BrowserSkillError(
+                "YouTube Short target rejected immediately before execution",
+                code="youtube_short_rejected",
+                data={"target": target.ref, "url": self.current_url()},
+            )
+        duration = self._youtube_target_duration(target, self._last_observation)
+        if duration is None or duration <= 90.0:
+            if self.debug:
+                self._debug_note(f"YOUTUBE_SELECTION: candidate={target.name!r} url={self.current_url()!r} shorts=false duration={duration!r} selected=false")
+            raise BrowserSkillError(
+                "YouTube target has no verified duration greater than 90 seconds",
+                code="youtube_short_rejected",
+                data={"target": target.ref, "duration": duration},
+            )
+
         click_result = self.click(target)
         if not click_result.ok:
             raise BrowserSkillError(
@@ -2632,11 +2768,35 @@ class BrowserSkillAdapter:
                 data=click_result,
             )
 
-        # A successful click is not evidence of navigation. Re-observe the
-        # browser until the active page is actually a YouTube watch page.
+        # A successful click is not evidence of navigation. Freshly observe the
+        # destination. A Shorts URL is never success; recover once by returning
+        # to the search and selecting the next valid long-form candidate.
+        recovered = False
         while time.monotonic() < deadline:
-            current = self.current_url()
-            if "youtube.com/watch" in current.casefold():
+            current = self.current_url().casefold()
+            if "youtube.com/shorts/" in current or "youtube.com/shorts" in current:
+                if recovered:
+                    raise BrowserSkillError(
+                        "YouTube navigated to Shorts twice; playback rejected",
+                        code="youtube_short_rejected",
+                        data={"current_url": current},
+                    )
+                recovered = True
+                self.navigate(
+                    "https://www.youtube.com/results?search_query=" + quote_plus(search_query)
+                )
+                target = self._wait_for_first_video_result(
+                    query, timeout_s=max(0.5, deadline - time.monotonic())
+                )
+                if self._youtube_target_is_short(target):
+                    raise BrowserSkillError(
+                        "Recovered YouTube target is still a Short",
+                        code="youtube_short_rejected",
+                        data={"target": target.ref},
+                    )
+                click_result = self.click(target)
+                continue
+            if "youtube.com/watch" in current:
                 break
             self.wait_ms(200)
         else:
@@ -2651,6 +2811,20 @@ class BrowserSkillAdapter:
                     "selected_ref": target.ref,
                     "selected_name": target.name,
                 },
+            )
+
+        # Fresh observation before declaring success. This catches semantic Shorts
+        # evidence even when the URL was rewritten or redirected.
+        self.observe()
+        fresh = self._last_observation
+        if fresh is not None and self._song_result_is_short(
+            BrowserElement("@current", role="link", name=str(self.page_title()), raw={"url": self.current_url(), "title": self.page_title()}),
+            observation=fresh,
+        ):
+            raise BrowserSkillError(
+                "Fresh YouTube observation identifies Shorts; playback is not successful",
+                code="youtube_short_rejected",
+                data={"current_url": self.current_url()},
             )
 
         playback_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
@@ -2717,7 +2891,9 @@ class BrowserSkillAdapter:
         return "normal"
 
     @classmethod
-    def _song_duration_seconds(cls, element: BrowserElement) -> float | None:
+    def _song_duration_seconds(
+        cls, element: BrowserElement, *, observation: BrowserObservation | None = None
+    ) -> float | None:
         """Extract a visible YouTube duration from semantic element data.
 
         Returns ``None`` when BrowserSkill did not expose duration metadata.
@@ -2743,6 +2919,28 @@ class BrowserSkillAdapter:
                     collect(item)
 
         collect(element.raw)
+        if observation is not None:
+            # BrowserSkill may expose duration only in the fresh semantic
+            # observation rather than on the normalized element. Inspect only
+            # records belonging to this ref so another result cannot lend its
+            # duration to the selected candidate.
+            def collect_observation(value: object) -> None:
+                if isinstance(value, dict):
+                    refs = {str(v) for k, v in value.items() if str(k).casefold() in {"ref", "semantic_ref", "semanticref", "id"}}
+                    if element.ref in refs:
+                        for k, item in value.items():
+                            if str(k).casefold() in {"duration", "length", "aria-label", "label", "title", "text"}:
+                                collect(item)
+                    for item in value.values():
+                        if isinstance(item, (dict, list, tuple)):
+                            collect_observation(item)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        collect_observation(item)
+            collect_observation(observation.raw)
+            for line in str(observation.text or "").splitlines():
+                if element.ref in line:
+                    values.append(line)
 
         patterns = (
             re.compile(r"\b(\d+)\s*(?:hours?|hrs?)\s*(?:(\d+)\s*(?:minutes?|mins?))?\s*(?:(\d+)\s*(?:seconds?|secs?))?\b", re.I),
@@ -2776,9 +2974,15 @@ class BrowserSkillAdapter:
         return None
 
     @classmethod
-    def _song_result_is_short(cls, element: BrowserElement) -> bool:
-        """Reject YouTube Shorts and known sub-minute song results."""
+    def _song_result_is_short(
+        cls,
+        element: BrowserElement,
+        *,
+        observation: BrowserObservation | None = None,
+    ) -> bool:
+        """Hard-reject Shorts using all current semantic evidence available."""
         text_parts = [str(element.name or ""), str(element.value or "")]
+        metadata: list[str] = []
         hrefs: list[str] = []
 
         for key, value in element.attributes.items():
@@ -2793,15 +2997,50 @@ class BrowserSkillAdapter:
                         "href", "url", "link", "target_url", "targeturl",
                     } and isinstance(item, str):
                         hrefs.append(item)
-                    elif isinstance(item, (dict, list, tuple)):
+                    elif key_folded in {
+                        "type", "category", "result_type", "resulttype",
+                        "content_type", "contenttype", "kind", "aria-label",
+                        "arialabel", "label", "title", "text",
+                    } and isinstance(item, str):
+                        metadata.append(item)
+                    if isinstance(item, (dict, list, tuple)):
                         collect_links(item)
             elif isinstance(value, (list, tuple)):
                 for item in value:
                     collect_links(item)
 
         collect_links(element.raw)
+        if observation is not None:
+            def collect_ref(value: object) -> None:
+                if isinstance(value, dict):
+                    refs = {
+                        str(v) for k, v in value.items()
+                        if str(k).casefold() in {"ref", "semantic_ref", "semanticref", "id"}
+                        for v in ([v] if not isinstance(v, (list, tuple)) else v)
+                    }
+                    if element.ref in refs:
+                        for k, v in value.items():
+                            kf = str(k).casefold()
+                            if isinstance(v, str) and kf in {"href", "url", "link", "target_url", "targeturl"}:
+                                hrefs.append(v)
+                            elif isinstance(v, str) and kf in {"type", "category", "result_type", "resulttype", "content_type", "contenttype", "kind", "aria-label", "arialabel", "label", "title", "text"}:
+                                metadata.append(v)
+                                text_parts.append(v)
+                    for v in value.values():
+                        collect_ref(v)
+                elif isinstance(value, (list, tuple)):
+                    for v in value:
+                        collect_ref(v)
+            collect_ref(observation.raw)
+            for line in str(observation.text or "").splitlines():
+                if element.ref in line:
+                    text_parts.append(line)
+
         text = " ".join(text_parts).casefold()
+        metadata_text = " ".join(metadata).casefold()
         if re.search(r"\b(?:shorts?|yt\s*shorts?)\b", text):
+            return True
+        if re.search(r"\b(?:shorts?|yt\s*shorts?)\b", metadata_text):
             return True
 
         # Shorts can be exposed through any URL-like field rather than the
@@ -2815,21 +3054,21 @@ class BrowserSkillAdapter:
             ):
                 return True
 
-        duration = cls._song_duration_seconds(element)
-        return duration is not None and duration < 60.0
+        return False
 
     @classmethod
     def _rank_song_candidates(
         cls,
         query: str,
         elements: Sequence[BrowserElement],
+        *,
+        observation: BrowserObservation | None = None,
     ) -> list[tuple[int, BrowserElement]]:
-        """Rank visible YouTube results, accepting lyric videos only.
+        """Rank visible YouTube results, preferring lyrics videos.
 
         ``play_song`` searches with the user's exact query. From the fresh
-        semantic observation, only results whose visible title identifies a
-        lyrics/lyric video are eligible. Shorts, remixes, official videos,
-        normal videos, speed variants, and other result types are rejected.
+        semantic observation, Shorts are hard-rejected. Lyrics is a deterministic
+        preference, while normal non-Short videos remain eligible as fallback.
         """
         q = cls._normalize_text(query)
         if not q:
@@ -2847,9 +3086,20 @@ class BrowserSkillAdapter:
 
             haystack = f"{name} {value}".strip()
 
-            # A lyric result must explicitly identify itself as lyrics.
-            # Do not accept a generic video merely because the song title
-            # matches the query.
+            # Shorts are never eligible for normal song playback. The check
+            # uses semantic title/metadata and URL evidence from the current
+            # observation rather than coordinates or thumbnail shape.
+            if cls._song_result_is_short(element, observation=observation):
+                continue
+
+            # Music playback has a hard minimum duration. Unknown duration is
+            # also rejected here: without evidence that a result is longer than
+            # 90 seconds, the runtime must not select it and discover too late
+            # that it is effectively a Short/clip.
+            duration = cls._song_duration_seconds(element, observation=observation)
+            if duration is None or duration <= 90.0:
+                continue
+
             is_lyrics = bool(
                 re.search(
                     r"\b(?:lyrics?|lyric\s+video)\b",
@@ -2857,14 +3107,6 @@ class BrowserSkillAdapter:
                     re.IGNORECASE,
                 )
             )
-            if not is_lyrics:
-                continue
-
-            # Explicitly reject unwanted variants even if their title also
-            # contains the word "lyrics". Shorts are checked using both
-            # semantic title text and any exposed href/duration metadata.
-            if cls._song_result_is_short(element):
-                continue
             if re.search(
                 r"\b(?:sped\s*up|speed\s*up|speeded\s*up|slowed(?:\s*down)?|slow\s*down|speed\s*down|nightcore)\b",
                 haystack,
@@ -2891,12 +3133,24 @@ class BrowserSkillAdapter:
             if q_tokens and q_tokens <= name_tokens:
                 score += 120
 
-            # Prefer an actual lyric video over a result that merely happens
-            # to mention lyrics later in its title.
-            if re.search(r"\blyric\s+video\b", haystack, re.IGNORECASE):
-                score += 180
+            # Lyrics are the primary music preference. Once Shorts and short
+            # clips are excluded, a valid lyrics video must beat every valid
+            # normal video, regardless of the normal title-match score.
+            if re.search(r"\bofficial\s+lyrics?\b|\blyric\s+video\b", haystack, re.IGNORECASE):
+                score += 100000
             elif re.search(r"\blyrics?\b", haystack, re.IGNORECASE):
-                score += 120
+                score += 100000
+
+            # Keep normal videos eligible, but demote obvious alternate
+            # versions so a lyrics result wins over a remix/cover/live edit
+            # when the query match is otherwise comparable. This is a small
+            # deterministic preference, not a title-specific allow/deny list.
+            if re.search(
+                r"\b(?:remix|rework|cover|reaction|live|acoustic|instrumental|karaoke|nightcore|8d|edit|mashup)\b",
+                haystack,
+                re.IGNORECASE,
+            ):
+                score -= 500
 
             if len(q_tokens) <= 3 and len(name.split()) > 12:
                 score -= 80
@@ -2912,6 +3166,51 @@ class BrowserSkillAdapter:
         )
         return ranked
 
+
+    @classmethod
+    def _youtube_target_duration(
+        cls, target: BrowserTarget, observation: BrowserObservation | None = None
+    ) -> float | None:
+        """Read duration from the resolved target or its owning observation."""
+        duration = cls._song_duration_seconds(
+            BrowserElement(target.ref, role=target.role, name=target.name, raw=target.raw),
+            observation=observation,
+        )
+        return duration
+
+    @classmethod
+    def _youtube_target_is_short(cls, target: BrowserTarget) -> bool:
+        """Final target guard: reject Shorts immediately before execution."""
+        raw = target.raw
+        values: list[str] = [str(target.name or ""), str(raw or "")]
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if str(key).casefold() in {"href", "url", "link", "target_url", "targeturl", "title", "type", "category", "kind"}:
+                    values.append(str(value))
+        haystack = " ".join(values).casefold()
+        return bool(re.search(r"\bshorts?\b", haystack) or re.search(r"youtube\.com/shorts(?:/|$)", haystack) or re.search(r"youtu\.be/shorts(?:/|$)", haystack))
+
+    def _debug_note(self, message: str) -> None:
+        if getattr(self, "debug", False):
+            print(message)
+
+    @classmethod
+    def _element_href(cls, element: BrowserElement, *, observation: BrowserObservation | None = None) -> str:
+        values: list[str] = []
+        if isinstance(element.attributes.get("href"), str):
+            values.append(element.attributes["href"])
+        raw = element.raw
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if str(key).casefold() in {"href", "url", "link", "target_url", "targeturl"} and isinstance(value, str):
+                    values.append(value)
+        if observation is not None:
+            for line in str(observation.text or "").splitlines():
+                if element.ref in line:
+                    match = re.search(r"https?://\S+", line)
+                    if match:
+                        values.append(match.group(0).rstrip(".,)"))
+        return values[0] if values else ""
 
     def _wait_for_first_video_result(
         self,
@@ -2950,9 +3249,15 @@ class BrowserSkillAdapter:
                 self.wait_ms(min(_DEFAULT_POLL_MS, remaining))
                 continue
 
-            ranked = self._rank_song_candidates(query, elements)
+            ranked = self._rank_song_candidates(query, elements, observation=observation)
             if ranked:
                 _, best = ranked[0]
+                if self.debug:
+                    duration = self._song_duration_seconds(best, observation=observation)
+                    self._debug_note(
+                        f"YOUTUBE_SELECTION: candidate={best.name!r} url={self._element_href(best, observation=observation)!r} "
+                        f"shorts={self._song_result_is_short(best, observation=observation)} duration={duration!r} selected=true"
+                    )
                 return BrowserTarget(
                     best.ref,
                     role=best.role,

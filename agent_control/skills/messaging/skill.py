@@ -20,7 +20,13 @@ class MessagingExecutor:
         p = action.params
         try:
             if action.kind.value == "whatsapp_send_message":
-                detail = self._backend.send_whatsapp(str(p["recipient"]), str(p["message"]))
+                recipient = p.get("recipient")
+                message = p.get("message")
+                if not isinstance(recipient, str) or not recipient.strip():
+                    raise ValueError("whatsapp_send_message requires structured 'recipient'")
+                if not isinstance(message, str) or not message.strip():
+                    raise ValueError("whatsapp_send_message requires structured 'message'")
+                detail = self._backend.send_whatsapp(recipient.strip(), message)
             elif action.kind.value == "whatsapp_search_contact":
                 detail = self._backend.search_whatsapp(str(p["query"]))
             elif action.kind.value == "gmail_send_email":

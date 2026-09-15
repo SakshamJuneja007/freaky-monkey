@@ -43,15 +43,11 @@ from typing import Any, Callable
 
 from . import api
 from .api import AgentResult, TaskStatus
-from .types import Action, Clarification, Verdict
+from .types import Action
 from .fast_interaction import classify_fast, FastInteractionTask
 from .task import Task
-from .workflow import Workflow, WorkflowStepTask
-from .workflow.graph import WorkflowOrchestrator
-from .workflow.session_adapter import SessionWorkflowRuntime
 from .skills.browser import BrowserSkillAdapter
 from .runtime import RuntimeManager
-from .runtime_control import RuntimeControlKind, RuntimeControlCommand, classify_runtime_control
 from .presentation import (
     completion_message,
     is_explicit_task_id_request,
@@ -70,7 +66,6 @@ from .response import (
     phrase_not_heard,
     phrase_result,
 )
-from .response import guard_conversation_runtime_claim
 
 #: Trailing characters a person types or an STT model appends that are never part
 #: of a task id. Kept to punctuation: stripping words would be intent inference,
@@ -373,20 +368,10 @@ class PendingApproval:
     goal: str = ""
     background_task_id: str | None = None
     runtime_task_id: str | None = None
-    workflow_id: str | None = None
-    step_id: str | None = None
-    approval_request_id: str | None = None
     ttl_s: float = 180.0
 
     @property
     def expired(self) -> bool:
-        # A LangGraph workflow approval is a durable human-in-the-loop
-        # interruption. Its lifetime is the workflow checkpoint lifetime, not
-        # the legacy single-task confirmation TTL. Never turn an unanswered
-        # workflow approval into a failure merely because a synchronous input
-        # turn took longer than the legacy 180s window.
-        if self.workflow_id:
-            return False
         return (time.time() - self.asked_at) > self.ttl_s
 
 
@@ -788,34 +773,6 @@ class Prepared:
     runtime_task_id: str | None = None
 
 
-@dataclass(frozen=True)
-class PendingInput:
-    """The single durable owner for a workflow's next user-provided value."""
-
-    input_id: str
-    workflow_id: str
-    step_id: str
-    task_id: str
-    parameter_name: str
-    prompt: str
-    expected_input_type: str = "text"
-    created_at: float = field(default_factory=time.time)
-    state: str = "PENDING"
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> "PendingInput":
-        required = ("input_id", "workflow_id", "step_id", "task_id", "parameter_name", "prompt")
-        if any(not payload.get(k) for k in required):
-            raise ValueError("pending_input_not_found: incomplete pending input owner")
-        return cls(
-            input_id=str(payload["input_id"]), workflow_id=str(payload["workflow_id"]),
-            step_id=str(payload["step_id"]), task_id=str(payload["task_id"]),
-            parameter_name=str(payload["parameter_name"]), prompt=str(payload["prompt"]),
-            expected_input_type=str(payload.get("expected_input_type", "text")),
-            created_at=float(payload.get("created_at", time.time())), state=str(payload.get("state", "PENDING")),
-        )
-
-
 @dataclass
 class BackgroundTask:
     """Live record for work submitted by the non-blocking chat interface."""
@@ -847,6 +804,7 @@ class BackgroundTask:
         }
 
 
+@dataclass
 def _friendly_runtime_state(state: str) -> str:
     return {
         "CREATED": "starting",
@@ -862,7 +820,6 @@ def _friendly_runtime_state(state: str) -> str:
     }.get(state, "in progress")
 
 
-@dataclass
 class Session:
     """A live conversation over the one execution pipeline.
 
@@ -903,8 +860,6 @@ class Session:
     #: and :func:`choose` can only ever return a path it already contains.
     pending: Pending | None = None
     pending_approval: PendingApproval | None = None
-    pending_workflow_input: dict[str, Any] | None = None
-    pending_input: PendingInput | None = field(default=None, repr=False, compare=False)
     recent_context: RecentContext = field(default_factory=RecentContext)
     #: Browser resources are task-scoped. Each independent browser task gets
     #: its own BrowserSkill session so selecting/navigating one task cannot
@@ -954,8 +909,6 @@ class Session:
         default_factory=threading.local, repr=False, compare=False,
     )
     _runtime: RuntimeManager = field(default_factory=RuntimeManager, repr=False, compare=False)
-    _workflow_orchestrator: WorkflowOrchestrator | None = field(default=None, repr=False, compare=False)
-    _workflow_runtime_adapter: SessionWorkflowRuntime | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         # Keep direct/unit Session construction lightweight and isolated. The
@@ -964,33 +917,6 @@ class Session:
             self._runtime.close()
             self._runtime = RuntimeManager(persistence_path=self.runtime_persistence_path)
         self._restore_runtime_views()
-
-    def _rehydrate_approval_owner(self) -> PendingApproval | None:
-        """Rebuild the durable approval owner before dispatching user input."""
-        if self.pending_approval is not None:
-            return self.pending_approval
-        approvals = self._runtime.snapshot().get("pending_approvals", [])
-        if len(approvals) != 1:
-            return None
-        item = approvals[0]
-        task_id = item.get("task_id")
-        task = self._runtime.get_task(task_id) if task_id else None
-        payload = item.get("payload") or {}
-        if task is None or task.state != "WAITING_FOR_APPROVAL":
-            return None
-        approval = PendingApproval(
-            request=str(payload.get("request") or task.goal),
-            action=dict(payload.get("action") or {}),
-            asked_at=float(payload.get("asked_at") or time.time()),
-            task_id=task.task_id, goal=task.goal,
-            background_task_id=payload.get("background_task_id"),
-            runtime_task_id=task.task_id,
-            workflow_id=payload.get("workflow_id"),
-            step_id=payload.get("step_id"),
-            approval_request_id=payload.get("approval_request_id"),
-        )
-        self.pending_approval = approval
-        return approval
 
     def _rehydrate_pending_input_owner(self) -> PendingApproval | None:
         """Rebuild the input owner from RuntimeManager before routing any input.
@@ -1006,13 +932,11 @@ class Session:
         if not approvals:
             return None
 
-        # A durable approval is safe to auto-bind only when it is unique. A
-        # focused task is presentation state, not consent, so it cannot silently
-        # select one of several approvals. Explicit task-id routing is handled by
-        # the dispatcher before this method is called.
-        if len(approvals) != 1:
-            return None
-        item = approvals[0]
+        # Prefer the focused task when it has a pending approval; otherwise use
+        # the oldest durable approval.  This chooses from RuntimeManager's one
+        # authoritative registry and never creates a second owner map.
+        focused = self._runtime.snapshot().get("focused_task_id")
+        item = next((x for x in approvals if x.get("task_id") == focused), approvals[0])
         task_id = item.get("task_id")
         task = self._runtime.get_task(task_id) if task_id else None
         payload = item.get("payload") or {}
@@ -1025,9 +949,6 @@ class Session:
             task_id=task.task_id, goal=task.goal,
             background_task_id=payload.get("background_task_id"),
             runtime_task_id=task.task_id,
-            workflow_id=payload.get("workflow_id"),
-            step_id=payload.get("step_id"),
-            approval_request_id=payload.get("approval_request_id"),
         )
         self.pending_approval = approval
         return approval
@@ -1120,12 +1041,6 @@ class Session:
                 except Exception:
                     pass
             try:
-                if self._workflow_orchestrator is not None:
-                    self._workflow_orchestrator.close()
-                    self._workflow_orchestrator = None
-            except Exception:
-                pass
-            try:
                 self._runtime.close()
             except Exception:
                 pass
@@ -1174,21 +1089,11 @@ class Session:
             return
         try:
             self._runtime.transition_task(runtime_task_id, status, event_type=event_type, **kwargs)
-        except ValueError as exc:
-            # Never silently discard a lifecycle mismatch. Keep RuntimeManager
-            # authoritative (the state is not mutated), and journal the rejected
-            # transition so diagnostics and regression tests can see exactly what
-            # was attempted. The caller may continue only where its surrounding
-            # pipeline can safely do so.
-            try:
-                self._runtime.event(runtime_task_id, "RUNTIME_TRANSITION_REJECTED", {
-                    "requested_state": status, "error": str(exc),
-                })
-            except KeyError:
-                pass
-            self.narrator.note(f"RUNTIME: rejected transition {runtime_task_id} -> {status}: {exc}")
-        except KeyError as exc:
-            self.narrator.note(f"RUNTIME: task missing for transition {runtime_task_id} -> {status}: {exc}")
+        except (KeyError, ValueError):
+            # Runtime truth must never take down the execution loop. Invalid
+            # transitions are still visible in debug output.
+            if self.debug:
+                self.narrator.note(f"RUNTIME: ignored transition {runtime_task_id} -> {status}")
 
     def _runtime_event(self, runtime_task_id: str | None, event_type: str, metadata: dict[str, Any] | None = None) -> None:
         if not runtime_task_id:
@@ -1209,39 +1114,13 @@ class Session:
             kind = str(event.get("event", ""))
             state = str(event.get("state", ""))
             if runtime_task_id:
-                runtime_task = self._runtime.get_task(runtime_task_id)
-                is_workflow_task = bool(
-                    runtime_task is not None
-                    and (
-                        runtime_task.task_type == "workflow"
-                        or runtime_task.metadata.get("workflow_orchestration") == "langgraph"
-                    )
-                )
                 mapping = {
                     "RUNNING": ("RUNNING", "TASK_RUNNING"),
                     "PLANNING": ("PLANNING", "TASK_PLANNING"),
-                    # AgentState.ACTING is the execution phase represented by
-                    # RuntimeManager's existing RUNNING state.  It must be
-                    # synchronized explicitly; otherwise the PLANNING event
-                    # overwrites RUNNING and later VERIFYING/COMPLETED
-                    # transitions are rejected as impossible.  Do not add a
-                    # parallel ACTING runtime state.
-                    "ACTING": ("RUNNING", "TASK_ACTING"),
                     "VERIFYING": ("VERIFYING", "VERIFICATION_STARTED"),
                     "WAITING_FOR_USER": ("WAITING_FOR_USER", "TASK_WAITING"),
-                    # A WorkflowStepTask is one child execution inside a
-                    # durable workflow. Its runner COMPLETED event means
-                    # "this step finished", not "the workflow task is
-                    # terminal". Keep the RuntimeManager task non-terminal so
-                    # the next step can legitimately request its own approval.
-                    # The workflow node emits the real workflow COMPLETED
-                    # transition only after every step has independently
-                    # verified.
-                    "COMPLETED": ("VERIFYING", "WORKFLOW_STEP_EXECUTION_COMPLETED") if is_workflow_task else ("COMPLETED", "TASK_COMPLETED"),
-                    # Likewise, a failed child execution must not force the
-                    # durable workflow identity terminal before its workflow
-                    # recovery/failed node records the final outcome.
-                    "FAILED": ("RECOVERY_REQUIRED", "WORKFLOW_STEP_EXECUTION_FAILED") if is_workflow_task else ("FAILED", "TASK_FAILED"),
+                    "COMPLETED": ("COMPLETED", "TASK_COMPLETED"),
+                    "FAILED": ("FAILED", "TASK_FAILED"),
                     "CANCELLED": ("CANCELLED", "TASK_CANCELLED"),
                 }
                 mapped = mapping.get(state)
@@ -1274,361 +1153,6 @@ class Session:
         self._emit_reply(message, goal=task.text)
         return turn
 
-    def _rehydrate_workflow_input(self) -> dict[str, Any] | None:
-        """Rehydrate the authoritative pending-input owner from RuntimeManager.
-
-        The local object is only a dispatcher view. The durable owner lives in
-        the runtime task metadata, so restart cannot turn a workflow answer into
-        an unrelated conversation turn.
-        """
-        if self.pending_input is not None and self.pending_input.state == "PENDING":
-            return {
-                "input_id": self.pending_input.input_id, "workflow_id": self.pending_input.workflow_id,
-                "step_id": self.pending_input.step_id, "task_id": self.pending_input.task_id,
-                "field": self.pending_input.parameter_name,
-            }
-        if self.pending_workflow_input is not None:
-            try:
-                self.pending_input = PendingInput.from_dict({
-                    "input_id": self.pending_workflow_input.get("input_id", "legacy"),
-                    "workflow_id": self.pending_workflow_input["workflow_id"],
-                    "step_id": self.pending_workflow_input["step_id"],
-                    "task_id": self.pending_workflow_input.get("task_id", self.pending_workflow_input["workflow_id"]),
-                    "parameter_name": self.pending_workflow_input["field"],
-                    "prompt": self.pending_workflow_input.get("prompt", "Please provide the missing value."),
-                })
-                return dict(self.pending_workflow_input)
-            except (KeyError, ValueError, TypeError):
-                self.pending_workflow_input = None
-                self.pending_input = None
-
-        # Focused task first; this is still RuntimeManager's one authoritative
-        # registry, not a second input-routing registry.
-        tasks = self._runtime.list_waiting_tasks()
-        focused = self._runtime.snapshot().get("focused_task_id")
-        ordered = sorted(tasks, key=lambda t: 0 if t.task_id == focused else 1)
-
-        # Do not infer ownership from focus or insertion order when more than one
-        # durable workflow-input owner exists. A generic answer must not guess.
-        valid_owner_count = 0
-        for candidate in ordered:
-            metadata = candidate.metadata if isinstance(candidate.metadata, dict) else {}
-            owner = metadata.get("pending_input")
-            workflow_data = metadata.get("workflow")
-            if not isinstance(owner, dict) or not isinstance(workflow_data, dict):
-                continue
-            try:
-                wf = Workflow.from_json(workflow_data)
-            except Exception:
-                continue
-            step = next((x for x in wf.steps if x.step_id == owner.get("step_id")), None)
-            if step is not None and step.state == "WAITING_FOR_USER":
-                valid_owner_count += 1
-        if valid_owner_count > 1:
-            return None
-
-        for task in ordered:
-            metadata = task.metadata if isinstance(task.metadata, dict) else {}
-            owner = metadata.get("pending_input")
-            if isinstance(owner, dict) and str(owner.get("state", "PENDING")) == "PENDING":
-                try:
-                    pending = PendingInput.from_dict(owner)
-                    workflow_data = metadata.get("workflow")
-                    if not isinstance(workflow_data, dict):
-                        raise ValueError("workflow_state_invalid: pending input has no workflow")
-                    workflow = Workflow.from_json(workflow_data)
-                    step = next((x for x in workflow.steps if x.step_id == pending.step_id), None)
-                    if step is None or step.state != "WAITING_FOR_USER":
-                        raise ValueError("pending_input_not_found: owner does not match waiting workflow step")
-                    self.pending_input = pending
-                    self.pending_workflow_input = {
-                        "input_id": pending.input_id, "workflow_id": pending.workflow_id,
-                        "step_id": pending.step_id, "task_id": pending.task_id,
-                        "field": pending.parameter_name, "prompt": pending.prompt,
-                    }
-                    return dict(self.pending_workflow_input)
-                except (ValueError, TypeError, KeyError):
-                    continue
-
-        # Backward-compatible recovery for P2.3 databases written before the
-        # explicit owner record existed: derive it once from the waiting step,
-        # then persist the durable owner so subsequent turns are explicit.
-        for task in ordered:
-            workflow_data = task.metadata.get("workflow") if isinstance(task.metadata, dict) else None
-            if not isinstance(workflow_data, dict):
-                continue
-            try:
-                wf = Workflow.from_json(workflow_data)
-            except Exception:
-                continue
-            for step in wf.steps:
-                if step.state != "WAITING_FOR_USER":
-                    continue
-                field_name = ("message" if step.action.kind == "whatsapp_send_message" and not step.action.params.get("message")
-                              else "query" if not step.action.params.get("query") else None)
-                if not field_name:
-                    continue
-                pending = PendingInput(
-                    input_id=f"input-{uuid.uuid4().hex[:10]}", workflow_id=wf.workflow_id,
-                    step_id=step.step_id, task_id=task.task_id, parameter_name=field_name,
-                    prompt=(f"What should I send to {step.action.params.get('recipient', 'the contact')}?" if field_name == "message" else "What should I search for?"),
-                )
-                self.pending_input = pending
-                self.pending_workflow_input = {
-                    "input_id": pending.input_id, "workflow_id": pending.workflow_id,
-                    "step_id": pending.step_id, "task_id": pending.task_id, "field": pending.parameter_name,
-                    "prompt": pending.prompt,
-                }
-                try:
-                    self._runtime.set_pending_input(task.task_id, self.pending_workflow_input)
-                except Exception:
-                    pass
-                return dict(self.pending_workflow_input)
-        return None
-
-    def _workflow_engine(self) -> WorkflowOrchestrator:
-        if self._workflow_orchestrator is None:
-            adapter = self._workflow_runtime_adapter or SessionWorkflowRuntime(self)
-            self._workflow_runtime_adapter = adapter
-            configured = self.runtime_persistence_path
-            if configured in (None, ":memory:"):
-                checkpoint_path = ":memory:"
-            else:
-                path = Path(configured)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                checkpoint_path = str(path.with_name("workflow.sqlite3"))
-            self._workflow_orchestrator = WorkflowOrchestrator(adapter, checkpoint_path)
-        return self._workflow_orchestrator
-
-    @staticmethod
-    def _workflow_id_from_goal(prefix: str = "fast") -> str:
-        return f"{prefix}-{uuid.uuid4().hex[:4]}"
-
-    def _workflow_turn(self, workflow_id: str, goal: str, graph_result: dict[str, Any], *, source: str) -> Turn:
-        task = UserTask(raw=goal, text=goal, source=source, task_id=workflow_id, status="accepted")
-        interrupts = graph_result.get("__interrupt__") if isinstance(graph_result, dict) else None
-        if interrupts:
-            self._rehydrate_approval_owner()
-            self._rehydrate_workflow_input()
-            question = None
-            if self.pending_approval is not None:
-                question = Clarification(question=approval_prompt(self.pending_approval.action, goal), context="APPROVAL_ACTION:" + json.dumps({"workflow_id": workflow_id, "step_id": self.pending_approval.step_id, "approval_request_id": self.pending_approval.approval_request_id, "action": self.pending_approval.action}, sort_keys=True))
-            elif self.pending_workflow_input is not None:
-                question = Clarification(question=self.pending_workflow_input.get("prompt", "Please provide the missing value."), context="WORKFLOW_INPUT:" + json.dumps(self.pending_workflow_input, sort_keys=True))
-            result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.NEEDS_INPUT, verified=Verdict.UNKNOWN.value, question=question)
-            reply = question.question if question is not None else "The workflow is waiting for input."
-            if self.pending_approval is not None:
-                reply = approval_prompt(self.pending_approval.action, goal)
-            self._emit_reply(reply, goal=goal, state="WAITING_FOR_APPROVAL" if self.pending_approval else "WAITING_FOR_USER")
-            return Turn(task=task, reply=reply, result=result)
-
-        runtime_task = self._runtime.get_task(workflow_id)
-        workflow_data = runtime_task.metadata.get("workflow") if runtime_task else None
-        workflow = Workflow.from_json(workflow_data) if isinstance(workflow_data, dict) else None
-        if workflow is not None and workflow.state == "COMPLETED":
-            result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.SUCCESS, verified=Verdict.PASS.value, completed=[s.step_id for s in workflow.steps], detail="workflow completed after independent verification")
-            reply = "The workflow is complete."
-            self._emit_reply(reply, goal=goal, state="COMPLETED")
-            return Turn(task=task, reply=reply, result=result)
-        detail = workflow.status.value if workflow is not None else "workflow failed"
-        result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.UNKNOWN, verified=Verdict.UNKNOWN.value, detail=detail)
-        reply = "The workflow did not complete."
-        self._emit_reply(reply, goal=goal, state=detail)
-        return Turn(task=task, reply=reply, result=result)
-
-    def _start_workflow(self, goal: str, *, source: str = "text", workflow_id: str | None = None) -> Turn:
-        workflow_id = workflow_id or self._workflow_id_from_goal()
-        self._runtime_create(goal, workflow_id, runtime_task_id=workflow_id, task_type="workflow", metadata={"workflow_orchestration": "langgraph"})
-        # A CLI workflow may already have a RuntimeManager row because the
-        # conversational/background lane reserves the task identity before
-        # dispatching ``submit``. ``create_task`` is intentionally idempotent,
-        # so that reservation keeps its original task_type/metadata. Mark the
-        # existing row as a LangGraph workflow projection explicitly; the
-        # runner event watcher uses this durable marker to distinguish a child
-        # workflow-step COMPLETED event from terminal completion of the whole
-        # workflow. This changes no lifecycle state and never weakens the
-        # RuntimeManager transition validator.
-        runtime_task = self._runtime.get_task(workflow_id)
-        if runtime_task is not None:
-            metadata = dict(runtime_task.metadata)
-            metadata["workflow_orchestration"] = "langgraph"
-            metadata["workflow_goal"] = goal
-            self._runtime.update_task(workflow_id, metadata=metadata)
-        self._runtime_transition(workflow_id, "RUNNING", event_type="WORKFLOW_STARTED", current_phase="workflow", execution_state="RUNNING")
-        try:
-            result = self._workflow_engine().start(workflow_id, goal)
-        except RuntimeError as exc:
-            self._runtime_transition(workflow_id, "FAILED", event_type="WORKFLOW_FAILED", failure_state=str(exc), failure_category="DEPENDENCY", execution_state="FAILED")
-            task = UserTask(raw=goal, text=goal, source=source, task_id=workflow_id, status="accepted")
-            agent_result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.UNAVAILABLE, verified=Verdict.UNKNOWN.value, detail=str(exc))
-            reply = f"The workflow engine is unavailable: {exc}"
-            self._emit_reply(reply, goal=goal, state="FAILED")
-            return Turn(task=task, reply=reply, result=agent_result)
-        return self._workflow_turn(workflow_id, goal, result, source=source)
-
-    def _resume_workflow_graph(self, workflow_id: str, value: Any, *, source: str = "text") -> Turn:
-        task = self._runtime.get_task(workflow_id)
-        if task is None:
-            return self._refused(UserTask(raw=str(value), text=str(value), source=source, status="dropped"), "That workflow is no longer available.")
-        result = self._workflow_engine().resume(workflow_id, value)
-        return self._workflow_turn(workflow_id, task.goal, result, source=source)
-
-    def _resume_workflow(self, workflow: Workflow, *, source: str = "text", background: bool = False) -> Turn:
-        """Run the next durable sequential step through the existing execution pipeline."""
-        for step in workflow.steps:
-            if step.state in {"COMPLETED"}:
-                continue
-            if step.state in {"BLOCKED", "FAILED", "UNKNOWN", "RECOVERY_REQUIRED"}:
-                reply = step.failure_reason or "The workflow needs recovery before it can continue."
-                self._emit_reply(reply, goal=workflow.goal)
-                return Turn(task=UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted"), reply=reply)
-            if step.state == "WAITING_FOR_APPROVAL":
-                return Turn(task=UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted"), reply=approval_prompt(step.action.to_json(), workflow.goal))
-            step.state = "PENDING"
-            prepared_task = WorkflowStepTask(workflow=workflow, step=step)
-            task = UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted")
-            turn = self._run(Prepared(task=task, goal=workflow.goal, kind="workflow step", task_obj=prepared_task, workspace=self.workspace, runtime_task_id=workflow.workflow_id))
-            result = turn.result
-            if result is None:
-                return turn
-            if result.needs_input or not result.ok:
-                return turn
-            continue
-        workflow.state = "COMPLETED"
-        self._runtime.update_workflow(workflow.workflow_id, workflow.to_json(), event_type="WORKFLOW_COMPLETED")
-        reply = "The workflow is complete."
-        turn = Turn(task=UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted"), reply=reply, result=None)
-        self._emit_reply(reply, goal=workflow.goal)
-        return turn
-
-    def _has_multiple_pending_workflow_inputs(self) -> bool:
-        candidates = []
-        for task in self._runtime.list_waiting_tasks():
-            metadata = task.metadata if isinstance(task.metadata, dict) else {}
-            owner = metadata.get("pending_input")
-            if not isinstance(owner, dict) or str(owner.get("state", "PENDING")) != "PENDING":
-                continue
-            workflow_data = metadata.get("workflow")
-            if not isinstance(workflow_data, dict):
-                continue
-            try:
-                workflow = Workflow.from_json(workflow_data)
-            except Exception:
-                continue
-            step_id = owner.get("step_id")
-            if any(step.step_id == step_id and step.state == "WAITING_FOR_USER" for step in workflow.steps):
-                candidates.append(task.task_id)
-        return len(candidates) > 1
-
-    def _resolve_workflow_input(self, raw: str, *, source: str) -> Turn:
-        """Resolve the next value against the exact durable workflow/step owner."""
-        if self._has_multiple_pending_workflow_inputs():
-            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I need the task ID because more than one workflow is waiting for input.")
-        pending_data = self._rehydrate_workflow_input()
-        if pending_data is None:
-            return self._route_without_owned_input(raw, source=source)
-
-        try:
-            pending = PendingInput.from_dict({
-                "input_id": pending_data.get("input_id", ""),
-                "workflow_id": pending_data["workflow_id"], "step_id": pending_data["step_id"],
-                "task_id": pending_data.get("task_id", pending_data["workflow_id"]),
-                "parameter_name": pending_data["field"],
-                "prompt": pending_data.get("prompt", "Please provide the missing value."),
-            })
-        except (KeyError, ValueError, TypeError) as exc:
-            raise RuntimeError(f"pending_input_not_found: {exc}") from exc
-
-        runtime_task = self._runtime.get_task(pending.task_id)
-        if runtime_task is None:
-            self._clear_pending_input_local()
-            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "That workflow is no longer available.")
-        try:
-            workflow = Workflow.from_json(runtime_task.metadata.get("workflow", {}))
-            step = next((x for x in workflow.steps if x.step_id == pending.step_id), None)
-            if step is None:
-                raise RuntimeError(f"pending_input_not_found: step {pending.step_id!r} is not in workflow")
-            if step.state != "WAITING_FOR_USER":
-                raise RuntimeError(f"pending_input_not_found: step {pending.step_id!r} is not waiting for user input")
-            if workflow.current_step != step.index:
-                raise RuntimeError(f"invalid_current_step: workflow current_step={workflow.current_step}, owner step={step.index}")
-
-            value = self._normalize_workflow_input_value(raw, pending.parameter_name)
-            if not value:
-                return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), pending.prompt)
-
-            if runtime_task.metadata.get("workflow_orchestration") == "langgraph":
-                self._clear_pending_input_local()
-                self._runtime.clear_pending_input(pending.task_id)
-                return self._resume_workflow_graph(pending.workflow_id, value, source=source)
-
-            # Inject only the named parameter; all other structured parameters and
-            # the original natural-language workflow goal remain untouched.
-            step.action.params[pending.parameter_name] = value
-            step.state = "PENDING"
-            step.failure_reason = ""
-            workflow.state = "RUNNING"
-            workflow.current_step = step.index
-            self._runtime.clear_pending_input(pending.task_id)
-            self._clear_pending_input_local()
-            self._runtime_transition(pending.task_id, "RUNNING", event_type="WORKFLOW_INPUT_RESOLVED", execution_state="RUNNING")
-            self._runtime.update_workflow(workflow.workflow_id, workflow.to_json(), event_type="WORKFLOW_INPUT_RECEIVED")
-            return self._resume_workflow(workflow, source=source)
-        except RuntimeError:
-            raise
-
-    @staticmethod
-    def _normalize_workflow_input_value(raw: str, field: str) -> str:
-        value = str(raw or "").strip()
-        if field == "message":
-            match = re.match(r"^(?:say|tell)\s+(?:her|him|them)\s+(.+)$", value, flags=re.I)
-            if match:
-                value = match.group(1).strip()
-        return value
-
-    def _clear_pending_input_local(self) -> None:
-        self.pending_input = None
-        self.pending_workflow_input = None
-
-    def _route_without_owned_input(self, raw: str, *, source: str) -> Turn:
-        """Continue through the normal dispatcher only when no owner exists."""
-        return self.submit(raw, source=source)
-
-    def _pending_approval_records(self) -> list[dict[str, Any]]:
-        return list(self._runtime.snapshot().get("pending_approvals", []) or [])
-
-    def _has_multiple_pending_approvals(self) -> bool:
-        return len(self._pending_approval_records()) > 1
-
-    def _approval_owner_for_input(self, raw: str) -> PendingApproval | None:
-        records = self._pending_approval_records()
-        if not records:
-            return None
-        match = re.search(r"\b(?:fast|task)-[a-z0-9]+(?:-[a-z0-9]+)?\b", str(raw or ""), re.I)
-        selected = None
-        if match:
-            selected = next((x for x in records if str(x.get("task_id", "")).casefold() == match.group(0).casefold()), None)
-            if selected is None:
-                return None
-        elif len(records) == 1:
-            selected = records[0]
-        else:
-            return None
-        task_id = selected.get("task_id")
-        task = self._runtime.get_task(task_id) if task_id else None
-        payload = selected.get("payload") or {}
-        if task is None or task.state != "WAITING_FOR_APPROVAL":
-            return None
-        approval = PendingApproval(
-            request=str(payload.get("request") or task.goal), action=dict(payload.get("action") or {}),
-            asked_at=float(payload.get("asked_at") or time.time()), task_id=task.task_id, goal=task.goal,
-            background_task_id=payload.get("background_task_id"), runtime_task_id=task.task_id,
-            workflow_id=payload.get("workflow_id"), step_id=payload.get("step_id"),
-            approval_request_id=payload.get("approval_request_id"),
-        )
-        self.pending_approval = approval
-        return approval
-
     def _resolve_approval_input(self, raw: str, *, source: str, background: bool) -> Turn:
         """Consume one approval response for the exact pending task.
 
@@ -1640,9 +1164,9 @@ class Session:
         with self._background_lock:
             approval = self.pending_approval
         if approval is None:
-            approval = self._approval_owner_for_input(raw)
+            approval = self._rehydrate_pending_input_owner()
         if approval is None:
-            return self._refused(UserTask(raw=raw, text=raw, source=source, status="dropped"), "I need the task ID because more than one approval is waiting.") if self._has_multiple_pending_approvals() else self.submit(raw, source=source)
+            return self.submit(raw, source=source)
         if approval.expired:
             with self._background_lock:
                 self.pending_approval = None
@@ -1652,28 +1176,24 @@ class Session:
         decision = "APPROVE" if decision == "APPROVE" else "REJECT" if decision == "REJECT" else "AMBIGUOUS"
         if decision == "AMBIGUOUS":
             if self.debug:
-                self.narrator.note(f"APPROVAL: workflow={approval.workflow_id or 'none'} step={approval.step_id or 'none'} approval={approval.approval_request_id or 'unknown'} response=AMBIGUOUS result=UNCHANGED")
+                self.narrator.note(f"APPROVAL: pending_task={approval.task_id or 'unknown'} response=AMBIGUOUS result=UNCHANGED")
             return self._approval_turn(raw, source, "Please answer yes or no. I will keep the pending action unchanged.", approval)
 
         with self._background_lock:
             self.pending_approval = None
+        from .skills.messaging.task import ApprovedMessagingTask
+        from .skills.messaging import BrowserMessagingBackend
         action = Action(kind=str(approval.action["kind"]), params=dict(approval.action.get("params", {})))
         task_id = approval.task_id or f"approved-messaging-{uuid.uuid4().hex[:12]}"
         runtime_task_id = approval.runtime_task_id
         if self.debug:
-            self.narrator.note(f"APPROVAL: workflow={approval.workflow_id or 'none'} step={approval.step_id or 'none'} approval={approval.approval_request_id or 'unknown'} response={'YES' if decision == 'APPROVE' else 'NO'} result={'APPROVED' if decision == 'APPROVE' else 'REJECTED'} resumed_workflow={approval.workflow_id or 'none'}")
+            self.narrator.note(f"APPROVAL: pending_task={task_id} response={'YES' if decision == 'APPROVE' else 'NO'} result={'APPROVED' if decision == 'APPROVE' else 'REJECTED'} resumed_task={task_id}")
         resource_key = (
             "whatsapp" if action.kind == "whatsapp_send_message"
             else "gmail" if action.kind == "gmail_send_email"
             else None
         )
         if decision == "REJECT":
-            if approval.workflow_id:
-                try:
-                    self._runtime.resolve_approval(approval.workflow_id, False)
-                except (KeyError, ValueError):
-                    self._runtime_transition(approval.workflow_id, "CANCELLED", event_type="APPROVAL_DENIED", approval_state="DENIED")
-                return self._approval_turn(raw, source, "Cancelled. Nothing was sent.", approval)
             if runtime_task_id:
                 try:
                     self._runtime.resolve_approval(runtime_task_id, False)
@@ -1687,34 +1207,21 @@ class Session:
                         record.finished_at = time.time()
             return self._approval_turn(raw, source, "Cancelled. Nothing was sent.", approval)
 
-        if approval.workflow_id:
-            if decision == "APPROVE":
-                # Do not consume RuntimeManager approval here. The graph's
-                # resumed approval node consumes it before execution, which
-                # keeps the LangGraph interrupt/checkpoint the durable owner.
-                with self._background_lock:
-                    self.pending_approval = None
-                return self._resume_workflow_graph(approval.workflow_id, True, source=source)
-            self._runtime.resolve_approval(approval.workflow_id, False)
-            return self._resume_workflow_graph(approval.workflow_id, False, source=source)
-        else:
-            from .skills.messaging.task import ApprovedMessagingTask
-            from .skills.messaging import BrowserMessagingBackend
-            approved_task = ApprovedMessagingTask(
-                action,
-                BrowserMessagingBackend(self._browser_for_task(task_id, resource_key=resource_key)),
-                task_id=task_id,
-            )
-            prepared = Prepared(
-                task=UserTask(raw=raw, text=approval.request, source=source, task_id=task_id, status="accepted"),
-                goal=approval.goal or approved_task.goal,
-                kind="approved messaging action",
-                task_obj=approved_task,
-                workspace=self.workspace,
-                approved_action=approval.action,
-                browser_resource_key=resource_key,
-                runtime_task_id=runtime_task_id,
-            )
+        approved_task = ApprovedMessagingTask(
+            action,
+            BrowserMessagingBackend(self._browser_for_task(task_id, resource_key=resource_key)),
+            task_id=task_id,
+        )
+        prepared = Prepared(
+            task=UserTask(raw=raw, text=approval.request, source=source, task_id=task_id, status="accepted"),
+            goal=approval.goal or approved_task.goal,
+            kind="approved messaging action",
+            task_obj=approved_task,
+            workspace=self.workspace,
+            approved_action=approval.action,
+            browser_resource_key=resource_key,
+            runtime_task_id=runtime_task_id,
+        )
         if runtime_task_id:
             try:
                 self._runtime.resolve_approval(runtime_task_id, True)
@@ -1734,14 +1241,7 @@ class Session:
                 if record is not None:
                     record.future = future
             return self._approval_turn(raw, source, "Approved. I’m continuing the original task.", approval)
-        turn = self._run(prepared)
-        if approval.workflow_id and turn.result is not None and turn.result.ok:
-            runtime_task = self._runtime.get_task(approval.workflow_id)
-            workflow_data = runtime_task.metadata.get("workflow") if runtime_task else None
-            if isinstance(workflow_data, dict):
-                workflow = Workflow.from_json(workflow_data)
-                return self._resume_workflow(workflow, source=source, background=background)
-        return turn
+        return self._run(prepared)
 
     def _resume_approved_background(self, background_task_id: str, prepared: Prepared) -> None:
         """Resume the exact approved task on the existing serialized worker lane."""
@@ -1756,14 +1256,6 @@ class Session:
         try:
             turn = self._run(prepared)
             result = turn.result
-            if prepared.kind == "workflow step" and result is not None and result.ok:
-                runtime_task = self._runtime.get_task(prepared.runtime_task_id or background_task_id)
-                workflow_data = runtime_task.metadata.get("workflow") if runtime_task else None
-                if isinstance(workflow_data, dict):
-                    workflow_turn = self._resume_workflow(Workflow.from_json(workflow_data), source="text", background=True)
-                    if workflow_turn.result is not None:
-                        result = workflow_turn.result
-                    turn = workflow_turn
             with self._background_lock:
                 record = self._background.get(background_task_id)
                 if record is None:
@@ -1825,31 +1317,14 @@ class Session:
         # Rehydrate durable ownership at the dispatcher boundary.  This is the
         # critical restart invariant: pending approval outranks conversation and
         # new task routing even in the first turn of a fresh process.
-        # Approval is a distinct owned interaction and must be rehydrated first.
-        # Workflow-input rehydration is deliberately separate; calling only that
-        # method here allowed a durable approval to fall through to conversation.
         self._rehydrate_pending_input_owner()
-        self._rehydrate_approval_owner()
         with self._background_lock:
             approval_pending = self.pending_approval is not None
-        if approval_pending or self._has_multiple_pending_approvals():
-            if self.debug:
-                self._debug_input(event, IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=self.pending_approval.task_id if self.pending_approval is not None else None)
+        if approval_pending:
             resolved = self._resolve_approval_input(event.text, source=event.source, background=True)
-            return resolved.task.task_id
-        workflow_input_owner = self._rehydrate_workflow_input()
-        if workflow_input_owner is not None or self._has_multiple_pending_workflow_inputs():
-            if self.debug:
-                self._debug_input(event, IntentCategory.CLARIFICATION_RESPONSE, InputOwner.TASK, task_created=False, task_id=str(workflow_input_owner.get("workflow_id", "")) if workflow_input_owner else None)
-            resolved = self._resolve_workflow_input(event.text, source=event.source)
             return resolved.task.task_id
 
         text = _WHITESPACE.sub(" ", event.text.strip()).strip(_TRAILING)
-        control = classify_runtime_control(text)
-        if control is not None:
-            resolved = self._handle_runtime_control(control, raw=event.text, source=event.source, background=True)
-            return resolved.task.task_id if resolved.task.task_id else event.event_id
-
         # Runtime-status questions are answered from the authoritative registry
         # before normal conversation/task classification. This keeps /chat usable
         # for runtime inspection even when the optional benchmark task catalog is
@@ -2021,16 +1496,7 @@ class Session:
         self.narrator.reply(spoken)
 
     def background_tasks(self) -> list[BackgroundTask]:
-        # BackgroundTask is a presentation view. Refresh lifecycle fields from
-        # RuntimeManager on read so it can never become a second source of truth.
         with self._background_lock:
-            for record in self._background.values():
-                runtime = self._runtime.get_task(record.runtime_task_id or record.task_id)
-                if runtime is None:
-                    continue
-                record.state = runtime.state
-                record.started_at = runtime.started_at
-                record.finished_at = runtime.completed_at
             return list(self._background.values())
 
     def cancel_background(self, task_id: str) -> bool:
@@ -2121,28 +1587,16 @@ class Session:
         # turns out to be -- which is what keeps this from becoming context the
         # agent accumulates.
         pending, self.pending = self.pending, None
-        approval = self.pending_approval or self._rehydrate_approval_owner()
-        workflow_input_owner = self.pending_workflow_input or self._rehydrate_workflow_input()
+        approval = self.pending_approval or self._rehydrate_pending_input_owner()
         if approval is not None and approval.expired:
             self.pending_approval = None
             approval = None
 
-        # Runtime ownership is resolved before lexical intent. The local fields
-        # are only cached views; the rehydration calls above read RuntimeManager.
-        # Never let a normal conversation turn outrank an owned interaction.
-        if approval is not None or self._has_multiple_pending_approvals():
-            if self.debug:
-                self._debug_input(InputEvent(text=raw or "", source=source), IntentCategory.CLARIFICATION_RESPONSE, InputOwner.APPROVAL, task_created=False, task_id=approval.task_id if approval is not None else None)
+        # Approval state is authoritative input ownership. While a consequential
+        # action is awaiting confirmation, this input is never normalized, routed,
+        # planned, or turned into a new task.
+        if self.pending_approval is not None:
             return self._resolve_approval_input(raw, source=source, background=False)
-
-        if workflow_input_owner is not None or self._has_multiple_pending_workflow_inputs():
-            if self.debug:
-                self._debug_input(InputEvent(text=raw or "", source=source), IntentCategory.CLARIFICATION_RESPONSE, InputOwner.TASK, task_created=False, task_id=str(workflow_input_owner.get("workflow_id", "")))
-            return self._resolve_workflow_input(raw, source=source)
-
-        control = classify_runtime_control(raw)
-        if control is not None:
-            return self._handle_runtime_control(control, raw=raw, source=source, background=False)
 
         if pending is not None and pending.expired:
             self.narrator.note(
@@ -2224,10 +1678,6 @@ class Session:
             # a python project called test_project" travel the same road to the
             # same ``run_agent_task``. The order the shapes are tried in is
             # deliberate; see ``api.resolve_request``.
-            if re.search(r"\bthen\b", task.text, flags=re.IGNORECASE):
-                workflow_id = getattr(self._thread_state, "runtime_task_id", None) or self._workflow_id_from_goal()
-                return self._start_workflow(task.text, source=source, workflow_id=workflow_id)
-
             fast = classify_fast(task.text)
             if fast.route is not None:
                 fast_task_id = getattr(self._thread_state, "runtime_task_id", None) or f"fast-{uuid.uuid4().hex[:12]}"
@@ -2505,7 +1955,6 @@ class Session:
                 fast_latency_seconds=prepared.fast_latency_seconds,
                 on_event=self._runtime_event_watcher(runtime_task_id, self._watcher(lines)),
                 browser_backend=browser_backend,
-                runtime_manager=self._runtime,
             )
 
         except Exception as exc:
@@ -2519,37 +1968,19 @@ class Session:
         if result.ok:
             self._update_recent_context(prepared, result)
 
-        runtime_after_run = self._runtime.get_task(runtime_task_id) if runtime_task_id else None
-        runtime_state_after_run = runtime_after_run.state if runtime_after_run is not None else None
-
         if result.needs_input:
-            # Approval ownership is persisted below, after the approval envelope is
-            # decoded. Do not first publish WAITING_FOR_USER: that creates a real
-            # observable state in which an approval exists only in a session-local
-            # field and the next dispatcher turn can race/fall through to chat.
-            context = result.question.context if result.question is not None else ""
-            if not context.startswith("APPROVAL_ACTION:"):
+            if self.pending_approval is not None:
+                self._runtime_transition(runtime_task_id, "WAITING_FOR_APPROVAL", approval_state="WAITING", execution_state="WAITING_FOR_APPROVAL")
+            else:
                 self._runtime_transition(runtime_task_id, "WAITING_FOR_USER", execution_state="WAITING_FOR_USER")
         elif result.status is TaskStatus.CANCELLED:
             self._runtime_transition(runtime_task_id, "CANCELLED", event_type="TASK_CANCELLED", cancellation_state="CANCELLED")
         elif result.ok:
-            workflow_data = result.outcome.workflow if result.outcome is not None else None
-            workflow_complete = isinstance(workflow_data, dict) and workflow_data.get("state") == "COMPLETED"
-            if runtime_state_after_run == "COMPLETED":
-                # The runner watcher already established the terminal lifecycle
-                # state from AgentState.COMPLETED. RuntimeManager remains
-                # authoritative; do not replay a transition from a terminal state.
-                pass
-            elif workflow_complete or not isinstance(workflow_data, dict):
-                self._runtime_transition(runtime_task_id, "COMPLETED", event_type="TASK_COMPLETED", execution_state="COMPLETED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
-            else:
-                self._runtime_transition(runtime_task_id, "RUNNING", event_type="WORKFLOW_STEP_COMPLETED", execution_state="RUNNING", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
+            self._runtime_transition(runtime_task_id, "COMPLETED", event_type="TASK_COMPLETED", execution_state="COMPLETED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
         elif result.status is TaskStatus.UNKNOWN:
-            if runtime_state_after_run != "FAILED":
-                self._runtime_transition(runtime_task_id, "FAILED", event_type="TASK_FAILED", failure_state=result.detail, failure_category="UNKNOWN", execution_state="FAILED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
+            self._runtime_transition(runtime_task_id, "FAILED", event_type="TASK_FAILED", failure_state=result.detail, failure_category="UNKNOWN", execution_state="FAILED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
         else:
-            if runtime_state_after_run != "FAILED":
-                self._runtime_transition(runtime_task_id, "FAILED", event_type="TASK_FAILED", failure_state=result.detail, failure_category="EXECUTION", execution_state="FAILED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
+            self._runtime_transition(runtime_task_id, "FAILED", event_type="TASK_FAILED", failure_state=result.detail, failure_category="EXECUTION", execution_state="FAILED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
 
         if self.debug:
             for line in result.report_lines():
@@ -2559,56 +1990,21 @@ class Session:
             context = result.question.context or ""
             if context.startswith("APPROVAL_ACTION:"):
                 try:
-                    envelope = json.loads(context[len("APPROVAL_ACTION:"):])
-                    if not isinstance(envelope, dict):
-                        raise ValueError("approval envelope is not an object")
-                    action = envelope.get("action", envelope)
-                    if not isinstance(action, dict) or not isinstance(action.get("kind"), str):
-                        raise ValueError("approval action is missing kind")
-                    workflow_id = envelope.get("workflow_id")
-                    step_id = envelope.get("step_id")
-                    self.pending_approval = PendingApproval(
-                        request=task.text, action=action, asked_at=time.time(),
-                        task_id=task.task_id, goal=prepared.goal,
-                        background_task_id=getattr(self._thread_state, "background_task_id", None),
-                        runtime_task_id=runtime_task_id,
-                        workflow_id=workflow_id,
-                        step_id=step_id,
-                        approval_request_id=envelope.get("approval_request_id"),
-                    )
-                    if runtime_task_id:
-                        self._runtime.request_approval(runtime_task_id, {
-                            "request": task.text, "action": action, "asked_at": self.pending_approval.asked_at,
-                            "background_task_id": self.pending_approval.background_task_id,
-                            "workflow_id": self.pending_approval.workflow_id,
-                            "step_id": self.pending_approval.step_id,
-                            "approval_request_id": self.pending_approval.approval_request_id,
-                        })
+                    action = json.loads(context[len("APPROVAL_ACTION:"):])
+                    if isinstance(action, dict) and isinstance(action.get("kind"), str):
+                        self.pending_approval = PendingApproval(
+                            request=task.text, action=action, asked_at=time.time(),
+                            task_id=task.task_id, goal=prepared.goal,
+                            background_task_id=getattr(self._thread_state, "background_task_id", None),
+                            runtime_task_id=runtime_task_id,
+                        )
+                        if runtime_task_id:
+                            self._runtime.request_approval(runtime_task_id, {
+                                "request": task.text, "action": action, "asked_at": self.pending_approval.asked_at,
+                                "background_task_id": self.pending_approval.background_task_id,
+                            })
                 except Exception:
                     pass
-            elif context.startswith("WORKFLOW_INPUT:"):
-                try:
-                    payload = json.loads(context[len("WORKFLOW_INPUT:"):])
-                    if isinstance(payload, dict) and payload.get("workflow_id") and payload.get("step_id") and payload.get("field"):
-                        pending = PendingInput(
-                            input_id=str(payload.get("input_id") or f"input-{uuid.uuid4().hex[:10]}"),
-                            workflow_id=str(payload["workflow_id"]),
-                            step_id=str(payload["step_id"]),
-                            task_id=str(payload.get("task_id") or runtime_task_id),
-                            parameter_name=str(payload["field"]),
-                            prompt=str(result.question.question if result.question is not None else "Please provide the missing value."),
-                        )
-                        self.pending_input = pending
-                        self.pending_workflow_input = {
-                            "input_id": pending.input_id, "workflow_id": pending.workflow_id,
-                            "step_id": pending.step_id, "task_id": pending.task_id,
-                            "field": pending.parameter_name, "prompt": pending.prompt,
-                        }
-                        if runtime_task_id:
-                            self._runtime.set_pending_input(runtime_task_id, self.pending_workflow_input)
-                except Exception as exc:
-                    if self.debug:
-                        self.narrator.note(f"INPUT: pending owner registration failed: {type(exc).__name__}: {exc}")
 
         # A run suspended on a question (NEEDS_INPUT) is not a failure and
         # must not be handed to the free-form conversational reply path: that
@@ -2714,121 +2110,6 @@ class Session:
             for key, value in self.recent_context.planner_state().items():
                 self.narrator.note(f"  recent_context.{key} = {value}")
 
-    def _runtime_control_task(self, command: RuntimeControlCommand):
-        snapshot = self.runtime_snapshot()
-        tasks = self._runtime.list_tasks()
-        if command.task_id:
-            task = self._runtime.get_task(command.task_id)
-            if task is None:
-                return None, "That task does not exist in the current runtime."
-            return task, None
-        if command.scope == "all":
-            return None, None
-        active = [t for t in tasks if t.state not in {"COMPLETED", "FAILED", "CANCELLED"}]
-        if len(active) == 1:
-            return active[0], None
-        if not active:
-            return None, "There are no active tasks right now."
-        return None, "I need a task ID because multiple active tasks need attention."
-
-    @staticmethod
-    def _runtime_task_reply(task) -> str:
-        if task is None:
-            return "There are no matching runtime tasks to continue."
-        state = str(task.state)
-        if state == "WAITING_FOR_APPROVAL":
-            return "The task is waiting for your approval."
-        if state in {"WAITING_FOR_USER", "WAITING_FOR_HUMAN"}:
-            return "The task is waiting for your input."
-        if state == "RECOVERY_REQUIRED":
-            return "The task needs recovery before it can continue."
-        if state == "RUNNING":
-            return "The task is already running."
-        if state == "COMPLETED":
-            return "The task has already completed; I will not replay it."
-        if state == "FAILED":
-            return "The task failed; I will not replay it without an explicit retry."
-        if state == "CANCELLED":
-            return "The task was cancelled and will not be replayed."
-        return f"The task is {state.casefold()}."
-
-    def _resume_runtime_task(self, task, *, source: str, background: bool) -> Turn:
-        if task is None:
-            return Turn(task=UserTask(raw="", text="", source=source, status="dropped"), reply="There are no matching runtime tasks to continue.")
-        state = str(task.state)
-        if state in {"WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "RECOVERY_REQUIRED", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"}:
-            reply = self._runtime_task_reply(task)
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), reply)
-        workflow_data = task.metadata.get("workflow") if isinstance(task.metadata, dict) else None
-        if not isinstance(workflow_data, dict):
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "That task has no resumable workflow state.")
-        try:
-            workflow = Workflow.from_json(workflow_data)
-        except Exception:
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "The task's workflow state could not be recovered safely.")
-        # A workflow is executable only when every dependency before the current
-        # step is verified complete and the current step itself is pending.
-        idx = workflow.current_step
-        if idx < 0 or idx >= len(workflow.steps):
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "The task's workflow state is invalid, so I will not continue it.")
-        if any(step.state != "COMPLETED" for step in workflow.steps[:idx]):
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), "The task has an incomplete prerequisite, so I will not skip ahead.")
-        if workflow.steps[idx].state != "PENDING":
-            return self._refused(UserTask(raw=task.goal, text=task.goal, source=source, task_id=task.task_id, status="accepted"), self._runtime_task_reply(task))
-        return self._resume_workflow(workflow, source=source, background=background)
-
-    def _handle_runtime_control(self, command: RuntimeControlCommand, *, raw: str, source: str, background: bool) -> Turn:
-        if self.debug:
-            owner = InputOwner.TASK
-            self._debug_input(InputEvent(text=raw, source=source), None, owner, task_created=False, task_id=command.task_id)
-            self.narrator.note(f"RUNTIME_CONTROL: {command.kind.value} task={command.task_id or command.scope}")
-        task, error = self._runtime_control_task(command)
-        if error:
-            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=command.task_id or "", status="accepted"), error)
-        if command.kind is RuntimeControlKind.STATUS:
-            reply = self._runtime_query_reply("what tasks are running") or "There are no active tasks right now."
-            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id if task else "", status="accepted"), reply)
-        if command.kind is RuntimeControlKind.CANCEL:
-            if task is None:
-                return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I need a task ID because multiple active tasks need attention.")
-            if task.state in {"COMPLETED", "FAILED", "CANCELLED"}:
-                return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), self._runtime_task_reply(task))
-            self._runtime.cancel_task(task.task_id, reason="cancelled by user")
-            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task was cancelled.")
-        if command.kind is RuntimeControlKind.RETRY:
-            if task is None:
-                return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I need a task ID because multiple tasks are available.")
-            if task.state != "FAILED":
-                return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task is not failed, so I will not retry it.")
-            # The existing recovery pipeline owns retries; this control command
-            # deliberately does not synthesize a new action or replay a terminal run.
-            return self._refused(UserTask(raw=raw, text=raw, source=source, task_id=task.task_id, status="accepted"), "The task failed. Recovery must re-observe it before another execution attempt.")
-        if command.kind in {RuntimeControlKind.CONTINUE, RuntimeControlKind.RESUME}:
-            if command.scope == "all":
-                active = self._runtime.list_active_tasks()
-                resumable = []
-                blocked = []
-                for candidate in active:
-                    if candidate.state in {"WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "WAITING_FOR_HUMAN", "RECOVERY_REQUIRED", "RUNNING"}:
-                        blocked.append(self._runtime_task_reply(candidate))
-                        continue
-                    workflow = candidate.metadata.get("workflow") if isinstance(candidate.metadata, dict) else None
-                    if isinstance(workflow, dict):
-                        try:
-                            wf = Workflow.from_json(workflow)
-                            idx = wf.current_step
-                            if 0 <= idx < len(wf.steps) and wf.steps[idx].state == "PENDING" and all(s.state == "COMPLETED" for s in wf.steps[:idx]):
-                                resumable.append(candidate)
-                        except Exception:
-                            blocked.append("A task has invalid workflow state and was not continued.")
-                if not resumable:
-                    return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "No task is ready to continue. " + " ".join(blocked[:2]))
-                if len(resumable) > 1:
-                    return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "Multiple tasks are ready to continue. Please provide a task ID.")
-                return self._resume_runtime_task(resumable[0], source=source, background=background)
-            return self._resume_runtime_task(task, source=source, background=background)
-        return self._refused(UserTask(raw=raw, text=raw, source=source, status="accepted"), "I could not resolve that runtime command safely.")
-
     def _runtime_query_reply(self, text: str) -> str | None:
         """Answer runtime-status questions from RuntimeManager truth.
 
@@ -2913,7 +2194,6 @@ class Session:
                 recent_context=context,
                 memories=self._conversation_memory().search(task.text, limit=8),
             )
-            reply = guard_conversation_runtime_claim(reply, runtime)
         except (LLMUnavailable, RuntimeError) as exc:
             return self._refused(
                 task,

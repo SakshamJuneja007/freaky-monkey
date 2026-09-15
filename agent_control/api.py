@@ -1933,6 +1933,9 @@ def run_agent_task(
     recent_context: dict[str, str] | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
     browser_backend: Any | None = None,
+    fast_route: Any | None = None,
+    fast_latency_seconds: float = 0.0,
+    runtime_manager: Any | None = None,
 ) -> AgentResult:
     """Run a task through the single execution pipeline.
 
@@ -2133,7 +2136,16 @@ def run_agent_task(
         )
 
     try:
-        if planner == "mock":
+        # A resumed WorkflowStepTask already owns the exact structured action.
+        # Do not re-plan from the user's parameter answer; replay the same step
+        # through the normal runner so Policy, execution and verification remain
+        # authoritative. MockPlanner here is only the deterministic adapter for
+        # an already-resolved action, not an approval or execution bypass.
+        if fast_route is not None:
+            engine = None
+        elif hasattr(task_obj, "workflow_step"):
+            engine = MockPlanner(reference_plan=[task_obj.workflow_step.action])
+        elif planner == "mock":
             engine = MockPlanner(
                 reference_plan=task.reference_plan(policy)
             )
@@ -2160,6 +2172,8 @@ def run_agent_task(
         recovery_enabled=recovery,
         budget=RecoveryBudget(),
         interactive=interactive,
+        runtime_manager=runtime_manager,
+        runtime_task_id=task_id,
     )
 
     own_trace = trace is None
@@ -2183,6 +2197,17 @@ def run_agent_task(
     owns_browser_backend = browser_backend is None
 
     try:
+        direct_action_factory = None
+        if fast_route is not None:
+            def direct_action_factory(loop, _route=fast_route, _task=task):
+                resolver = getattr(_task, "resolve_current_action", None)
+                if callable(resolver):
+                    return resolver()
+                action = getattr(_task, "action", None)
+                if action is None:
+                    raise ValueError("fast route did not resolve a browser action")
+                return action
+
         outcome = run_task(
             task,
             engine,
@@ -2191,6 +2216,8 @@ def run_agent_task(
             trace=active,
             skills=skills,
             teardown=not keep_workspace,
+            direct_action_factory=direct_action_factory,
+            fast_latency_seconds=fast_latency_seconds,
             extra_state={
                 **_permissions(policy),
                 **_decisions(answers, approved_action),
@@ -2224,6 +2251,7 @@ def run_agent_task(
                     policy,
                     use_memory,
                 ),
+                **({"workflow": task_obj.workflow.to_json(), "workflow_step_index": task_obj.workflow_step.index} if hasattr(task_obj, "workflow") and hasattr(task_obj, "workflow_step") else {}),
             },
         )
 

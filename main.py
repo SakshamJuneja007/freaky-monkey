@@ -148,6 +148,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "dotenv",
         "pytest",
         "playwright",
+        "langgraph",
+        "langgraph.checkpoint.sqlite",
     ):
         try:
             __import__(module)
@@ -620,7 +622,8 @@ Type a message and press Enter -- or press Enter on an empty line to speak one.
 
   /memory <query>      look up remembered file locations; runs nothing
 
-  /tasks               list registered benchmark / structured workflows
+  /tasks               list registered workflows and background task state
+  /cancel <task-id>    cancel a queued background task
 
   cls | clear          clear the terminal locally; no model call
 
@@ -700,7 +703,9 @@ def _chat_voice(session) -> None:
             f"{capture.latency_seconds:.1f}s stt]"
         )
 
-    session.submit_capture(capture)
+    submitted = session.submit_capture(capture, background=True)
+    if isinstance(submitted, str):
+        print(f"  [{submitted}] submitted")
 
 
 def _chat_memory(
@@ -796,9 +801,66 @@ def _chat_command(
 
     elif name == "tasks":
 
-        cmd_tasks(
-            argparse.Namespace()
-        )
+        print("RUNTIME TASKS")
+        snapshot = session.runtime_snapshot()
+        active = snapshot["active_tasks"]
+        waiting = snapshot["waiting_tasks"]
+        completed = snapshot["completed_tasks"]
+        failed = snapshot["failed_tasks"]
+
+        def show(title, items):
+            print(f"\n{title}")
+            if not items:
+                print("  (none)")
+                return
+            for item in items:
+                print(f"  [{item['task_id']}] {item['state']:<20} {item['goal']}")
+                workflow = item.get("metadata", {}).get("workflow") if isinstance(item.get("metadata"), dict) else None
+                if isinstance(workflow, dict):
+                    for step in workflow.get("steps", []):
+                        capability = step.get("capability", "step")
+                        args = step.get("arguments", {}) if isinstance(step.get("arguments"), dict) else {}
+                        target = args.get("recipient") or args.get("query") or ""
+                        suffix = f" → {target}" if target else ""
+                        print(f"      Step {int(step.get('index', 0)) + 1}  {step.get('state', 'PENDING'):<20} {capability}{suffix}")
+
+        show("ACTIVE", active)
+        # Waiting tasks are also active; this separate section makes approval
+        # ownership visible without maintaining a second task registry.
+        show("WAITING", waiting)
+        show("COMPLETED", completed[-10:])
+        show("FAILED", failed[-10:])
+
+        show("RECOVERY_REQUIRED", snapshot.get("recovery_tasks", []))
+        show("CANCELLED", snapshot.get("cancelled_tasks", [])[-10:])
+
+        print("\nBACKGROUND TASK VIEW")
+        background_by_id = {}
+        for item in (active + waiting + completed + failed + snapshot.get("recovery_tasks", []) + snapshot.get("cancelled_tasks", [])):
+            if item.get("metadata", {}).get("background"):
+                background_by_id[item["task_id"]] = item
+        background = list(background_by_id.values())
+        if not background:
+            print("  (none)")
+        else:
+            for item in background[-20:]:
+                print(f"  [{item['task_id']}] {item['state']:<20} {item['goal']}")
+
+        print("\nREGISTERED / STRUCTURED")
+        try:
+            cmd_tasks(argparse.Namespace())
+        except ModuleNotFoundError:
+            print("  registered task catalog unavailable in this checkout")
+
+    elif name == "cancel":
+
+        task_id = argument.strip()
+        if not task_id:
+            print("  usage: /cancel <task-id>")
+        elif session.cancel_background(task_id):
+            print(f"  [{task_id}] cancelled")
+        else:
+            print(f"  [{task_id}] could not be cancelled (not queued or not found)")
 
     else:
 
@@ -850,6 +912,7 @@ def cmd_chat(args: argparse.Namespace) -> int:
         use_memory=not args.no_memory,
         show_status=bool(getattr(args, "debug", False)) and not args.no_status,
         debug=getattr(args, "debug", False),
+        runtime_persistence_path=ROOT / ".agent_state" / "runtime.sqlite3",
     )
 
     print(
@@ -905,7 +968,8 @@ def cmd_chat(args: argparse.Namespace) -> int:
                 continue
 
             try:
-                session.submit(line)
+                task_id = session.submit_background(line)
+                print(f"[{task_id}] submitted")
 
             except KeyboardInterrupt:
 
@@ -913,6 +977,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
                     "\n  interrupted. "
                     "Nothing is claimed without a completed result."
                 )
+            except Exception as exc:
+                # Submission failures are presentation errors, not reasons to
+                # terminate the interactive session. Background execution itself
+                # records its exceptions on the task registry.
+                print(f"  could not submit task: {type(exc).__name__}: {exc}")
 
             print()
 
@@ -1669,7 +1738,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--speak",
         dest="speak",
         action="store_true",
-        default=None,
+        default=True,
         help=(
             "read replies aloud "
             "(overrides TTS_ENABLED)"

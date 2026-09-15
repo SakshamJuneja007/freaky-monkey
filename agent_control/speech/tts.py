@@ -287,6 +287,15 @@ class Speaker:
         self._ensure_worker()
         self._queue.put(text)
 
+    def wait_until_idle(self, timeout_s: float = 15.0) -> bool:
+        """Wait until all queued speech has finished."""
+        deadline = time.time() + max(0.0, float(timeout_s))
+        while time.time() < deadline:
+            if self._queue.unfinished_tasks == 0:
+                return True
+            time.sleep(0.01)
+        return self._queue.unfinished_tasks == 0
+
     def close(self, timeout_s: float = 15.0) -> None:
         """Let queued speech finish, then stop the worker.
 
@@ -310,9 +319,12 @@ class Speaker:
     def _drain(self) -> None:
         while True:
             item = self._queue.get()
-            if item is None:
-                return
-            self._speak_now(item)
+            try:
+                if item is None:
+                    return
+                self._speak_now(item)
+            finally:
+                self._queue.task_done()
 
     def _speak_now(self, text: str) -> None:
         try:

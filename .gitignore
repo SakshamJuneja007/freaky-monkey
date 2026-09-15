@@ -126,4 +126,6 @@ desktop.ini
 *.state
 *.session
 *.lock
+*.zip
+.agent_state/
 "@ | Add-Content -Encoding UTF8 .gitignore

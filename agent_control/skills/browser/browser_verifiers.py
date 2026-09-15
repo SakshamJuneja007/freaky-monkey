@@ -56,6 +56,29 @@ class BrowserVerifier:
         if action.kind is BrowserActionKind.PLAY_SONG:
             return self.verify_playback(str(p.get("query", "")))
 
+        if p.get("verify_youtube_playback") is True:
+            target = p.get("target")
+            if target is not None:
+                name = str(getattr(target, "name", ""))
+                raw = getattr(target, "raw", None)
+                hrefs = []
+
+                def collect(value: Any) -> None:
+                    if isinstance(value, dict):
+                        for key, item in value.items():
+                            if str(key).casefold() in {"href", "url", "link", "target_url", "targeturl"} and isinstance(item, str):
+                                hrefs.append(item)
+                            elif isinstance(item, (dict, list, tuple)):
+                                collect(item)
+                    elif isinstance(value, (list, tuple)):
+                        for item in value:
+                            collect(item)
+
+                collect(raw)
+                if "short" in name.casefold() or any("/shorts/" in h.casefold() or "youtube.com/shorts" in h.casefold() for h in hrefs):
+                    return BrowserVerificationResult(False, "selected YouTube result was a Short", "FAIL")
+            return self.verify_playback("")
+
         if action.kind is BrowserActionKind.OPEN_URL:
             expected = str(p.get("url", ""))
             if expected:

@@ -184,10 +184,10 @@ def test_play_song_uses_fresh_semantic_result_and_never_hard_codes_ref():
     browser = BrowserSkillAdapter(cli)
     result = browser.play_song("Killshot", timeout_s=2)
     assert result["ok"] is True
-    assert result["selected_ref"] == "@e57"
+    assert result["selected_ref"] == "@e58"
     assert result["playback"] == "verified"
     click_calls = [c for c, _ in cli.calls if c[:1] == ["click"]]
-    assert click_calls and "@e57" in click_calls[0]
+    assert click_calls and "@e58" in click_calls[0]
 
 
 def test_tab_list_uses_session_scoped_tab_command_not_status():

@@ -380,6 +380,11 @@ GENERAL RULES:
 - recent_context may contain verified references from previous turns.
 - If state contains approved_action, reproduce that exact action kind and parameters; it is a trusted runtime approval and must not be altered.
 - Sending through WhatsApp or Gmail is externally side-effecting and the runtime requires a separate human approval before it can execute.
+- A compound request containing multiple dependent actions MUST be decomposed into an ordered `actions` list, one action per executable step. Never put the entire compound request into any action parameter.
+- Preserve the original goal only as context. Explicitly assign each action parameter from the relevant clause of the goal.
+- For `whatsapp_send_message`, `recipient` is only the contact target and `message` is only the message body. Never use the whole goal as either field. If the message is not specified, omit the value or use an explicit structured missing value rather than inventing text.
+- For `browser_play_song`, `query` is only the requested song/artist, never the whole compound goal.
+- Ordered actions are sequential dependent steps: later actions must not be treated as approved merely because an earlier action was approved.
 - Use recent_context to resolve relative references such as "that folder",
   "that file", "it", or "there".
 - recent_context never widens path permissions.
@@ -488,22 +493,21 @@ class OpenAICompatPlanner:
         the resulting action downstream.
         """
 
+        compound = _parse_compound_goal(goal)
+        if compound is not None:
+            return PlannerStep(
+                actions=compound,
+                done=False,
+                reasoning=f"deterministically decomposed {len(compound)} ordered workflow steps",
+            )
+
         whatsapp = _parse_whatsapp_send_goal(goal)
         if whatsapp is not None:
             recipient, message = whatsapp
             return PlannerStep(
-                actions=[
-                    Action(
-                        kind="whatsapp_send_message",
-                        params={
-                            "recipient": recipient,
-                            "message": message,
-                        },
-                        rationale="deterministic WhatsApp send intent",
-                    )
-                ],
+                actions=[Action(kind="whatsapp_send_message", params={"recipient": recipient, "message": message}, rationale="deterministic structured WhatsApp intent")],
                 done=False,
-                reasoning="recognized explicit WhatsApp send request",
+                reasoning="recognized one explicit WhatsApp send action",
             )
 
         messages = [
@@ -548,7 +552,32 @@ class OpenAICompatPlanner:
                 error=f"planner {truncated}"
             )
 
-        return _parse_step(text)
+        step = _parse_step(text)
+        if step.error:
+            return step
+        original = " ".join(str(goal or "").split()).casefold()
+        for action in step.actions:
+            if action.kind == "whatsapp_send_message":
+                recipient = action.params.get("recipient")
+                message = action.params.get("message")
+                if not isinstance(recipient, str) or not recipient.strip():
+                    step.rejected.append("whatsapp_send_message: missing recipient")
+                elif recipient.strip().casefold() == original:
+                    step.rejected.append("whatsapp_send_message: recipient conflates workflow goal")
+                    action.params.pop("recipient", None)
+                if not isinstance(message, str) or not message.strip():
+                    action.params.pop("message", None)
+            elif action.kind == "whatsapp_search_contact":
+                query = action.params.get("query")
+                if isinstance(query, str) and query.strip().casefold() == original:
+                    step.rejected.append("whatsapp_search_contact: query conflates workflow goal")
+                    action.params.pop("query", None)
+            elif action.kind == "browser_play_song":
+                query = action.params.get("query")
+                if isinstance(query, str) and query.strip().casefold() == original:
+                    step.rejected.append("browser_play_song: query conflates workflow goal")
+                    action.params.pop("query", None)
+        return step
 
     def _user_message(
         self,
@@ -631,21 +660,78 @@ def _normalize_whatsapp_command(text: str) -> str:
 
     return " ".join(tokens)
 
+def _parse_compound_goal(goal: str) -> list[Action] | None:
+    """Decompose a fully explicit ``then`` workflow without LLM ambiguity.
+
+    This is intentionally schema-driven rather than sentence-specific: each
+    clause must independently match an existing capability parser. If any
+    clause is not understood, return ``None`` and leave the normal planner path
+    responsible for it. The original goal is never copied into action params.
+    """
+    text = " ".join(str(goal or "").strip().split())
+    clauses = [part.strip() for part in re.split(r"\s+then\s+", text, flags=re.IGNORECASE)]
+    if len(clauses) < 2:
+        return None
+
+    actions: list[Action] = []
+    for clause in clauses:
+        whatsapp = _parse_whatsapp_send_goal(clause)
+        if whatsapp is not None:
+            recipient, message = whatsapp
+            actions.append(Action(
+                kind="whatsapp_send_message",
+                params={"recipient": recipient, "message": message},
+                rationale="decomposed explicit WhatsApp workflow step",
+            ))
+            continue
+
+        play = re.fullmatch(r"(?:open\s+youtube\s+and\s+)?play\s+(.+)", clause, flags=re.IGNORECASE)
+        if play and play.group(1).strip():
+            actions.append(Action(
+                kind="browser_play_song",
+                params={"query": play.group(1).strip(" \"'.,!?;:")},
+                rationale="decomposed explicit YouTube playback workflow step",
+            ))
+            continue
+
+        return None
+
+    return actions if actions else None
+
+
 def _parse_whatsapp_send_goal(goal: str) -> tuple[str, str] | None:
     """Extract an explicit WhatsApp send command without using the LLM."""
 
     text = " ".join(str(goal or "").strip().split())
     text = _normalize_whatsapp_command(text)
+    # A sentence containing multiple executable clauses belongs to workflow
+    # decomposition. Do not let the single-action shorthand consume text from
+    # later clauses as a recipient or message.
+    if re.search(r"\s+then\s+", text, flags=re.IGNORECASE):
+        return None
+    # Explicit forms: ``send message to papa saying hello`` and the common
+    # conversational shorthand ``send hello to papa``.  The latter is kept
+    # deliberately narrow: the first ``to`` is the message/recipient boundary
+    # and an optional trailing ``on whatsapp`` makes the channel explicit.
     match = re.fullmatch(
         r"send\s+(?:a\s+)?(?:whatsapp(?:\s+message)?|message)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?\s+(?:saying|telling)\s+(.+)",
         text,
         flags=re.IGNORECASE,
     )
-    if not match:
-        return None
+    if match:
+        recipient = match.group(1).strip(" \"'.,!?;:")
+        message = match.group(2).strip()
+    else:
+        shorthand = re.fullmatch(
+            r"send\s+(.+?)\s+to\s+(.+?)(?:\s+on\s+whatsapp)?",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if not shorthand:
+            return None
+        message = shorthand.group(1).strip(" \"'.,!?;:")
+        recipient = shorthand.group(2).strip(" \"'.,!?;:")
 
-    recipient = match.group(1).strip(" \"'.,!?;:")
-    message = match.group(2).strip()
     if not recipient or not message:
         return None
     return recipient, message

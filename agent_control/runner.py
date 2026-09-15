@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from . import os_tools
 from .observe import summarize
@@ -73,6 +73,8 @@ class RunConfig:
     recovery_enabled: bool = True
     budget: RecoveryBudget = field(default_factory=RecoveryBudget)
     interactive: bool = False
+    runtime_manager: Any | None = None
+    runtime_task_id: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -129,6 +131,7 @@ class RunOutcome:
 
     #: Explicitly marks a legitimate informational completion.
     informational_completion: bool = False
+    workflow: dict[str, Any] | None = None
 
     @property
     def verified_success(self) -> bool:
@@ -217,6 +220,8 @@ class _Loop:
     extra_state: dict[str, Any] = field(default_factory=dict)
     state: AgentState = AgentState.IDLE
     question: Clarification | None = None
+    workflow: Any | None = None
+    workflow_step_index: int = -1
 
     def refresh(self) -> float:
         """Observe the task and establish a fresh state fingerprint."""
@@ -679,34 +684,37 @@ def _execute_skill_action(
             )
         )
 
-        execution_detail = getattr(
-            execution,
-            "detail",
-            "",
-        )
+        execution_detail = getattr(execution, "detail", "")
+        execution_error = getattr(execution, "error", None)
+        execution_failure_class = getattr(execution, "failure_class", None)
 
         # ---------------------------------------------------------------
         # Executor failure
         # ---------------------------------------------------------------
         if not execution_ok:
+            # Preserve a structured failure returned by the owning skill.  The
+            # recovery policy is intentionally unchanged here: the historical
+            # runner classification remains UNKNOWN unless the runner itself
+            # already classified the failure.  This keeps the current UNKNOWN ->
+            # ABORT behavior while exposing the real skill error to the workflow.
+            detail = {
+                "skill": skill_name,
+                "skill_detail": execution_detail,
+                "skill_error": execution_error,
+                "skill_failure_class": (
+                    execution_failure_class.value
+                    if isinstance(execution_failure_class, FailureClass)
+                    else str(execution_failure_class) if execution_failure_class else None
+                ),
+                "skill_value": getattr(execution, "value", None),
+                "skill_executed": False,
+                "skill_verified": False,
+            }
             return ActionResult(
                 action=action,
                 ok=False,
-                error=str(
-                    execution_detail
-                    or "skill execution failed"
-                ),
-                detail={
-                    "skill": skill_name,
-                    "skill_detail": execution_detail,
-                    "skill_value": getattr(
-                        execution,
-                        "value",
-                        None,
-                    ),
-                    "skill_executed": False,
-                    "skill_verified": False,
-                },
+                error=str(execution_error or execution_detail or "skill execution failed"),
+                detail=detail,
                 failure_class=FailureClass.UNKNOWN,
             )
 
@@ -899,15 +907,98 @@ def _execute_skill_action(
 
 
 # ---------------------------------------------------------------------------
-# Policy + execution
+# Workflow durability helpers
 # ---------------------------------------------------------------------------
+
+
+def _workflow_persist(loop: _Loop) -> None:
+    workflow = loop.workflow
+    runtime = loop.config.runtime_manager
+    task_id = loop.config.runtime_task_id
+    if workflow is None or runtime is None or not task_id:
+        return
+    try:
+        runtime.update_workflow(task_id, workflow.to_json())
+    except Exception as exc:
+        loop.trace.note("workflow_persist_failed", error=f"{type(exc).__name__}: {exc}")
+
+
+def _workflow_step(loop: _Loop, index: int, state: str, *, result: ActionResult | None = None, verification: str | None = None, reason: str = "") -> None:
+    if loop.workflow is None or index < 0 or index >= len(loop.workflow.steps):
+        return
+    step = loop.workflow.steps[index]
+    # ``state`` is the existing runner vocabulary.  The workflow domain has a
+    # deliberately smaller enum; WorkflowStep.state performs the explicit
+    # boundary mapping (notably BLOCKED -> PENDING because the dependent step
+    # was never attempted).
+    step.state = state
+    loop.workflow.current_step = index
+    if result is not None:
+        step.result_summary = str(result.error or result.detail or "")[:500]
+        if result.failure_class is not None:
+            step.failure_category = result.failure_class.value
+        if isinstance(result.detail, dict):
+            underlying = result.detail.get("skill_failure_class")
+            if underlying:
+                step.failure_category = str(underlying)
+        if result.error:
+            step.error = str(result.error)[:500]
+    if verification is not None:
+        step.verification = verification
+    if reason:
+        step.failure_reason = reason[:500]
+        if state in {"FAILED", "RECOVERY_REQUIRED"}:
+            step.error = reason[:500]
+    if loop.abort_reason:
+        step.recovery = {
+            "decision": "ABORTED",
+            "reason": str(loop.abort_reason)[:500],
+            "attempts": int(loop.recovery.budget.retries_used + loop.recovery.budget.reobserves_used + loop.recovery.budget.replans_used),
+        }
+    # BLOCKED is a step scheduling state, not a workflow terminal state.  Do
+    # not overwrite an already-failed workflow with an invalid parallel state.
+    workflow_state = {
+        "PENDING": "PENDING", "RUNNING": "RUNNING",
+        "WAITING_FOR_APPROVAL": "WAITING_FOR_APPROVAL",
+        "WAITING_FOR_USER": "WAITING_FOR_USER",
+        "COMPLETED": "RUNNING", "FAILED": "FAILED",
+        "UNKNOWN": "RECOVERY_REQUIRED", "RECOVERY_REQUIRED": "RECOVERY_REQUIRED",
+        "CANCELLED": "CANCELLED",
+    }.get(state)
+    if workflow_state is not None:
+        loop.workflow.state = workflow_state
+    if all(x.state == "COMPLETED" for x in loop.workflow.steps):
+        loop.workflow.state = "COMPLETED"
+    _workflow_persist(loop)
 
 
 def _permit_and_execute(
     loop: _Loop,
     action: Action,
 ) -> ActionResult:
-    """Check policy and execute the approved action."""
+    """Check structured action arguments, then policy and execution."""
+
+    if action.kind == "whatsapp_send_message":
+        missing = [key for key in ("recipient", "message") if not isinstance(action.params.get(key), str) or not action.params.get(key).strip()]
+        if missing:
+            field = missing[0]
+            label = "message" if field == "message" else "recipient"
+            if loop.workflow is not None and loop.workflow_step_index >= 0:
+                _workflow_step(loop, loop.workflow_step_index, "WAITING_FOR_USER", reason=f"missing required field: {field}")
+                context = {"workflow_id": loop.workflow.workflow_id, "step_id": loop.workflow.steps[loop.workflow_step_index].step_id, "step_index": loop.workflow_step_index, "field": field, "action": action.to_json()}
+            else:
+                context = {"action": action.to_json(), "field": field}
+            raise NeedUserInput(Clarification(
+                question=f"What should I send to {action.params.get('recipient', 'the contact') }?" if field == "message" else "Who should I send this message to?",
+                context="WORKFLOW_INPUT:" + json.dumps(context, sort_keys=True),
+            ))
+
+    if action.kind in {"whatsapp_search_contact", "browser_play_song"}:
+        key = "query"
+        if not isinstance(action.params.get(key), str) or not action.params.get(key).strip():
+            if loop.workflow is not None and loop.workflow_step_index >= 0:
+                _workflow_step(loop, loop.workflow_step_index, "WAITING_FOR_USER", reason=f"missing required field: {key}")
+            raise NeedUserInput(Clarification(question="What should I search for?", context="WORKFLOW_INPUT:" + json.dumps({"action": action.to_json(), "field": key}, sort_keys=True)))
 
     decision, reason = loop.policy.check(
         action
@@ -921,10 +1012,18 @@ def _permit_and_execute(
 
     if decision is Decision.CONFIRM:
         if loop.config.interactive:
+            context = {"action": action.to_json()}
+            if loop.workflow is not None and loop.workflow_step_index >= 0:
+                _workflow_step(loop, loop.workflow_step_index, "WAITING_FOR_APPROVAL", reason="policy confirmation required")
+                context.update({
+                    "workflow_id": loop.workflow.workflow_id,
+                    "step_id": loop.workflow.steps[loop.workflow_step_index].step_id,
+                    "step_index": loop.workflow_step_index,
+                })
             raise NeedUserInput(
                 Clarification(
                     question=f"Approve {action.kind.replace('_', ' ')}?",
-                    context="APPROVAL_ACTION:" + __import__("json").dumps(action.to_json(), sort_keys=True),
+                    context="APPROVAL_ACTION:" + __import__("json").dumps(context, sort_keys=True),
                     unobservable="the exact external delivery state is not established until the action runs",
                 )
             )
@@ -971,6 +1070,7 @@ def _permit_and_execute(
 def _run_action(
     loop: _Loop,
     action: Action,
+    action_factory: Callable[[_Loop], Action] | None = None,
 ) -> tuple[
     ActionResult | None,
     VerificationResult | None,
@@ -983,9 +1083,15 @@ def _run_action(
     for attempt in range(
         _MAX_ATTEMPTS_PER_ACTION
     ):
+        # For fast semantic browser actions, the target must be resolved only
+        # after the normal freshness gate has observed the current page. This
+        # avoids creating an @eN target and then immediately invalidating it by
+        # taking a second observation. Retries call the factory again, so a
+        # recovered page never reuses a stale semantic reference.
+        gate_action = action
         stale = _precondition_failure(
             loop,
-            action,
+            gate_action,
         )
 
         if stale is not None:
@@ -999,6 +1105,22 @@ def _run_action(
                 continue
 
             return None, checkpoint
+
+        if action_factory is not None:
+            try:
+                action = action_factory(loop)
+            except Exception as exc:
+                result = ActionResult(
+                    action=gate_action,
+                    ok=False,
+                    error=f"fast action resolution failed: {type(exc).__name__}: {exc}",
+                    failure_class=FailureClass.STALE_STATE,
+                )
+                loop.trace.action(result, precondition_age_s=oldest_age_s(loop.observations))
+                recovering = FailureClass.STALE_STATE
+                if not _dispatch(loop, recovering, attempt):
+                    return None, checkpoint
+                continue
 
         age = oldest_age_s(
             loop.observations
@@ -1548,13 +1670,44 @@ def _drive(
         loop.decide(
             DecisionKind.ACT,
             "the next planned step is executable",
-            actions=[
-                action.kind
-                for action in step.actions
-            ],
+            actions=[action.kind for action in step.actions],
         )
 
-        for action in step.actions:
+        # One planner batch is the existing minimal sequential workflow representation.
+        # Persist it in RuntimeManager before executing any side effect.
+        if loop.workflow is None and isinstance(loop.extra_state.get("workflow"), dict):
+            from .workflow import Workflow
+            try:
+                loop.workflow = Workflow.from_json(loop.extra_state["workflow"])
+            except Exception:
+                loop.workflow = None
+        if loop.workflow is None:
+            from .workflow import Workflow
+            loop.workflow = Workflow.from_actions(loop.config.runtime_task_id or loop.task.task_id, loop.task.goal, list(step.actions))
+            base_index = 0
+        elif isinstance(loop.extra_state.get("workflow_step_index"), int):
+            candidate = int(loop.extra_state["workflow_step_index"])
+            if 0 <= candidate < len(loop.workflow.steps) and len(step.actions) == 1:
+                existing = loop.workflow.steps[candidate].action
+                if existing.kind == step.actions[0].kind and existing.params == step.actions[0].params:
+                    base_index = candidate
+                else:
+                    base_index = len(loop.workflow.steps)
+            else:
+                base_index = len(loop.workflow.steps)
+        elif len(loop.workflow.steps) == len(step.actions) and all(a.action.kind == b.kind and a.action.params == b.params for a, b in zip(loop.workflow.steps, step.actions)):
+            base_index = 0
+        else:
+            from .workflow import WorkflowStep
+            base_index = len(loop.workflow.steps)
+            for offset, action in enumerate(step.actions):
+                loop.workflow.steps.append(WorkflowStep(f"{loop.workflow.workflow_id}:step-{base_index + offset + 1}", base_index + offset, action))
+        _workflow_persist(loop)
+
+        for offset, action in enumerate(step.actions):
+            action_index = base_index + offset
+            loop.workflow_step_index = action_index
+            _workflow_step(loop, action_index, "RUNNING")
             if isinstance(
                 loop.task,
                 GeneralTask,
@@ -1633,14 +1786,34 @@ def _drive(
                     record_external(action)
 
             history.append(
-                _history_entry(
-                    action,
-                    result,
-                    checkpoint,
-                )
+                _history_entry(action, result, checkpoint)
             )
 
+            if result is not None and result.ok:
+                verified_now = checkpoint is None or checkpoint.verdict is Verdict.PASS
+                _workflow_step(loop, action_index, "COMPLETED", result=result, verification={"verdict": "PASS" if verified_now else checkpoint.verdict.value})
+                # A WorkflowStepTask is deliberately a one-action invocation of
+                # the existing runner. Once that action has passed its checkpoint,
+                # there is nothing left for this task to plan. Returning here keeps
+                # the authoritative lifecycle at VERIFYING -> COMPLETED instead
+                # of opening a new PLANNING iteration for the same side effect.
+                if verified_now and getattr(loop.task, "workflow_step", None) is not None:
+                    loop.decide(
+                        DecisionKind.VERIFY,
+                        "workflow step action executed and passed independent checkpoint verification",
+                    )
+                    return (True, steps_used, step.reasoning or "")
+            elif result is not None:
+                failure_state = "UNKNOWN" if result.failure_class is FailureClass.UNKNOWN else "FAILED"
+                _workflow_step(loop, action_index, failure_state, result=result, verification={"verdict": "UNKNOWN" if failure_state == "UNKNOWN" else "FAIL"}, reason=result.error or "step failed")
+                for later in range(action_index + 1, len(loop.workflow.steps)):
+                    _workflow_step(loop, later, "BLOCKED", reason="dependent step did not run")
+
             if result is None:
+                final_state = "RECOVERY_REQUIRED" if loop.abort_reason and "attempt ceiling" in loop.abort_reason else "FAILED"
+                _workflow_step(loop, action_index, final_state, verification={"verdict": "UNKNOWN"}, reason=loop.abort_reason or "step failed")
+                for later in range(action_index + 1, len(loop.workflow.steps)):
+                    _workflow_step(loop, later, "BLOCKED", reason="dependent step did not run")
                 break
 
         # The action loop can suspend waiting for a person.
@@ -1792,12 +1965,14 @@ def _final_skill_verification(
             )
 
         ok, detail = _normalize_skill_verification(current)
+        status = str(getattr(current, "status", "")).upper()
+        verdict = Verdict.PASS if ok else (Verdict.UNKNOWN if status == "UNKNOWN" else Verdict.FAIL)
         checks.append(
             Check(
                 name="skill_final_observation",
-                verdict=Verdict.PASS if ok else Verdict.FAIL,
-                evidence={"action": key, "detail": detail},
-                reason=detail or ("final skill observation passed" if ok else "final skill observation failed"),
+                verdict=verdict,
+                evidence={"action": key, "detail": detail, "status": status},
+                reason=detail or ("final skill observation passed" if ok else "final skill observation could not establish the postcondition"),
             )
         )
 
@@ -1868,6 +2043,8 @@ def run_task(
     teardown: bool = True,
     extra_state: dict | None = None,
     skills: SkillRegistry | None = None,
+    direct_action_factory: Callable[["_Loop"], Action] | None = None,
+    fast_latency_seconds: float = 0.0,
 ) -> RunOutcome:
     """Run one complete task trial.
 
@@ -1922,7 +2099,7 @@ def run_task(
             "bucket",
             "",
         ),
-        planner=_planner_name(planner),
+        planner=_planner_name(planner) if planner is not None else "fast-router",
         config=config.to_json(),
         workspace=str(
             policy.workspace
@@ -1949,15 +2126,37 @@ def run_task(
 
         loop.refresh()
 
-        (
-            reported_success,
-            steps_used,
-            final_reasoning,
-        ) = _drive(
-            loop,
-            planner,
-            history,
-        )
+        if direct_action_factory is not None:
+            loop.trace.counters["fast_router_classifications"] += 1
+            loop.trace.counters["fast_router_latency_s"] += float(fast_latency_seconds or 0.0)
+            loop.trace.note("fast_path_selected", latency_s=round(float(fast_latency_seconds or 0.0), 6))
+            loop.enter(AgentState.ACTING, purpose="fast_path")
+            template_factory = getattr(task, "action_template", None)
+            if callable(template_factory):
+                action = template_factory()
+                loop.trace.note("fast_path_action_template", action=action.to_json())
+                result, _checkpoint = _run_action(
+                    loop, action, action_factory=direct_action_factory
+                )
+            else:
+                action = direct_action_factory(loop)
+                if action is None:
+                    raise ValueError("fast path produced no action")
+                loop.trace.note("fast_path_action", action=action.to_json())
+                result, _checkpoint = _run_action(loop, action)
+            reported_success = bool(result and result.ok)
+            steps_used = 1
+            loop.steps_used = steps_used
+        else:
+            (
+                reported_success,
+                steps_used,
+                final_reasoning,
+            ) = _drive(
+                loop,
+                planner,
+                history,
+            )
 
         if loop.question is not None:
             awaiting = True
@@ -2000,8 +2199,8 @@ def run_task(
             # against the live browser state.
             if (
                 final.verdict is Verdict.UNKNOWN
-                and isinstance(task, GeneralTask)
-                and not task.effects()
+                and (isinstance(task, GeneralTask) or getattr(task, "bucket", "") == "fast_interaction")
+                and (not hasattr(task, "effects") or not task.effects())
             ):
                 skill_final = _final_skill_verification(loop)
                 if skill_final is not None:
@@ -2181,9 +2380,7 @@ def run_task(
         task_id=task.task_id,
         condition=config.condition,
         trial=trial,
-        planner_name=_planner_name(
-            planner
-        ),
+        planner_name=_planner_name(planner) if planner is not None else "fast-router",
         reported_success=reported_success,
         verified=final.verdict,
         final=final,
@@ -2228,6 +2425,7 @@ def run_task(
         informational_completion=(
             informational_completion
         ),
+        workflow=(loop.workflow.to_json() if loop.workflow is not None else None),
     )
 
     trace.emit(

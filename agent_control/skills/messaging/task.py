@@ -15,8 +15,10 @@ class ApprovedMessagingTask:
     task_id = "approved_messaging_action"
     bucket = "communication"
 
-    def __init__(self, action: Action, backend: Any) -> None:
+    def __init__(self, action: Action, backend: Any, *, task_id: str | None = None) -> None:
         self._action = action
+        if task_id:
+            self.task_id = str(task_id)
         self._verifier = MessagingVerifier(backend)
         self.goal = f"execute the approved {action.kind} action"
 

@@ -60,3 +60,25 @@ def test_cli_rejects_malformed_json(monkeypatch):
     monkeypatch.setattr("shutil.which", lambda _: "bsk")
     with pytest.raises(BrowserSkillProtocolError):
         BrowserSkillCLI().run(["status"])
+
+
+def test_scroll_falls_back_to_supported_keyboard_primitive_when_wheel_is_unavailable():
+    from agent_control.skills.browser.backend import BrowserSkillError
+
+    class OldCLI(FakeCLI):
+        def run(self, args, *, session=None, timeout_s=None):
+            args = list(args)
+            self.calls.append((args, session))
+            if args[:2] == ["session", "start"]:
+                return {"session_id": "s1"}
+            if args[:1] == ["wheel"]:
+                raise BrowserSkillError("BrowserSkill command failed (exit code 2): error: unrecognized subcommand 'wheel'")
+            return {"ok": True}
+
+    cli = OldCLI()
+    browser = BrowserSkillAdapter(cli)
+    result = browser.scroll(600)
+    assert result["scroll_fallback"] == "keyboard"
+    calls = [call[0] for call in cli.calls]
+    assert any(c[:2] == ["wheel", "--session"] for c in calls)
+    assert any(c[:2] == ["press", "--session"] and "PageDown" in c for c in calls)

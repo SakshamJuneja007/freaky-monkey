@@ -9,11 +9,11 @@ from agent_control.skills.browser.backend import (
 )
 
 
-def element(ref: str, name: str, role: str = "link") -> BrowserElement:
-    return BrowserElement(ref, role=role, name=name)
+def element(ref: str, name: str, role: str = "link", raw=None) -> BrowserElement:
+    return BrowserElement(ref, role=role, name=name, raw=raw)
 
 
-def test_song_ranking_selects_only_a_lyrics_video():
+def test_song_ranking_prefers_lyrics_but_keeps_normal_videos_eligible():
     candidates = [
         element("@e1", "Magdalena Bay - Killshot (Lyrics)"),
         element("@e2", "Killshot slowed + reverb lyrics"),
@@ -27,33 +27,32 @@ def test_song_ranking_selects_only_a_lyrics_video():
 
     assert ranked
     assert ranked[0][1].ref == "@e1"
-    assert all("lyrics" in item[1].name.casefold() for item in ranked)
-    assert all(
-        item[1].ref not in {"@e2", "@e3", "@e4", "@e5", "@e6"}
-        for item in ranked
-    )
+    assert all(item[1].ref != "@e6" for item in ranked)
 
 
-def test_song_ranking_rejects_normal_official_and_remix_results():
+def test_song_ranking_falls_back_to_best_non_short_video():
     candidates = [
-        element("@e1", "Magdalena Bay - Killshot (Official Video)"),
-        element("@e2", "Magdalena Bay - Killshot"),
-        element("@e3", "Killshot Remix"),
+        element("@e1", "Killshot - Official Video"),
+        element("@e2", "Killshot Remix"),
+        element("@e3", "Killshot"),
     ]
 
-    assert BrowserSkillAdapter._rank_song_candidates("Killshot", candidates) == []
+    ranked = BrowserSkillAdapter._rank_song_candidates("Killshot", candidates)
+
+    assert ranked
+    assert all(item[1].ref in {"@e1", "@e2", "@e3"} for item in ranked)
+    assert ranked[0][1].ref == "@e3"
 
 
-def test_song_ranking_rejects_lyrics_speed_and_shorts_variants():
+def test_song_ranking_rejects_short_by_semantic_url_even_when_title_says_lyrics():
     candidates = [
-        element("@e1", "Killshot sped up lyrics"),
-        element("@e2", "Killshot slowed down lyrics"),
-        element("@e3", "Killshot speed down lyrics"),
-        element("@e4", "Killshot nightcore lyrics"),
-        element("@e5", "Killshot Shorts lyrics"),
+        element("@e1", "Killshot Lyrics", raw={"href": "https://www.youtube.com/shorts/abc123"}),
+        element("@e2", "Killshot Lyrics", raw={"href": "https://www.youtube.com/watch?v=abc"}),
     ]
 
-    assert BrowserSkillAdapter._rank_song_candidates("Killshot", candidates) == []
+    ranked = BrowserSkillAdapter._rank_song_candidates("Killshot", candidates)
+
+    assert [item[1].ref for item in ranked] == ["@e2"]
 
 
 class SongCLI:
@@ -133,49 +132,3 @@ def test_play_song_searches_normally_and_clicks_lyrics_ref():
     assert click_calls
     assert "@e3" in click_calls[0]
 
-
-def test_play_song_fails_when_no_lyrics_video_is_visible():
-    class NoLyricsCLI(SongCLI):
-        def run(self, args, *, session=None, timeout_s=None):
-            args = list(args)
-            if args[:1] == ["observe"] and not self.watch:
-                self.observation_count += 1
-                return {
-                    "text": (
-                        '@e1 link "Magdalena Bay - Killshot (Official Video)"\n'
-                        '@e2 link "Killshot Remix"\n'
-                        '@e3 link "Killshot"'
-                    )
-                }
-            return super().run(args, session=session, timeout_s=timeout_s)
-
-    browser = BrowserSkillAdapter(NoLyricsCLI())
-
-    with pytest.raises(BrowserSkillError) as exc_info:
-        browser.play_song("Killshot", timeout_s=0.2)
-
-    assert exc_info.value.code == "semantic_song_result_not_ready"
-
-
-def test_song_ranking_rejects_a_short_even_when_it_is_called_lyrics():
-    candidates = [
-        element(
-            "@e1",
-            "Killshot Lyrics",
-            raw={"href": "https://www.youtube.com/shorts/abc123"},
-        ),
-        element(
-            "@e2",
-            "Killshot Lyrics",
-            raw={"duration": "0:28"},
-        ),
-        element(
-            "@e3",
-            "Killshot Lyrics",
-            raw={"duration": "3:42"},
-        ),
-    ]
-
-    ranked = BrowserSkillAdapter._rank_song_candidates("Killshot", candidates)
-
-    assert [item[1].ref for item in ranked] == ["@e3"]

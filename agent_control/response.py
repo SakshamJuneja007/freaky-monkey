@@ -25,13 +25,14 @@ planner has any knowledge that speech exists.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
 from .api import AgentResult, TaskStatus
 from .speech.tts import Speaker, TTSConfig
-
+from typing import Any
 #: Spoken lines stay one sentence long. The detail belongs in the text report,
 #: which the user can re-read; a paragraph of synthesised speech cannot be.
 MAX_GOAL_WORDS = 14
@@ -511,6 +512,12 @@ class Narrator:
     def speaking(self) -> bool:
         return self.speaker is not None and self.speaker.enabled
 
+    def wait_until_speech_idle(self, timeout_s: float = 15.0) -> bool:
+        """Pause microphone capture until queued TTS has finished, then resume."""
+        if self.speaker is None:
+            return True
+        return self.speaker.wait_until_idle(timeout_s)
+
     def note(self, message: str) -> None:
         """Print without speaking. Progress detail is read, not narrated."""
         self.write(message)
@@ -560,3 +567,47 @@ class Narrator:
     def close(self, timeout_s: float = 15.0) -> None:
         if self.speaker is not None:
             self.speaker.close(timeout_s)
+_RUNTIME_CLAIM_RE = re.compile(
+    r"\b(?:i(?:\'m)?|we(?:\'re)?|deimos|the task|it)\s+(?:am|are|is|was|were|has|have)?\s*"
+    r"(?:now\s+)?(?:sending|sent|started|resumed|running|completed|finished|failed|stopped|cancelled|canceled|playing)\b",
+    re.I,
+)
+
+
+def guard_conversation_runtime_claim(text: str, snapshot: dict[str, Any]) -> str:
+    """Reject execution claims that have no matching RuntimeManager evidence.
+
+    This is an output boundary, not an LLM prompt. Ordinary conversational text
+    remains untouched unless it makes a concrete claim that DEIMOS performed a
+    runtime action. The replacement is deliberately factual and contains no
+    generated execution state.
+    """
+    value = str(text or "").strip()
+    if not value or not _RUNTIME_CLAIM_RE.search(value):
+        return value
+
+    tasks = [item for bucket in ("active_tasks", "completed_tasks", "failed_tasks", "cancelled_tasks") for item in (snapshot.get(bucket, []) or [])]
+    states = {str(item.get("state") or "").upper() for item in tasks}
+    verified_complete = any(
+        str(item.get("state") or "").upper() == "COMPLETED"
+        and str(item.get("verification_state") or "").upper() == "PASS"
+        for item in tasks
+    )
+    lower = value.casefold()
+    supported = (
+        (any(word in lower for word in ("sending", "running", "started", "resumed", "playing")) and "RUNNING" in states)
+        or (any(word in lower for word in ("sent", "completed", "finished")) and verified_complete)
+        or ("failed" in lower and "FAILED" in states)
+        or (any(word in lower for word in ("stopped", "cancelled", "canceled")) and "CANCELLED" in states)
+    )
+    if supported:
+        return value
+    if not tasks:
+        return "I haven't executed that action."
+    if "WAITING_FOR_APPROVAL" in states:
+        return "The task is waiting for your approval."
+    if "WAITING_FOR_USER" in states or "WAITING_FOR_HUMAN" in states:
+        return "The task is waiting for your input."
+    if "RECOVERY_REQUIRED" in states:
+        return "The task needs recovery before it can continue."
+    return "I haven't verified that execution state, so I won't claim that it happened."

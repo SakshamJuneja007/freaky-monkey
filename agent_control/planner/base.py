@@ -32,6 +32,9 @@ class PlannerStep:
     #: Set when the planner itself failed (bad JSON, API error, refusal).
     error: str | None = None
 
+    #: Ordered executable actions are also the minimal sequential workflow representation.
+    #: The runtime may persist them as workflow steps without changing the planner contract.
+
     #: Action kinds/items proposed by the planner that the runtime cannot execute.
     #: Kept structured so the runner can explain an empty executable plan.
     rejected: list[str] = field(default_factory=list)

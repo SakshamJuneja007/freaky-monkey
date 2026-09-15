@@ -47,3 +47,27 @@ def test_whatsapp_typo_produces_existing_executable_action():
         "recipient": "papa",
         "message": "test message",
     }
+
+
+def test_whatsapp_send_parser_accepts_natural_shorthand():
+    assert _parse_whatsapp_send_goal("send hello to papa") == ("papa", "hello")
+    assert _parse_whatsapp_send_goal("send hello to papa on whatsapp") == ("papa", "hello")
+
+
+def test_whatsapp_shorthand_produces_existing_executable_action():
+    from agent_control.planner.openai_compat import OpenAICompatPlanner
+
+    class _FakeClient:
+        model = "test"
+
+    step = OpenAICompatPlanner(_FakeClient()).plan(
+        "send hello to papa",
+        state={},
+        history=[],
+    )
+
+    assert [action.kind for action in step.actions] == ["whatsapp_send_message"]
+    assert step.actions[0].params == {
+        "recipient": "sir",
+        "message": "hello",
+    }

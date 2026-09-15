@@ -24,6 +24,7 @@ from __future__ import annotations
 import array
 import math
 import time
+import threading
 import wave
 from collections import deque
 from dataclasses import dataclass
@@ -35,6 +36,8 @@ from typing import Callable
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
+
+_CAPTURE_LOCK = threading.Lock()
 
 #: Small enough that silence is noticed promptly, large enough not to spin.
 BLOCK_SECONDS = 0.05
@@ -106,104 +109,110 @@ def record_utterance(*, max_seconds: float = 30.0, silence_seconds: float = 1.2,
     "recording", "stopping: silence") so the CLI can show what the microphone is
     doing without this module knowing anything about the terminal.
     """
-    say = on_status or (lambda _message: None)
+    if not _CAPTURE_LOCK.acquire(blocking=False):
+        return Recording(stopped_by="listener_busy", error="another speech listener is already capturing")
     try:
-        import sounddevice  # noqa: PLC0415 - lazy: PortAudio is optional
-    except (ImportError, OSError) as exc:
-        return Recording(stopped_by="no_device", error=(
-            f"microphone capture unavailable ({type(exc).__name__}: {exc}); "
-            "pip install sounddevice"))
 
-    block_frames = max(1, int(SAMPLE_RATE * BLOCK_SECONDS))
-    #: Rolling window of the audio before speech starts. Bounded, so a person who
-    #: takes ten seconds to think does not send ten seconds of room tone to the
-    #: recogniser -- which costs latency, and invites a transcript of the room.
-    preroll: deque[bytes] = deque(
-        maxlen=max(1, int(PREROLL_SECONDS / BLOCK_SECONDS))
-    )
-    captured: list[bytes] = []
-    noise_floor = 0.0
-    peak = 0.0
-    waited = 0.0
-    stopped_by = "max_seconds"
+        say = on_status or (lambda _message: None)
+        try:
+            import sounddevice  # noqa: PLC0415 - lazy: PortAudio is optional
+        except (ImportError, OSError) as exc:
+            return Recording(stopped_by="no_device", error=(
+                f"microphone capture unavailable ({type(exc).__name__}: {exc}); "
+                "pip install sounddevice"))
 
-    try:
-        stream = sounddevice.RawInputStream(
-            samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
-            blocksize=block_frames,
+        block_frames = max(1, int(SAMPLE_RATE * BLOCK_SECONDS))
+        #: Rolling window of the audio before speech starts. Bounded, so a person who
+        #: takes ten seconds to think does not send ten seconds of room tone to the
+        #: recogniser -- which costs latency, and invites a transcript of the room.
+        preroll: deque[bytes] = deque(
+            maxlen=max(1, int(PREROLL_SECONDS / BLOCK_SECONDS))
         )
-    except Exception as exc:  # noqa: BLE001 - PortAudio raises its own types
-        return Recording(stopped_by="no_device", error=(
-            f"could not open the default input device: {type(exc).__name__}: {exc}"))
+        captured: list[bytes] = []
+        noise_floor = 0.0
+        peak = 0.0
+        waited = 0.0
+        stopped_by = "max_seconds"
 
-    try:
-        with stream:
-            say("calibrating (stay quiet)")
-            deadline = time.time() + calibrate_seconds
-            while time.time() < deadline:
-                block, _overflow = stream.read(block_frames)
-                noise_floor = max(noise_floor, _rms(bytes(block)))
-            threshold = max(MIN_THRESHOLD, noise_floor * NOISE_MULTIPLE)
+        try:
+            stream = sounddevice.RawInputStream(
+                samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="int16",
+                blocksize=block_frames,
+            )
+        except Exception as exc:  # noqa: BLE001 - PortAudio raises its own types
+            return Recording(stopped_by="no_device", error=(
+                f"could not open the default input device: {type(exc).__name__}: {exc}"))
 
-            say(f"listening (noise floor {noise_floor:.4f}, "
-                f"speech above {threshold:.4f}); Ctrl+C to stop")
-            started = time.time()
-            speech_started = False
-            last_voice = started
-            while True:
-                waited = time.time() - started
-                if waited >= max_seconds:
-                    break
-                block, _overflow = stream.read(block_frames)
-                data = bytes(block)
-                level = _rms(data)
-                peak = max(peak, level)
+        try:
+            with stream:
+                say("calibrating (stay quiet)")
+                deadline = time.time() + calibrate_seconds
+                while time.time() < deadline:
+                    block, _overflow = stream.read(block_frames)
+                    noise_floor = max(noise_floor, _rms(bytes(block)))
+                threshold = max(MIN_THRESHOLD, noise_floor * NOISE_MULTIPLE)
 
-                if speech_started:
-                    captured.append(data)
-                elif level >= threshold:
-                    # The threshold was crossed part-way into a word, so the
-                    # window that was being held back is prepended rather than
-                    # dropped: without it the recogniser receives a syllable that
-                    # begins mid-consonant.
-                    speech_started = True
-                    captured.extend(preroll)
-                    captured.append(data)
-                    preroll.clear()
-                    say("recording")
-                else:
-                    # Still waiting. The block is remembered only as pre-roll, so
-                    # a long pause before speaking costs nothing downstream.
-                    preroll.append(data)
+                say(f"listening (noise floor {noise_floor:.4f}, "
+                    f"speech above {threshold:.4f}); Ctrl+C to stop")
+                started = time.time()
+                speech_started = False
+                last_voice = started
+                while True:
+                    waited = time.time() - started
+                    if waited >= max_seconds:
+                        break
+                    block, _overflow = stream.read(block_frames)
+                    data = bytes(block)
+                    level = _rms(data)
+                    peak = max(peak, level)
 
-                if level >= threshold:
-                    last_voice = time.time()
-                elif speech_started and time.time() - last_voice >= silence_seconds:
-                    stopped_by = "silence"
-                    break
-    except KeyboardInterrupt:
-        # A deliberate stop, not a failure: keep what was said up to this point.
-        stopped_by = "user"
-        say("stopping: user")
-    except Exception as exc:  # noqa: BLE001 - a dead device is a datum
-        return Recording(stopped_by="error", peak_level=peak, waited_seconds=waited, error=(
-            f"capture failed after {len(captured) * BLOCK_SECONDS:.1f}s: "
-            f"{type(exc).__name__}: {exc}"))
-    else:
-        say(f"stopping: {stopped_by}")
+                    if speech_started:
+                        captured.append(data)
+                    elif level >= threshold:
+                        # The threshold was crossed part-way into a word, so the
+                        # window that was being held back is prepended rather than
+                        # dropped: without it the recogniser receives a syllable that
+                        # begins mid-consonant.
+                        speech_started = True
+                        captured.extend(preroll)
+                        captured.append(data)
+                        preroll.clear()
+                        say("recording")
+                    else:
+                        # Still waiting. The block is remembered only as pre-roll, so
+                        # a long pause before speaking costs nothing downstream.
+                        preroll.append(data)
 
-    frames = b"".join(captured)
-    seconds = len(frames) / float(SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
-    if peak < max(MIN_THRESHOLD, noise_floor * NOISE_MULTIPLE):
-        # Nothing above the room's own noise. Reporting this as an empty
-        # transcript later would blame the model for a muted microphone. The span
-        # named is the one that was listened to, not the pre-roll that survived
-        # it -- "no speech in 0.3s" would look like the recorder gave up.
-        return Recording(
-            duration_seconds=seconds, stopped_by=stopped_by, peak_level=peak,
-            waited_seconds=waited,
-            error=f"no speech detected in {waited:.1f}s (peak level {peak:.4f} "
-                  f"vs noise floor {noise_floor:.4f}); is the microphone muted?",
-        )
-    return Recording(wav=_to_wav(frames), duration_seconds=seconds,
-                     stopped_by=stopped_by, peak_level=peak, waited_seconds=waited)
+                    if level >= threshold:
+                        last_voice = time.time()
+                    elif speech_started and time.time() - last_voice >= silence_seconds:
+                        stopped_by = "silence"
+                        break
+        except KeyboardInterrupt:
+            # A deliberate stop, not a failure: keep what was said up to this point.
+            stopped_by = "user"
+            say("stopping: user")
+        except Exception as exc:  # noqa: BLE001 - a dead device is a datum
+            return Recording(stopped_by="error", peak_level=peak, waited_seconds=waited, error=(
+                f"capture failed after {len(captured) * BLOCK_SECONDS:.1f}s: "
+                f"{type(exc).__name__}: {exc}"))
+        else:
+            say(f"stopping: {stopped_by}")
+
+        frames = b"".join(captured)
+        seconds = len(frames) / float(SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH)
+        if peak < max(MIN_THRESHOLD, noise_floor * NOISE_MULTIPLE):
+            # Nothing above the room's own noise. Reporting this as an empty
+            # transcript later would blame the model for a muted microphone. The span
+            # named is the one that was listened to, not the pre-roll that survived
+            # it -- "no speech in 0.3s" would look like the recorder gave up.
+            return Recording(
+                duration_seconds=seconds, stopped_by=stopped_by, peak_level=peak,
+                waited_seconds=waited,
+                error=f"no speech detected in {waited:.1f}s (peak level {peak:.4f} "
+                      f"vs noise floor {noise_floor:.4f}); is the microphone muted?",
+            )
+        return Recording(wav=_to_wav(frames), duration_seconds=seconds,
+                         stopped_by=stopped_by, peak_level=peak, waited_seconds=waited)
+    finally:
+        _CAPTURE_LOCK.release()

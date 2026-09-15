@@ -16,7 +16,7 @@ from .actions import (
     BROWSER_ACTION_KINDS,
     BrowserAction,
 )
-from .backend import BrowserSkillAdapter
+from .backend import BrowserSkillAdapter, BrowserTarget, BrowserSkillError
 from .executor import (
     BrowserBackend,
     BrowserExecutionResult,
@@ -119,6 +119,40 @@ class BrowserSkill(Skill):
             )
             or {}
         )
+
+        # Fast semantic actions may carry the existing BrowserTarget object
+        # until this skill boundary. BrowserAction itself intentionally requires
+        # plain JSON-compatible parameter values, so translate the target here
+        # while preserving BrowserTarget's generation/staleness check.
+        target = params.get("target")
+        if isinstance(target, BrowserTarget):
+            params["target"] = target.ref
+            if target.generation is not None:
+                current_generation = getattr(self._backend, "_generation", None)
+                if current_generation != target.generation:
+                    raise BrowserSkillError(
+                        f"stale BrowserSkill reference {target.ref!r}: observation generation "
+                        f"{target.generation} is no longer current (current={current_generation})"
+                    )
+
+        # Normal YouTube playback must never execute a semantic click on a
+        # Short. This is enforced at the BrowserSkill boundary as well as in
+        # indexed/song selection so planner-generated click actions cannot bypass
+        # the candidate-set exclusion. It uses the current cached observation;
+        # it does not observe or mutate state between resolution and execution.
+        if kind == "browser_click" and "youtube.com" in str(getattr(self._backend._last_observation, "url", "")).casefold():
+            obs = getattr(self._backend, "_last_observation", None)
+            if obs is not None:
+                ref = params.get("target")
+                ref = ref.ref if isinstance(ref, BrowserTarget) else ref
+                if isinstance(ref, str):
+                    element = next((e for e in obs.elements if e.ref == ref), None)
+                    if element is not None and self._backend._song_result_is_short(element, observation=obs):
+                        raise BrowserSkillError(
+                            "YouTube Short is not a valid normal-playback target",
+                            code="youtube_short_rejected",
+                            data={"semantic_target_category": "youtube_short"},
+                        )
 
         if (
             kind == "browser_open_url"
