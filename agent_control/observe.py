@@ -23,6 +23,7 @@ import psutil
 
 from .platform_window import get_backend
 from .types import Observation, Source
+from .text_observation import TextObservation, UniversalTextReader
 
 MAX_HASH_BYTES = 8 * 1024 * 1024
 
@@ -171,6 +172,18 @@ def window_state(*, title_contains: str | None = None, pid: int | None = None) -
     return _observe(Source.WINDOW, f"window_state(title={title_contains},pid={pid})", read)
 
 
+def validate_window_target(handle: int, *, pid: int | None = None, title_contains: str | None = None) -> bool:
+    """Validate cached window identity without reading dynamic application state."""
+    backend = get_backend()
+    validator = getattr(backend, "validate_window_target", None)
+    if not callable(validator):
+        return False
+    try:
+        return bool(validator(int(handle), pid=pid, title_contains=title_contains))
+    except Exception:
+        return False
+
+
 def accessibility_state(handle: int) -> Observation:
     """Accessibility tree for a window. Unimplemented backends -> ok=False."""
     backend = get_backend()
@@ -233,6 +246,67 @@ def chooser_state() -> Observation:
         }
 
     return _observe(Source.WINDOW, "chooser_state()", read)
+
+
+def window_text_observation(handle: int, *, target: dict[str, Any] | None = None) -> TextObservation:
+    """Fresh semantic text evidence for one native application target."""
+    backend = get_backend()
+    started = time.time()
+    descriptor = {"kind": "window", "handle": int(handle), **(target or {})}
+    try:
+        reader = UniversalTextReader(native_reader=_NativeTextReader(backend))
+        observation = reader.read(descriptor)
+        if observation is not None:
+            return observation
+        raise RuntimeError("no semantic native text provider could read the target")
+    except Exception as exc:
+        return TextObservation(
+            text="", source="unavailable", target=descriptor, fresh=True,
+            observed_at=started, metadata={"backend": backend.name}, ok=False,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
+
+def window_text_state(handle: int) -> Observation:
+    """Compatibility wrapper exposing the normalized text observation via Observation."""
+    text = window_text_observation(handle)
+    return Observation(
+        source=Source.WINDOW,
+        query=f"window_text_state(handle={handle})",
+        value=text.to_json() if text.ok else None,
+        observed_at=text.observed_at,
+        ok=text.ok,
+        error=text.error,
+    )
+
+
+def universal_text_state(target: dict[str, Any]) -> TextObservation:
+    """Take one fresh semantic text reading through the universal reader."""
+    backend = get_backend()
+    reader = UniversalTextReader(native_reader=_NativeTextReader(backend))
+    observation = reader.read(target)
+    if observation is not None:
+        return observation
+    return TextObservation(
+        text="",
+        source="unavailable",
+        target=dict(target),
+        fresh=True,
+        ok=False,
+        error="no semantic text observation provider could read the target",
+    )
+
+
+class _NativeTextReader:
+    def __init__(self, backend: Any) -> None:
+        self.backend = backend
+
+    def read(self, target: dict[str, Any]) -> TextObservation | None:
+        handle = target.get("handle")
+        reader = getattr(self.backend, "read_text_observation", None)
+        if handle is None or not callable(reader):
+            return None
+        return reader(int(handle), target=target)
 
 
 # -- python environment ----------------------------------------------------

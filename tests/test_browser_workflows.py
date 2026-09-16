@@ -67,3 +67,62 @@ def test_browser_job_application_is_semantic_action():
     result = skill.executor().execute(action)
     assert result.ok is True
     assert result.value["submitted"] is True
+
+
+def test_open_chrome_and_search_decomposes_to_app_then_browser_action():
+    from agent_control.workflow.decomposer import WorkflowDecomposer
+    from agent_control.planner.mock import MockPlanner
+
+    workflow = WorkflowDecomposer(MockPlanner()).decompose(
+        "w1", "open chrome and search deimos ai agent"
+    )
+    assert [step.action.kind for step in workflow.steps] == ["launch_app", "browser_search"]
+    assert workflow.steps[1].dependencies == [workflow.steps[0].step_id]
+
+
+def test_word_is_registered_for_windows_discovery():
+    from agent_control.os_tools import APP_REGISTRY
+    assert "word" in APP_REGISTRY
+    assert "WINWORD.EXE" in APP_REGISTRY["word"]["executables"]
+
+
+def test_configured_profile_selector_accepts_generic_single_browser_when_local_process_matches(monkeypatch):
+    from agent_control.skills.browser.backend import BrowserSkillAdapter, BrowserSkillResult
+
+    browser = BrowserSkillAdapter(cli=object())
+    monkeypatch.setattr(
+        "agent_control.os_tools._chrome_process_matches_configuration",
+        lambda config: True,
+    )
+    result = BrowserSkillResult({
+        "browsers": [
+            {"id": "discovered", "name": "connected browser"},
+        ]
+    })
+    selected = browser._select_configured_chrome_browser(
+        result,
+        {"user_data": r"C:\Users\test\AppData\Local\Google\Chrome\User Data", "profile": "Default"},
+    )
+    assert selected == "discovered"
+
+
+def test_chrome_process_match_requires_explicit_configured_profile(monkeypatch):
+    import agent_control.os_tools as os_tools
+
+    class Proc:
+        info = {
+            "name": "chrome.exe",
+            "exe": r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            "cmdline": [
+                "chrome.exe",
+                r"--user-data-dir=C:\Users\test\AppData\Local\Google\Chrome\User Data",
+                "--profile-directory=Profile 1",
+            ],
+        }
+
+    monkeypatch.setattr(os_tools.psutil, "process_iter", lambda fields: [Proc()])
+    config = {
+        "user_data": r"C:\Users\test\AppData\Local\Google\Chrome\User Data",
+        "profile": "Default",
+    }
+    assert not os_tools._chrome_process_matches_configuration(config)

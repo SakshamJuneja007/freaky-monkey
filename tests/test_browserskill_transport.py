@@ -30,7 +30,7 @@ def test_adapter_uses_bsk_session_and_semantic_commands():
     browser.click("@e4")
     browser.type_text("@e5", "hello")
     browser.scroll(500)
-    assert cli.calls[0][0][:3] == ["session", "start", "--no-focus"]
+    assert any(call[0][:2] == ["session", "start"] for call in cli.calls)
     calls = [x[0] for x in cli.calls]
     assert any(c[:2] == ["navigate", "--session"] and "https://example.com" in c for c in calls)
     assert any(c[:2] == ["click", "--session"] and "@e4" in c for c in calls)
@@ -109,7 +109,7 @@ def test_session_start_prefers_default_chrome_profile(monkeypatch):
     browser = BrowserSkillAdapter(cli)
     browser.session_start()
 
-    assert cli.calls[1] == ["session", "start", "--browser", "default", "--no-focus"]
+    assert [call for call in cli.calls if call[:2] == ["session", "start"]] == [["session", "start", "--browser", "default", "--no-focus"]]
 
 
 def test_phrase_accepted_never_exposes_internal_task_id():
@@ -118,3 +118,64 @@ def test_phrase_accepted_never_exposes_internal_task_id():
     text = phrase_accepted("fast-1234", "open chrome", debug=True)
     assert "fast-1234" not in text
     assert "Starting fast" not in text
+
+
+def test_session_start_uses_configured_chrome_profile(monkeypatch):
+    from agent_control.skills.browser.backend import BrowserSkillAdapter
+
+    class CLI:
+        def __init__(self):
+            self.calls = []
+        def run(self, args):
+            self.calls.append(list(args))
+            if args[:1] == ["browsers"]:
+                return {"browsers": [
+                    {"id": "work", "browser": "Chrome", "profile": "Profile 3", "user_data_dir": r"C:\Users\me\AppData\Local\Google\Chrome\User Data"},
+                    {"id": "target", "browser": "Chrome", "profile": "Profile 5", "user_data_dir": r"C:\Users\me\AppData\Local\Google\Chrome\User Data"},
+                ]}
+            if args[:2] == ["session", "start"]:
+                return {"session_id": "configured"}
+            raise AssertionError(args)
+
+    monkeypatch.setenv("DEIMOS_CHROME_USER_DATA", r"C:\Users\me\AppData\Local\Google\Chrome\User Data")
+    monkeypatch.setenv("DEIMOS_CHROME_PROFILE", "Profile 5")
+    cli = CLI()
+    BrowserSkillAdapter(cli).session_start()
+    assert [call for call in cli.calls if call[:2] == ["session", "start"]] == [["session", "start", "--browser", "target", "--no-focus"]]
+
+
+def test_session_start_rejects_unavailable_configured_profile(monkeypatch):
+    from agent_control.skills.browser.backend import BrowserSkillAdapter, BrowserSkillError
+
+    class CLI:
+        def run(self, args):
+            if args[:1] == ["browsers"]:
+                return {"browsers": [{"id": "other", "browser": "Chrome", "profile": "Profile 1"}]}
+            raise AssertionError(args)
+
+    monkeypatch.setenv("DEIMOS_CHROME_PROFILE", "Profile 9")
+    try:
+        BrowserSkillAdapter(CLI()).session_start()
+    except BrowserSkillError as exc:
+        assert exc.code == "configured_profile_unavailable"
+    else:
+        raise AssertionError("configured unavailable Chrome profile was silently accepted")
+
+
+def test_existing_browser_session_is_reused_without_starting_another(monkeypatch):
+    from agent_control.skills.browser.backend import BrowserSkillAdapter
+
+    class CLI:
+        def __init__(self):
+            self.calls = []
+        def run(self, args):
+            self.calls.append(list(args))
+            if args[:1] == ["observe"]:
+                return {"data": {"text": "textbox \"Address\" @e1", "url": "https://example.com"}}
+            return {"ok": True}
+
+    cli = CLI()
+    browser = BrowserSkillAdapter(cli, session="existing")
+    browser.observe()
+    assert not any(call[:2] == ["session", "start"] for call in cli.calls)
+    assert cli.calls[0][:2] == ["observe", "--session"]

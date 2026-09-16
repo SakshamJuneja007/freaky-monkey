@@ -9,11 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .types import Action, Check, Observation, Source, VerificationResult, Verdict
+from .types import Action, Check, Observation, RetrySafety, Source, VerificationResult, Verdict
 from .general_task import GeneralTask
 
 
-WORKFLOW_STATES = frozenset({"PENDING", "RUNNING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "COMPLETED", "FAILED", "UNKNOWN", "BLOCKED", "RECOVERY_REQUIRED"})
+WORKFLOW_STATES = frozenset({"PENDING", "RUNNING", "WAITING_FOR_APPROVAL", "WAITING_FOR_USER", "RECOVERING", "COMPLETED", "FAILED", "PARTIAL_FAILURE", "UNKNOWN", "BLOCKED", "RECOVERY_REQUIRED", "CANCELLED"})
 
 
 class WorkflowError(RuntimeError):
@@ -47,6 +47,7 @@ class WorkflowStep:
     result_summary: str = ""
     verification: str = "NOT_STARTED"
     failure_reason: str = ""
+    timing: dict[str, float] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -54,10 +55,12 @@ class WorkflowStep:
             "index": self.index,
             "capability": self.action.kind,
             "arguments": dict(self.action.params),
+            "action": self.action.to_json(),
             "state": self.state,
             "result_summary": self.result_summary,
             "verification": self.verification,
             "failure_reason": self.failure_reason,
+            "timing": dict(self.timing),
         }
 
 
@@ -103,11 +106,23 @@ class Workflow:
             steps.append(WorkflowStep(
                 step_id=str(item.get("step_id", "")),
                 index=index,
-                action=Action(kind=str(item.get("capability", "")), params=dict(item.get("arguments", {}))),
+                action=Action(**({
+                    "kind": str((item.get("action") or {}).get("kind", item.get("capability", ""))),
+                    "params": dict((item.get("action") or {}).get("params", item.get("arguments", {}))),
+                    "consequential": bool((item.get("action") or {}).get("consequential", True)),
+                    "rationale": str((item.get("action") or {}).get("rationale", "")),
+                    "retry_safety": RetrySafety(str((item.get("action") or {}).get("retry_safety", "AUTO"))),
+                    "idempotent": (item.get("action") or {}).get("idempotent"),
+                    "side_effect_level": str((item.get("action") or {}).get("side_effect_level", "normal")),
+                    "requires_fresh_observation": bool((item.get("action") or {}).get("requires_fresh_observation", True)),
+                    "verification_required": bool((item.get("action") or {}).get("verification_required", True)),
+                    "recovery_strategy": (item.get("action") or {}).get("recovery_strategy"),
+                })),
                 state=str(item.get("state", "PENDING")),
                 result_summary=str(item.get("result_summary", "")),
                 verification=str(item.get("verification", "NOT_STARTED")),
                 failure_reason=str(item.get("failure_reason", "")),
+                timing={str(k): float(v) for k, v in (item.get("timing") or {}).items()},
             ))
         try:
             current_step = int(payload.get("current_step", 0))
@@ -134,9 +149,40 @@ class WorkflowStepTask(GeneralTask):
         self.workflow = workflow
         self.workflow_step = step
         self.goal = workflow.goal
+        self._last_step_verification: VerificationResult | None = None
 
     def reference_plan(self, policy: Any) -> list[Action]:
         return [self.workflow_step.action]
 
     def observe(self, policy: Any, trace: Any = None) -> dict[str, Observation]:
-        return {"workflow_step": Observation(Source.BROWSER, "workflow step", self.workflow_step.action.kind)}
+        # Workflow-step execution still uses the normal runner freshness gate.
+        # This method only supplies task-specific observations for verification.
+        action = self.workflow_step.action
+        if action.kind == "type_text":
+            from . import observe as obs_mod
+            app = str(action.params.get("app", ""))
+            spec = __import__("agent_control.os_tools", fromlist=["APP_REGISTRY"]).APP_REGISTRY.get(app.casefold(), {})
+            needle = spec.get("window_title_contains") or app
+            return {"target_window": obs_mod.window_state(title_contains=needle)}
+        return {"workflow_step": Observation(Source.BROWSER, "workflow step", action.kind)}
+
+    def verify_checkpoint(self, policy: Any, action: Action, trace: Any = None) -> VerificationResult | None:
+        from .verifiers import verify_app_running, verify_text_in_app
+        if action.kind == "launch_app":
+            app = str(action.params.get("app", "")).strip().casefold()
+            if not app:
+                return VerificationResult(checks=[Check("app_target", Verdict.UNKNOWN, reason="launch_app has no application target")], label="workflow:launch_app")
+            verification = verify_app_running(policy, app, trace=trace)
+            self._last_step_verification = verification
+            return verification
+        if action.kind == "type_text":
+            app = str(action.params.get("app", "")).strip()
+            text = action.params.get("text")
+            if not app or not isinstance(text, str) or not text:
+                return VerificationResult(checks=[Check("requested_text", Verdict.UNKNOWN, reason="type_text is missing app or text")], label="workflow:type_text")
+            return verify_text_in_app(policy, app, text, trace=trace)
+        return None
+
+    def verify_final(self, policy: Any, trace: Any = None) -> VerificationResult:
+        verification = self.verify_checkpoint(policy, self.workflow_step.action, trace)
+        return verification or VerificationResult(checks=[Check("workflow_step_verification", Verdict.UNKNOWN, reason=f"no verifier for action {self.workflow_step.action.kind!r}")], label="workflow:step")

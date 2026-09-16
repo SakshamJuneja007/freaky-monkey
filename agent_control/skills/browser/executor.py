@@ -39,6 +39,7 @@ class BrowserExecutionResult:
     ok: bool
     detail: str = ""
     value: Any = None
+    failure_code: str | None = None
 
 
 class BrowserExecutor:
@@ -50,7 +51,14 @@ class BrowserExecutor:
             value = self._dispatch(action)
             return BrowserExecutionResult(action, True, f"executed {action.kind.value}", value)
         except Exception as exc:
-            return BrowserExecutionResult(action, False, f"{type(exc).__name__}: {exc}")
+            code = getattr(exc, "code", None)
+            return BrowserExecutionResult(
+                action,
+                False,
+                f"{type(exc).__name__}: {exc}",
+                None,
+                str(code) if code else "browser_action_failed",
+            )
 
     def _dispatch(self, action: BrowserAction) -> Any:
         p = action.params

@@ -343,6 +343,11 @@ class FastMessagingTask:
         return None
 
     def observe(self, policy: Any, trace: Any = None) -> dict[str, Observation]:
+        browser = getattr(self, "browser", None)
+        if browser is not None:
+            ensure_ready = getattr(browser, "ensure_ready", None)
+            if callable(ensure_ready):
+                ensure_ready()
         return {"messaging": Observation(Source.BROWSER, "messaging target", {
             "action": self.action.kind,
             "recipient": self.action.params.get("recipient", ""),
@@ -427,7 +432,11 @@ class FastInteractionTask:
             observation = self._first_observation
             self._first_observation = None
         else:
-            self.browser.observe()
+            ensure_ready = getattr(self.browser, "ensure_ready", None)
+            if callable(ensure_ready):
+                ensure_ready()
+            else:
+                self.browser.observe()
             observation = getattr(self.browser, "_last_observation", None)
         if observation is None:
             return {"browser": Observation(Source.BROWSER, "browser.observe", {}, ok=False, error="browser observation unavailable")}

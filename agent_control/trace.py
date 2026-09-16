@@ -119,6 +119,10 @@ class Trace:
     def observation(self, obs: Observation, *, purpose: str = "") -> Observation:
         """Log an observation and return it unchanged, so call sites can wrap."""
         self.counters["observations"] += 1
+        # Observation values are acquired by the live observation functions;
+        # the cache is never used as verification evidence. Count these as fresh
+        # observations at the tracing boundary.
+        self.counters["fresh_observations"] += 1
         self.counters[f"observations.{obs.source.value}"] += 1
         if obs.source.value == "vision":
             # Screen captures are counted separately from model invocations.
@@ -128,6 +132,15 @@ class Trace:
             self.counters["screenshots"] += 1
         self.emit("observation", purpose=purpose, observation=obs.to_json())
         return obs
+
+    def text_observation(self, observation: Any, *, purpose: str = "") -> Any:
+        """Record a UniversalTextReader observation with the same counters."""
+        self.counters["observations"] += 1
+        self.counters["observations.text"] += 1
+        if bool(getattr(observation, "fresh", False)):
+            self.counters["fresh_observations"] += 1
+        self.emit("text_observation", purpose=purpose, observation=observation.to_json())
+        return observation
 
     def policy(self, action: Action, decision: str, reason: str) -> None:
         self.counters[f"policy.{decision.lower()}"] += 1
@@ -199,7 +212,12 @@ class Trace:
     def planner_call(self, *, planner: str, kind: str, prompt_tokens: int = 0,
                      completion_tokens: int = 0, vision: bool = False,
                      latency_s: float = 0.0, error: str | None = None) -> None:
-        self.counters["llm_calls"] += 1
+        self.counters["planner_calls"] += 1
+        # ``planner_call`` is also used by MockPlanner for deterministic tests.
+        # Keep planner invocations and actual model calls distinct so P2.7
+        # measurements do not call deterministic planning an LLM request.
+        if not str(planner).casefold().startswith(("mock", "fast-router")):
+            self.counters["llm_calls"] += 1
         if vision:
             self.counters["vision_calls"] += 1
         self.counters["prompt_tokens"] += prompt_tokens
@@ -214,6 +232,12 @@ class Trace:
             latency_s=round(latency_s, 4),
             error=error,
         )
+
+    def phase(self, name: str, elapsed_s: float, **fields: Any) -> None:
+        """Accumulate lightweight phase timing without a telemetry subsystem."""
+        key = f"{name}_ms"
+        self.counters[key] += float(elapsed_s) * 1000.0
+        self.emit("phase_timing", phase=name, elapsed_ms=round(float(elapsed_s) * 1000.0, 3), **fields)
 
     def note(self, message: str, **fields: Any) -> None:
         self.emit("note", message=message, **fields)

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .backend import canonical_url
+from .text_observer import BrowserTextObserver
 
 
 class BrowserVerifierBackend(Protocol):
@@ -34,6 +35,7 @@ class BrowserVerifier:
         if backend is None:
             raise ValueError("BrowserVerifier requires a backend")
         self._backend = backend
+        self._text_observer = BrowserTextObserver(backend)
 
     def verify(self, action: Any, result: Any) -> BrowserVerificationResult:
         from .actions import BrowserAction, BrowserActionKind
@@ -127,12 +129,18 @@ class BrowserVerifier:
                 return BrowserVerificationResult(False, f"could not independently inspect playback: {url_exc}", "FAIL")
             return BrowserVerificationResult(False, f"playback state is unknown: {exc}", "UNKNOWN")
 
+    def _fresh_observation(self) -> Any:
+        """Acquire one fresh browser observation for an independent check."""
+        return self._text_observer.observe({"kind": "browser", "purpose": "verification"})
+
     def verify_url(self, expected_url: str) -> BrowserVerificationResult:
+        observation = self._fresh_observation()
+        if not observation.ok:
+            return BrowserVerificationResult(False, f"browser observation unavailable: {observation.error}", "UNKNOWN")
+        actual = canonical_url(str(observation.metadata.get("url") or ""))
         expected = canonical_url(expected_url)
-        actual = canonical_url(self._backend.current_url())
         if actual == expected:
             return BrowserVerificationResult(True, f"URL matched {actual!r}", "PASS")
-        # Redirects from a bare host to a canonical host/path are acceptable.
         from urllib.parse import urlsplit
         ep, ap = urlsplit(expected), urlsplit(actual)
         if ep.netloc == ap.netloc and ep.path == "/" and not ep.query:
@@ -140,19 +148,28 @@ class BrowserVerifier:
         return BrowserVerificationResult(False, f"URL mismatch: expected {expected!r}, observed {actual!r}", "FAIL")
 
     def verify_url_contains(self, fragment: str) -> BrowserVerificationResult:
-        actual = self._backend.current_url()
+        observation = self._fresh_observation()
+        if not observation.ok:
+            return BrowserVerificationResult(False, f"browser observation unavailable: {observation.error}", "UNKNOWN")
+        actual = str(observation.metadata.get("url") or "")
         if fragment.casefold() in actual.casefold():
             return BrowserVerificationResult(True, f"URL contains {fragment!r}", "PASS")
         return BrowserVerificationResult(False, f"URL does not contain {fragment!r}; observed {actual!r}", "FAIL")
 
     def verify_title(self, expected: str) -> BrowserVerificationResult:
-        actual = self._backend.page_title()
+        observation = self._fresh_observation()
+        if not observation.ok:
+            return BrowserVerificationResult(False, f"browser observation unavailable: {observation.error}", "UNKNOWN")
+        actual = str(observation.metadata.get("title") or "")
         if expected.casefold() in actual.casefold():
             return BrowserVerificationResult(True, f"title contains {expected!r}", "PASS")
         return BrowserVerificationResult(False, f"title {actual!r} does not contain {expected!r}", "FAIL")
 
     def verify_text(self, expected: str) -> BrowserVerificationResult:
-        actual = self._backend.page_text()
+        observation = self._fresh_observation()
+        if not observation.ok:
+            return BrowserVerificationResult(False, f"browser observation unavailable: {observation.error}", "UNKNOWN")
+        actual = observation.text
         if expected.casefold() in actual.casefold():
             return BrowserVerificationResult(True, f"page contains {expected!r}", "PASS")
         return BrowserVerificationResult(False, f"page does not contain {expected!r}", "FAIL")

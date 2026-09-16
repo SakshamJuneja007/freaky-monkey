@@ -88,7 +88,7 @@ def test_session_assigns_distinct_browser_resources_to_independent_tasks():
         session.close()
 
 
-def test_same_site_browser_followups_reuse_resource_while_whatsapp_is_separate():
+def test_all_browser_sites_reuse_one_live_browser_resource():
     from agent_control.session import Session
 
     class FakeBrowser:
@@ -103,8 +103,7 @@ def test_same_site_browser_followups_reuse_resource_while_whatsapp_is_separate()
         youtube_a = session._browser_for_task("task-a", resource_key="youtube")
         youtube_b = session._browser_for_task("task-b", resource_key="youtube")
         whatsapp = session._browser_for_task("task-c", resource_key="whatsapp")
-        assert youtube_a is youtube_b
-        assert youtube_a is not whatsapp
+        assert youtube_a is youtube_b is whatsapp
     finally:
         session.close()
 
@@ -131,9 +130,8 @@ def test_resource_identity_reuses_matching_site_and_not_unrelated_site():
         youtube_again = session._browser_for_task("task-c", resource_key="youtube")
         gmail = session._browser_for_task("task-d", resource_key="gmail")
         assert youtube_again is youtube
-        assert whatsapp is not youtube
-        assert gmail is not youtube
-        assert gmail is not whatsapp
+        assert whatsapp is youtube
+        assert gmail is youtube
     finally:
         session.close()
 
@@ -152,3 +150,27 @@ def test_whatsapp_open_reuses_existing_ready_whatsapp_page():
     assert result.get("reused") is True
     current_url.assert_called_once()
     navigate.assert_not_called()
+
+
+def test_browser_resources_share_one_live_browser_adapter_across_sites():
+    from agent_control.session import Session
+
+    class FakeBrowser:
+        def __init__(self):
+            self.created = 0
+        def new_task_session(self):
+            self.created += 1
+            return self
+        def close_session(self):
+            pass
+
+    base = FakeBrowser()
+    session = Session(narrator=FakeNarrator(), _browser_backend=base)
+    try:
+        a = session._browser_for_task("youtube", resource_key="youtube")
+        b = session._browser_for_task("whatsapp", resource_key="whatsapp")
+        c = session._browser_for_task("gmail", resource_key="gmail")
+        assert a is b is c
+        assert base.created == 1
+    finally:
+        session.close()

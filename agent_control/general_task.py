@@ -94,6 +94,7 @@ class Effect:
             "write_file": ("content",),
             "fetch_file": ("url",),
             "launch_app": ("open_path",),
+            "type_text": ("text", "app"),
         }.get(self.kind, ())
         return (
             self.kind,
@@ -184,6 +185,18 @@ def _verify_written(policy: Policy, effect: Effect,
         policy, effect.target, trace=trace,
         min_bytes=len(data), must_contain=_first_line(content),
     )
+
+def _verify_typed(policy: Policy, effect: Effect,
+                   trace: Trace | None) -> VerificationResult:
+    app = effect.params.get("app")
+    text = effect.params.get("text")
+    if not isinstance(app, str) or not app.strip() or not isinstance(text, str) or not text:
+        return VerificationResult(checks=[Check(
+            name="requested_text", verdict=Verdict.UNKNOWN,
+            reason="type_text effect is missing app or text",
+        )], label="type_text")
+    return verifiers.verify_text_in_app(policy, app, text, trace=trace)
+
 
 def _verify_fetched(policy: Policy, effect: Effect,
                     trace: Trace | None) -> VerificationResult:
@@ -309,6 +322,7 @@ _EFFECTS: dict[str, tuple[str, _Locator, _Verifier]] = {
     "fetch_file": ("dest", _write_target, _verify_fetched),
     "open_file": ("path", _read_target, _verify_opened),
     "launch_app": ("app", _app_target, _verify_launched),
+    "type_text": ("app", _app_target, _verify_typed),
     "create_venv": ("venv", _write_target, _verify_venv),
 }
 
@@ -334,8 +348,10 @@ def _requested_effect_kinds(request: str) -> frozenset[str]:
         kinds.add("write_file")
     if re.search(r"\b(open|show|view|play)\b.*\bfile\b", text):
         kinds.add("open_file")
-    if re.search(r"\b(open|launch|start|run)\b.*\b(vscode|vs code|chrome|app|application)\b", text):
+    if re.search(r"\b(open|launch|start|run)\b.*\b(vscode|vs code|chrome|app|application|notepad|calculator|paint)\b", text):
         kinds.add("launch_app")
+    if re.search(r"\b(type|write)\b.+(?:\b(in|into|inside)\b.+)?", text):
+        kinds.add("type_text")
 
     # Browser effects are verified by the BrowserSkill verifier rather than
     # the filesystem/app effect ledger.  Keep this intentionally narrow: a

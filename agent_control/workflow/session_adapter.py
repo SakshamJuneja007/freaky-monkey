@@ -61,6 +61,18 @@ def normalize_execution_result(result: AgentResult) -> dict[str, Any]:
     if result.failure_categories:
         failure_category = str(result.failure_categories[-1])
 
+    # ``AgentResult.detail`` is historically allowed to contain the short
+    # execution detail (and can be the literal ``"ok"`` even when the final
+    # verification is UNKNOWN).  Never surface that as a workflow failure
+    # reason.  The authoritative failure category / verification verdict is
+    # the useful terminal diagnostic.
+    detail_text = str(result.detail or "").strip()
+    if detail_text.lower() == "ok":
+        detail_text = ""
+    terminal_error = result.aborted_reason or detail_text
+    if not terminal_error and verdict == "UNKNOWN" and failure_category:
+        terminal_error = failure_category
+
     return {
         "ok": ok,
         "execution_ok": execution_ok,
@@ -70,9 +82,9 @@ def normalize_execution_result(result: AgentResult) -> dict[str, Any]:
         "result": result_json,
         "verification": verification,
         "workflow": workflow_payload,
-        "error": None if ok else (result.detail or result.aborted_reason or None),
+        "error": None if ok else terminal_error,
         "error_category": failure_category,
-        "error_detail": None if ok else (result.detail or result.aborted_reason or None),
+        "error_detail": None if ok else terminal_error,
         "needs_input": bool(result.needs_input),
     }
 
@@ -83,6 +95,7 @@ class SessionWorkflowRuntime:
     def __init__(self, session: Any) -> None:
         self.session = session
         self._decomposer: WorkflowDecomposer | None = None
+        self._policy_cache: Policy | None = None
 
 
     @staticmethod
@@ -112,10 +125,15 @@ class SessionWorkflowRuntime:
         return workflow
 
     def _policy(self) -> Policy:
-        root = self.session._general_workspace
-        if root is None:
-            root = (self.session.workspace or Path.cwd()).resolve()
-        return Policy(workspace=root, confirm_mode="ask")
+        # Policy construction is deterministic for the lifetime of this workflow
+        # adapter. Reuse the immutable policy object instead of rebuilding it for
+        # every atomic child; the policy check itself still runs for every action.
+        if self._policy_cache is None:
+            root = self.session._general_workspace
+            if root is None:
+                root = (self.session.workspace or Path.cwd()).resolve()
+            self._policy_cache = Policy(workspace=root, confirm_mode="ask")
+        return self._policy_cache
 
     @staticmethod
     def _missing(action: Action) -> str | None:
@@ -148,14 +166,8 @@ class SessionWorkflowRuntime:
                 "prompt": prompt,
                 "action": action.to_json(),
             }
-        # One explicit approval authorizes the complete sequential workflow.
-        # The grant is durable RuntimeManager metadata, so later steps do not
-        # manufacture fresh approval interrupts and a resumed process keeps the
-        # same authorization decision.
-        runtime_task = self.session._runtime.get_task(workflow.workflow_id)
-        metadata = runtime_task.metadata if runtime_task is not None else {}
-        if bool(metadata.get("workflow_approval_granted")) and action.consequential:
-            return Decision.ALLOW.value, "workflow approval already granted", None
+        # Approval is evaluated for this atomic child only. A grant for one
+        # high-impact action never authorizes a different decomposed child.
         decision, reason = self._policy().check(action)
         return decision.value, reason, None
 
@@ -264,20 +276,9 @@ class SessionWorkflowRuntime:
         legacy = PublicWorkflow.from_json(workflow.to_json())
         step = legacy.steps[step_index]
 
-        # A workflow-level approval is an explicit authorization for the whole
-        # sequential workflow, not just the first action.  The existing runner
-        # still enforces policy on every action; passing the *current, immutable
-        # workflow action* as approved_action makes the runner's normal policy
-        # fingerprint check recognize that this exact step is covered by the
-        # already-granted workflow authorization.  This also tells the planner
-        # to reproduce the decomposed action rather than inventing a different
-        # side effect.  No policy checks or verification are bypassed.
-        if approved_action is None:
-            runtime_task = self.session._runtime.get_task(workflow.workflow_id)
-            metadata = runtime_task.metadata if runtime_task is not None else {}
-            if bool(metadata.get("workflow_approval_granted")) and step.action.consequential:
-                approved_action = step.action.to_json()
-
+        # ``approved_action`` is supplied only by the current approval node and
+        # is fingerprinted by the existing runner policy gate. Never synthesize
+        # approval for a later child from workflow metadata.
         task = UserTask(raw=workflow.goal, text=workflow.goal, source="text", task_id=workflow.workflow_id, status="accepted")
         turn = self.session._run(Prepared(
             task=task,
@@ -288,6 +289,7 @@ class SessionWorkflowRuntime:
             approved_action=approved_action,
             browser_resource_key=step.resource_key,
             runtime_task_id=workflow.workflow_id,
+            suppress_presentation=True,
         ))
         result = turn.result
         if result is None:
@@ -296,6 +298,28 @@ class SessionWorkflowRuntime:
         if normalized["workflow"] is None:
             normalized["workflow"] = legacy.to_json()
         return normalized
+
+    def verify_workflow_step(self, workflow: Workflow, step_index: int) -> dict[str, Any]:
+        """Run the existing independent checkpoint verifier without executing."""
+        from ..workflow import Workflow as PublicWorkflow
+        legacy = PublicWorkflow.from_json(workflow.to_json())
+        step = legacy.steps[step_index]
+        verification = step_task_verification = __import__("agent_control.workflow", fromlist=["WorkflowStepTask"]).WorkflowStepTask(workflow=legacy, step=step).verify_checkpoint(self._policy(), step.action)
+        return verification.to_json() if verification is not None else {"verdict": "UNKNOWN", "reason": "no independent checkpoint verifier"}
+
+    def recover_workflow_resource(self, workflow: Workflow, step_index: int) -> bool:
+        """Delegate resource recovery to the existing session/browser owner."""
+        hook = getattr(self.session, "recover_workflow_resource", None)
+        if callable(hook):
+            return bool(hook(workflow, step_index))
+        return False
+
+    def replan_workflow_step(self, workflow: Workflow, step_index: int) -> bool:
+        """Delegate semantic re-planning to the existing decomposer/planner."""
+        hook = getattr(self.session, "replan_workflow_step", None)
+        if callable(hook):
+            return bool(hook(workflow, step_index))
+        return False
 
     def emit_workflow_event(self, workflow: Workflow, event: str, **metadata: Any) -> None:
         try:

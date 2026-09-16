@@ -148,10 +148,14 @@ class DependencyScheduler:
                 for dep_id in node.dependencies
             ):
                 node.status = StepStatus.BLOCKED
+                node.failure_category = "dependency_failed"
+                node.error = "a prerequisite step did not complete successfully"
         return ready
 
     @staticmethod
     def aggregate(workflow: Workflow) -> WorkflowStatus:
+        if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+            return WorkflowStatus.CANCELLED
         states = [node.status for node in workflow.steps]
         if not states:
             return WorkflowStatus.COMPLETED
@@ -184,6 +188,12 @@ class DependencyScheduler:
         with ThreadPoolExecutor(max_workers=self.max_concurrency, thread_name_prefix="deimos-workflow") as pool:
             while rounds < max_rounds:
                 rounds += 1
+                if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+                    workflow.status = WorkflowStatus.CANCELLED
+                    for node in workflow.steps:
+                        if node.status not in {StepStatus.COMPLETED, StepStatus.CANCELLED}:
+                            node.status = StepStatus.CANCELLED
+                    break
                 ready = self.ready_nodes(workflow)
                 if not ready:
                     workflow.status = self.aggregate(workflow)
@@ -213,6 +223,10 @@ class DependencyScheduler:
 
                 for future in as_completed(futures):
                     node = futures[future]
+                    if workflow.cancel_requested:
+                        # Do not schedule anything else; an already-running
+                        # executor is allowed to reach its own safe boundary.
+                        pass
                     try:
                         result = dict(future.result() or {})
                         results[node.step_id] = result
@@ -234,6 +248,11 @@ class DependencyScheduler:
                         node.result = dict(result.get("result") or {})
                         node.verification = dict(result.get("verification") or {})
                         node.error = result.get("error")
+                        node.failure_category = (
+                            result.get("error_category")
+                            or result.get("failure_category")
+                            or (node.failure_category if node.failure_category else None)
+                        )
                         # Only verified output becomes dependency data. A failed
                         # or UNKNOWN producer can never satisfy a data edge.
                         if node.status is StepStatus.COMPLETED and str(node.verification.get("verdict", "")).upper() == "PASS":
@@ -254,7 +273,8 @@ class DependencyScheduler:
                     except Exception as exc:
                         node.status = StepStatus.FAILED
                         node.error = f"{type(exc).__name__}: {exc}"
-                        results[node.step_id] = {"status": "FAILED", "error": node.error}
+                        node.failure_category = "execution_exception"
+                        results[node.step_id] = {"status": "FAILED", "error": node.error, "error_category": node.failure_category}
                     finally:
                         self.resources.release(node.resource_key, node.step_id)
 

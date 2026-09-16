@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 from ..policy import Decision
 from .models import StepStatus, Workflow, WorkflowStatus
+from ..recovery import action_can_retry, retry_safety
+from ..types import RetrySafety
 from .resources import bind_resources
 from .scheduler import DependencyScheduler
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,8 +50,14 @@ def _next_runnable_step(workflow: Workflow) -> Any | None:
 def load_workflow(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state) if state.get("workflow") else runtime.decompose_workflow(state["workflow_id"], state["goal"])
     bind_resources(workflow)
+    if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+        workflow.status = WorkflowStatus.CANCELLED
+        runtime.emit_workflow_event(workflow, "WORKFLOW_CANCELLED")
+        return {"workflow": workflow.to_json(), "decision": "CANCELLED"}
     workflow.status = WorkflowStatus.RUNNING
     runtime.emit_workflow_event(workflow, "WORKFLOW_LOADED")
+    if any(step.status in {StepStatus.RECOVERY_REQUIRED, StepStatus.UNKNOWN} for step in workflow.steps):
+        runtime.emit_workflow_event(workflow, "WORKFLOW_RESUMED", step_id=workflow.current_step_id)
     return {"workflow": workflow.to_json(), "goal": workflow.goal, "current_step_id": workflow.current_step_id}
 
 
@@ -59,12 +67,23 @@ def decompose(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dic
     else:
         workflow = runtime.decompose_workflow(state["workflow_id"], state["goal"])
     bind_resources(workflow)
+    if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+        workflow.status = WorkflowStatus.CANCELLED
+        runtime.emit_workflow_event(workflow, "WORKFLOW_CANCELLED")
+        return {"workflow": workflow.to_json(), "current_step_id": workflow.current_step_id, "decision": "CANCELLED"}
     runtime.emit_workflow_event(workflow, "WORKFLOW_DECOMPOSED", step_count=len(workflow.steps))
     return {"workflow": workflow.to_json(), "current_step_id": workflow.current_step_id}
 
 
 def select_next_step(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state)
+    if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+        workflow.status = WorkflowStatus.CANCELLED
+        for step in workflow.steps:
+            if step.status not in {StepStatus.COMPLETED, StepStatus.CANCELLED}:
+                step.status = StepStatus.CANCELLED
+        runtime.emit_workflow_event(workflow, "WORKFLOW_CANCELLED")
+        return {"workflow": workflow.to_json(), "decision": "CANCELLED"}
     scheduler = DependencyScheduler()
     scheduler.validate(workflow)
     ready = scheduler.ready_nodes(workflow)
@@ -87,6 +106,8 @@ def route_after_select(state: WorkflowGraphState) -> str:
     workflow = _workflow(state)
     if workflow.status is WorkflowStatus.COMPLETED:
         return "done"
+    if workflow.status in {WorkflowStatus.FAILED, WorkflowStatus.PARTIAL_FAILURE, WorkflowStatus.UNKNOWN, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED}:
+        return "failed"
     ready = state.get("ready_step_ids") or []
     return "batch" if len(ready) > 1 else "observe"
 
@@ -100,15 +121,24 @@ def route_after_batch(state: WorkflowGraphState) -> str:
     workflow = _workflow(state)
     if workflow.status is WorkflowStatus.COMPLETED:
         return "done"
+    if workflow.status in {WorkflowStatus.FAILED, WorkflowStatus.PARTIAL_FAILURE, WorkflowStatus.UNKNOWN, WorkflowStatus.CANCELLED, WorkflowStatus.BLOCKED}:
+        return "failed"
     return "next"
 
 
 def observe(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state)
     index = workflow.current_step
+    import time
+    started = time.perf_counter()
     observation = runtime.observe_workflow_step(workflow, index)
     step = workflow.steps[index]
     step.observation = dict(observation or {})
+    step.observation["observed_at"] = time.time()
+    step.timing["observation_ms"] = round((time.perf_counter() - started) * 1000, 3)
+    if step.observation.get("stale") is True:
+        step.failure_category = "stale_observation"
+        runtime.emit_workflow_event(workflow, "STALE_STATE_DETECTED", step_id=step.step_id, attempt=step.attempt_count, failure_category="stale_observation")
     runtime.emit_workflow_event(workflow, "STEP_OBSERVED", step_id=step.step_id)
     return {"workflow": workflow.to_json(), "last_observation": step.observation}
 
@@ -116,8 +146,14 @@ def observe(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[
 def policy(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
     workflow = _workflow(state)
     index = workflow.current_step
-    decision, reason, pending_input = runtime.workflow_policy(workflow, index)
     step = workflow.steps[index]
+    # A technical recovery of an already-approved action does not constitute a
+    # new approval request. Only a genuinely new action/fingerprint should pass
+    # through policy again.
+    if step.policy_state == "APPROVED":
+        decision, reason, pending_input = Decision.ALLOW.value, "previously approved action is being recovered", None
+    else:
+        decision, reason, pending_input = runtime.workflow_policy(workflow, index)
     if pending_input is not None:
         runtime.request_workflow_input(workflow, index, pending_input)
         step.status = StepStatus.WAITING_FOR_USER
@@ -165,6 +201,7 @@ def approval(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict
         runtime.emit_workflow_event(workflow, "STEP_CANCELLED", step_id=workflow.steps[index].step_id)
         return {"workflow": workflow.to_json(), "decision": "FAILURE", "decision_reason": "workflow step was not approved"}
     runtime.resolve_workflow_approval(workflow, True)
+    workflow.steps[index].policy_state = "APPROVED"
     action = workflow.steps[index].action.to_json()
     runtime.emit_workflow_event(workflow, "APPROVAL_GRANTED", step_id=workflow.steps[index].step_id)
     return {"workflow": workflow.to_json(), "approved_action": action, "decision": "ALLOW"}
@@ -223,10 +260,14 @@ def execute_ready_batch(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapt
         executable.append(node)
 
     def run_branch(node):
+        import time
+        started = time.perf_counter()
         node.status = StepStatus.RUNNING
         node.attempt_count += 1
         runtime.emit_workflow_event(workflow, "STEP_EXECUTION_STARTED", step_id=node.step_id, resource=node.resource_key)
         result = runtime.execute_workflow_step(workflow, node.index, None)
+        node.timing["step_total_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        runtime.emit_workflow_event(workflow, "STEP_TIMING", step_id=node.step_id, timing=node.timing)
         return node, result
 
     branch_results = dict(state.get("branch_results") or {})
@@ -280,11 +321,15 @@ def execute(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[
     workflow = _workflow(state)
     index = workflow.current_step
     step = workflow.steps[index]
+    import time
+    execution_started = time.perf_counter()
     step.status = StepStatus.RUNNING
     step.attempt_count += 1
     workflow.status = WorkflowStatus.RUNNING
     runtime.emit_workflow_event(workflow, "STEP_EXECUTION_STARTED", step_id=step.step_id, resource=step.resource_key)
     result = runtime.execute_workflow_step(workflow, index, state.get("approved_action"))
+    step.timing["execution_ms"] = round((time.perf_counter() - execution_started) * 1000, 3)
+    step.timing["total_step_ms"] = step.timing["execution_ms"]
     approved = state.get("approved_action")
     step_result = dict(result.get("result") or {})
     verification = dict(result.get("verification") or {})
@@ -297,9 +342,12 @@ def execute(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[
     elif result.get("ok"):
         step.status = StepStatus.VERIFYING
     else:
-        step.status = StepStatus.FAILED
         step.error = str(result.get("error") or "workflow step failed")
-        raw_result = step_result.get("failure_class") or step_result.get("skill_failure_class")
+        raw_result = (
+            result.get("error_category")
+            or step_result.get("failure_class")
+            or step_result.get("skill_failure_class")
+        )
         if raw_result:
             step.failure_category = str(raw_result)
         outcome = result.get("outcome") or {}
@@ -314,8 +362,30 @@ def execute(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[
                     "attempts": int(outcome.get("recovery_attempts", 0) or 0),
                 }
         step.verification = verification or {"verdict": result.get("verification", {}).get("verdict", "UNKNOWN")}
-        workflow.status = WorkflowStatus.FAILED
-    runtime.emit_workflow_event(workflow, "STEP_EXECUTION_RESULT", step_id=step.step_id, ok=bool(result.get("ok")))
+        verdict = str(step.verification.get("verdict") or result.get("verification_status") or "UNKNOWN").upper()
+        step.failure_category = step.failure_category or ("verification_unknown" if verdict == "UNKNOWN" else "execution_exception")
+        # UNKNOWN is an unresolved postcondition, not an execution failure.
+        # Preserve it so the recovery graph can re-observe instead of converting
+        # it into FAILED merely because AgentResult.ok is false.
+        if workflow.cancel_requested:
+            step.status = StepStatus.CANCELLED
+            workflow.status = WorkflowStatus.CANCELLED
+        elif step.failure_category in {"application_not_found", "environment", "permission_denied", "policy_denied"}:
+            # A known execution/environment failure is a real failure, not an
+            # unresolved verification state. Dependents are blocked by the DAG
+            # and the original category remains attached to this failed step.
+            step.status = StepStatus.FAILED
+            workflow.status = WorkflowStatus.FAILED
+        elif verdict == "UNKNOWN":
+            step.status = StepStatus.RECOVERY_REQUIRED
+            workflow.status = WorkflowStatus.RECOVERING
+        elif action_can_retry(step.action) or step.failure_category in {"browser_connection_failed", "stale_observation", "target_not_found", "application_not_found"}:
+            step.status = StepStatus.RECOVERY_REQUIRED
+            workflow.status = WorkflowStatus.RECOVERING
+        else:
+            step.status = StepStatus.UNKNOWN
+            workflow.status = WorkflowStatus.UNKNOWN
+    runtime.emit_workflow_event(workflow, "STEP_EXECUTION_RESULT", step_id=step.step_id, ok=bool(result.get("ok")), failure_category=step.failure_category)
     return {
         "workflow": workflow.to_json(),
         "step_result": step_result,
@@ -329,8 +399,10 @@ def verify(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[s
     workflow = _workflow(state)
     index = workflow.current_step
     step = workflow.steps[index]
+    verification_started = __import__("time").perf_counter()
     verification = dict(state.get("step_verification") or {})
     verdict = str(verification.get("verdict") or "UNKNOWN").upper()
+    step.timing["verification_ms"] = round((__import__("time").perf_counter() - verification_started) * 1000, 3)
     if verdict == "PASS":
         step.status = StepStatus.COMPLETED
         step.verification = verification
@@ -341,7 +413,9 @@ def verify(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[s
     if verdict == "UNKNOWN":
         step.status = StepStatus.RECOVERY_REQUIRED
         step.verification = verification
+        step.failure_category = "verification_unknown"
         workflow.status = WorkflowStatus.RECOVERING
+        runtime.emit_workflow_event(workflow, "STEP_FAILURE_CLASSIFIED", step_id=step.step_id, attempt=step.attempt_count, failure_category="verification_unknown", recoverability="REOBSERVE")
         runtime.emit_workflow_event(workflow, "STEP_RECOVERY_REQUIRED", step_id=step.step_id)
         return {"workflow": workflow.to_json(), "decision": "UNKNOWN", "failure_class": "INCONCLUSIVE", "approved_action": None}
     step.status = StepStatus.FAILED
@@ -371,20 +445,138 @@ def next_step(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dic
     if workflow.status is WorkflowStatus.COMPLETED:
         runtime.emit_workflow_event(workflow, "WORKFLOW_COMPLETED")
         return {"workflow": workflow.to_json(), "decision": "DONE", "result": {"status": "COMPLETED"}}
-    runtime.emit_workflow_event(workflow, "WORKFLOW_TERMINAL", status=workflow.status.value)
-    return {"workflow": workflow.to_json(), "decision": "FAILED", "result": {"status": workflow.status.value}}
+    if workflow.status is WorkflowStatus.PARTIAL_FAILURE:
+        runtime.emit_workflow_event(workflow, "WORKFLOW_PARTIAL_COMPLETION", status=workflow.status.value)
+    elif workflow.status is WorkflowStatus.UNKNOWN:
+        runtime.emit_workflow_event(workflow, "WORKFLOW_TERMINAL", status="UNKNOWN")
+    return {
+        "workflow": workflow.to_json(),
+        "decision": "TERMINAL",
+        "result": {
+            "status": workflow.status.value,
+            "completed_steps": [s.step_id for s in workflow.steps if s.status is StepStatus.COMPLETED],
+            "failed_steps": [s.step_id for s in workflow.steps if s.status in {StepStatus.FAILED, StepStatus.BLOCKED}],
+            "unknown_steps": [s.step_id for s in workflow.steps if s.status is StepStatus.UNKNOWN],
+        },
+    }
 
 
 def recover(state: WorkflowGraphState, runtime: WorkflowRuntimeAdapter) -> dict[str, Any]:
+    """Bounded P2.6 recovery coordinator for the existing graph.
+
+    It never marks a step complete from execution evidence.  Recovery either
+    obtains new verification evidence, prepares a safe retry, requests a replan,
+    or leaves the workflow honestly unresolved.
+    """
     workflow = _workflow(state)
     index = workflow.current_step
     step = workflow.steps[index]
-    # The existing DEIMOS runner already owns bounded retries/re-observation.
-    # Graph recovery never blindly repeats a side effect after UNKNOWN.
-    if str(state.get("failure_class")) == "INCONCLUSIVE":
-        observation = runtime.observe_workflow_step(workflow, index)
-        step.observation = dict(observation or {})
-        step.status = StepStatus.RECOVERY_REQUIRED
-        workflow.status = WorkflowStatus.RECOVERING
-        runtime.emit_workflow_event(workflow, "RECOVERY_REOBSERVED", step_id=step.step_id)
-    return {"workflow": workflow.to_json(), "decision": "FAILED"}
+    import time
+    recovery_started = time.perf_counter()
+
+    if workflow.cancel_requested or workflow.status is WorkflowStatus.CANCELLED:
+        step.status = StepStatus.CANCELLED
+        workflow.status = WorkflowStatus.CANCELLED
+        runtime.emit_workflow_event(workflow, "WORKFLOW_CANCELLED", step_id=step.step_id)
+        step.timing["recovery_ms"] = round((time.perf_counter() - recovery_started) * 1000, 3)
+        return {"workflow": workflow.to_json(), "decision": "CANCELLED"}
+
+    if step.attempt_count > step.max_step_retries:
+        step.failure_category = "recovery_exhausted"
+        step.recovery["decision"] = "STEP_RETRY_EXHAUSTED"
+        workflow.status = WorkflowStatus.UNKNOWN if step.status in {StepStatus.UNKNOWN, StepStatus.RECOVERY_REQUIRED} else WorkflowStatus.FAILED
+        runtime.emit_workflow_event(workflow, "STEP_RETRY_EXHAUSTED", step_id=step.step_id, attempt=step.attempt_count, failure_category=step.failure_category)
+        step.timing["recovery_ms"] = round((time.perf_counter() - recovery_started) * 1000, 3)
+        return {"workflow": workflow.to_json(), "decision": "UNKNOWN" if workflow.status is WorkflowStatus.UNKNOWN else "FAILURE"}
+
+    if workflow.recovery_attempts >= workflow.max_recovery_attempts:
+        step.failure_category = "recovery_exhausted"
+        step.recovery["decision"] = "RECOVERY_EXHAUSTED"
+        workflow.status = WorkflowStatus.UNKNOWN if step.status in {StepStatus.UNKNOWN, StepStatus.RECOVERY_REQUIRED} else WorkflowStatus.FAILED
+        runtime.emit_workflow_event(workflow, "RECOVERY_EXHAUSTED", step_id=step.step_id, attempt=workflow.recovery_attempts, failure_category=step.failure_category)
+        step.timing["recovery_ms"] = round((time.perf_counter() - recovery_started) * 1000, 3)
+        return {"workflow": workflow.to_json(), "decision": "UNKNOWN" if workflow.status is WorkflowStatus.UNKNOWN else "FAILURE"}
+
+    workflow.recovery_attempts += 1
+    attempt = workflow.recovery_attempts
+    failure = str(state.get("failure_class") or step.failure_category or "execution_exception")
+    safety = retry_safety(step.action)
+    step.recovery.update({"attempt": attempt, "max_attempts": workflow.max_recovery_attempts, "failure_category": failure, "retry_safety": safety.value})
+    runtime.emit_workflow_event(workflow, "WORKFLOW_RECOVERY_STARTED", step_id=step.step_id, attempt=attempt, failure_category=failure, recovery_strategy=step.recovery.get("decision", ""))
+    runtime.emit_workflow_event(workflow, "STEP_FAILURE_CLASSIFIED", step_id=step.step_id, attempt=attempt, failure_category=failure, recoverability=safety.value)
+
+    def finish_recovery() -> None:
+        step.timing["recovery_ms"] = round((time.perf_counter() - recovery_started) * 1000, 3)
+        step.timing["retry_ms"] = step.timing["recovery_ms"]
+
+    # UNKNOWN after a possibly completed side effect: observe and verify, never
+    # execute the side effect again unless the fresh evidence proves it is absent.
+    if failure in {"verification_unknown", "INCONCLUSIVE", "action_may_have_succeeded", "ACTION_MAY_HAVE_SUCCEEDED"} or safety is RetrySafety.REOBSERVE_FIRST:
+        runtime.emit_workflow_event(workflow, "FRESH_OBSERVATION_REQUESTED", step_id=step.step_id, attempt=attempt, failure_category=failure, recovery_strategy="REOBSERVE")
+        observed = runtime.observe_workflow_step(workflow, index)
+        step.observation = dict(observed or {})
+        verifier = getattr(runtime, "verify_workflow_step", None)
+        if callable(verifier):
+            import time
+            started = time.perf_counter()
+            verification = dict(verifier(workflow, index) or {})
+            step.timing["verification_ms"] = round((time.perf_counter() - started) * 1000, 3)
+            step.verification = verification
+            verdict = str(verification.get("verdict") or "UNKNOWN").upper()
+            if verdict == "PASS":
+                step.status = StepStatus.COMPLETED
+                workflow.status = DependencyScheduler.aggregate(workflow)
+                runtime.emit_workflow_event(workflow, "STEP_COMPLETED", step_id=step.step_id, recovered=True)
+                finish_recovery()
+                return {"workflow": workflow.to_json(), "decision": "PASS"}
+            if verdict == "FAIL" and safety is RetrySafety.SAFE_TO_RETRY:
+                step.status = StepStatus.READY
+                runtime.emit_workflow_event(workflow, "STEP_RETRY_STARTED", step_id=step.step_id, attempt=step.attempt_count + 1, recovery_strategy="RETRY_STEP")
+                finish_recovery()
+                return {"workflow": workflow.to_json(), "decision": "RETRY"}
+        step.status = StepStatus.UNKNOWN
+        workflow.status = WorkflowStatus.UNKNOWN
+        step.failure_category = "verification_unknown"
+        finish_recovery()
+        return {"workflow": workflow.to_json(), "decision": "UNKNOWN"}
+
+    if failure in {"browser_connection_failed", "resource_unavailable"}:
+        recover_resource = getattr(runtime, "recover_workflow_resource", None)
+        if callable(recover_resource):
+            runtime.emit_workflow_event(workflow, "RESOURCE_RECOVERY_STARTED", step_id=step.step_id, attempt=attempt, failure_category=failure, recovery_strategy="RECOVER_RESOURCE")
+            ok = bool(recover_resource(workflow, index))
+            if ok:
+                step.status = StepStatus.READY
+                workflow.status = WorkflowStatus.RUNNING
+                finish_recovery()
+                return {"workflow": workflow.to_json(), "decision": "RETRY"}
+
+    if failure in {"target_not_found", "application_not_found", "precondition_failed", "STALE_STATE"}:
+        replan = getattr(runtime, "replan_workflow_step", None)
+        if callable(replan):
+            runtime.emit_workflow_event(workflow, "REPLAN_STARTED", step_id=step.step_id, attempt=attempt, failure_category=failure, recovery_strategy="REPLAN")
+            ok = bool(replan(workflow, index))
+            if ok:
+                step.status = StepStatus.READY
+                workflow.status = WorkflowStatus.RUNNING
+                finish_recovery()
+                return {"workflow": workflow.to_json(), "decision": "RETRY"}
+
+    if failure in {"browser_connection_failed", "target_not_found", "application_not_found", "stale_observation"}:
+        runtime.emit_workflow_event(workflow, "FRESH_OBSERVATION_REQUESTED", step_id=step.step_id, attempt=attempt, failure_category=failure, recovery_strategy="REOBSERVE")
+        observed = runtime.observe_workflow_step(workflow, index)
+        step.observation = dict(observed or {})
+
+    if action_can_retry(step.action):
+        step.status = StepStatus.READY
+        workflow.status = WorkflowStatus.RUNNING
+        runtime.emit_workflow_event(workflow, "STEP_RETRY_STARTED", step_id=step.step_id, attempt=step.attempt_count + 1, recovery_strategy="RETRY_STEP")
+        finish_recovery()
+        return {"workflow": workflow.to_json(), "decision": "RETRY"}
+
+    step.status = StepStatus.UNKNOWN
+    workflow.status = WorkflowStatus.UNKNOWN
+    step.failure_category = failure
+    step.recovery["decision"] = "ASK_USER" if safety is RetrySafety.ASK_USER else "UNKNOWN"
+    finish_recovery()
+    return {"workflow": workflow.to_json(), "decision": "ASK_USER" if safety is RetrySafety.ASK_USER else "UNKNOWN"}

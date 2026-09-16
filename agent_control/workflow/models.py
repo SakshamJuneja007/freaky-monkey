@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from ..types import Action
+from ..types import Action, RetrySafety
 
 
 def _now() -> str:
@@ -149,6 +149,7 @@ class WorkflowStep:
     action: Action
     status: StepStatus = StepStatus.PENDING
     attempt_count: int = 0
+    max_step_retries: int = 2
     resource_key: str | None = None
     dependencies: list[str] = field(default_factory=list)
     dependency_reasons: dict[str, str] = field(default_factory=dict)
@@ -163,6 +164,7 @@ class WorkflowStep:
     error: str | None = None
     failure_category: str | None = None
     recovery: dict[str, Any] = field(default_factory=dict)
+    timing: dict[str, float] = field(default_factory=dict)
     # Kept for compatibility with the P2.3 workflow projection.
     index: int = 0
 
@@ -235,6 +237,7 @@ class WorkflowStep:
             "state": self.status.value,
             "status": self.status.value,
             "attempt_count": self.attempt_count,
+            "max_step_retries": self.max_step_retries,
             "resource_key": self.resource_key,
             "dependencies": list(self.dependencies),
             "dependency_reasons": dict(self.dependency_reasons),
@@ -252,6 +255,7 @@ class WorkflowStep:
             "error": self.error,
             "failure_category": self.failure_category,
             "recovery": dict(self.recovery),
+            "timing": dict(self.timing),
             "result_summary": str(self.result.get("summary", "")),
             "failure_reason": self.error or "",
         }
@@ -263,7 +267,14 @@ class WorkflowStep:
         params = action_data.get("params", data.get("arguments", {}))
         action = Action(kind=str(kind), params=dict(params or {}),
                         consequential=bool(action_data.get("consequential", data.get("side_effect", True))),
-                        rationale=str(action_data.get("rationale", "")))
+                        rationale=str(action_data.get("rationale", "")),
+            retry_safety=RetrySafety(str(action_data.get("retry_safety", "AUTO"))),
+            idempotent=action_data.get("idempotent"),
+            side_effect_level=str(action_data.get("side_effect_level", "normal")),
+            requires_fresh_observation=bool(action_data.get("requires_fresh_observation", True)),
+            verification_required=bool(action_data.get("verification_required", True)),
+            recovery_strategy=action_data.get("recovery_strategy"),
+        )
         raw_status = data.get("status", data.get("state", "PENDING"))
         status = workflow_step_status_from_runner_state(str(raw_status))
         result = _mapping(data.get("result"), "result")
@@ -274,6 +285,7 @@ class WorkflowStep:
             action=action,
             status=status,
             attempt_count=int(data.get("attempt_count", 0)),
+            max_step_retries=max(0, int(data.get("max_step_retries", 2))),
             resource_key=data.get("resource_key"),
             dependencies=[str(x) for x in data.get("dependencies", [])],
             dependency_reasons={str(k): str(v) for k, v in (data.get("dependency_reasons") or {}).items()},
@@ -288,6 +300,7 @@ class WorkflowStep:
             error=data.get("error") or data.get("failure_reason") or None,
             failure_category=data.get("failure_category"),
             recovery=dict(data.get("recovery") or {}),
+            timing={str(k): float(v) for k, v in (data.get("timing") or {}).items()},
             index=int(data.get("index", index)),
         )
 
@@ -310,8 +323,12 @@ class Workflow:
     context: WorkflowContext = field(default_factory=WorkflowContext)
     resources: dict[str, ResourceBinding] = field(default_factory=dict)
     history: list[dict[str, Any]] = field(default_factory=list)
+    timing: dict[str, float] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+    max_recovery_attempts: int = 4
+    recovery_attempts: int = 0
+    cancel_requested: bool = False
 
     @property
     def current_step(self) -> int:
@@ -339,6 +356,11 @@ class Workflow:
 
     def to_json(self) -> dict[str, Any]:
         self.updated_at = _now()
+        try:
+            started = datetime.fromisoformat(self.created_at).timestamp()
+            self.timing["total_workflow_ms"] = round(max(0.0, datetime.now(timezone.utc).timestamp() - started) * 1000, 3)
+        except (TypeError, ValueError, OSError):
+            pass
         return {
             "workflow_id": self.workflow_id,
             "goal": self.goal,
@@ -350,8 +372,12 @@ class Workflow:
             "context": self.context.to_json(),
             "resources": {k: v.to_json() for k, v in self.resources.items()},
             "history": list(self.history),
+            "timing": dict(self.timing),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
+            "max_recovery_attempts": self.max_recovery_attempts,
+            "recovery_attempts": self.recovery_attempts,
+            "cancel_requested": self.cancel_requested,
         }
 
     @classmethod
@@ -388,17 +414,26 @@ class Workflow:
             context=WorkflowContext(dict(payload.get("context") or {})),
             resources=resources,
             history=list(payload.get("history") or []),
+            timing={str(k): float(v) for k, v in (payload.get("timing") or {}).items()},
             created_at=str(payload.get("created_at") or _now()),
             updated_at=str(payload.get("updated_at") or _now()),
+            max_recovery_attempts=max(0, int(payload.get("max_recovery_attempts", 4))),
+            recovery_attempts=max(0, int(payload.get("recovery_attempts", 0))),
+            cancel_requested=bool(payload.get("cancel_requested", False)),
         )
 
     @classmethod
-    def from_actions(cls, workflow_id: str, goal: str, actions: list[Action]) -> "Workflow":
+    def from_actions(cls, workflow_id: str, goal: str, actions: list[Action], *, explicit_order: bool = False) -> "Workflow":
         steps: list[WorkflowStep] = []
         resources: dict[str, ResourceBinding] = {}
         for i, action in enumerate(actions):
+            if action.kind == "type_text" and not str(action.params.get("app", "")).strip():
+                for previous in reversed(steps):
+                    if previous.action.kind == "launch_app":
+                        action = Action(kind=action.kind, params={**action.params, "app": previous.action.params.get("app")}, consequential=action.consequential, rationale=action.rationale)
+                        break
             resource_key = resource_key_for_action(action)
-            dependencies, reasons, types = infer_dependencies(goal, action, steps)
+            dependencies, reasons, types = infer_dependencies(goal, action, steps, explicit_order=explicit_order)
             step = WorkflowStep(
                 step_id=f"{workflow_id}:step-{i + 1}",
                 index=i,
@@ -419,13 +454,34 @@ class Workflow:
         return wf
 
 
-def infer_dependencies(goal: str, action: Action, prior_steps: list[WorkflowStep]) -> tuple[list[str], dict[str, str], dict[str, str]]:
-    """Infer only genuine ordering dependencies; linguistic adjacency is not enough."""
+def _semantic_target_parent(action: Action) -> str | None:
+    """Return an explicitly declared parent resource for a UI target."""
+    params = action.params if isinstance(action.params, dict) else {}
+    for key in ("parent_resource", "parent_application", "application", "parent_app"):
+        value = params.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().casefold()
+    target = params.get("target_semantic")
+    if isinstance(target, dict):
+        for key in ("parent_resource", "application", "parent_app"):
+            value = target.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().casefold()
+    return None
+
+
+def _is_browser_application(app: str) -> bool:
+    """Identify an application capable of owning browser semantic controls."""
+    return str(app).casefold().strip() in {"chrome", "google chrome", "edge", "microsoft edge"}
+
+
+def infer_dependencies(goal: str, action: Action, prior_steps: list[WorkflowStep], *, explicit_order: bool = False) -> tuple[list[str], dict[str, str], dict[str, str]]:
+    """Infer genuine state/data dependencies while preserving safe concurrency."""
     deps: list[str] = []
     reasons: dict[str, str] = {}
     types: dict[str, str] = {}
     text = " ".join(str(goal or "").casefold().split())
-    explicit_order = bool(__import__("re").search(r"\bthen\b|\bafter that\b|\bonce\b", text))
+    explicit_order = explicit_order or bool(__import__("re").search(r"\bthen\b|\bafter that\b|\bonce\b", text))
     if explicit_order and prior_steps:
         previous = prior_steps[-1]
         deps.append(previous.step_id)
@@ -433,19 +489,45 @@ def infer_dependencies(goal: str, action: Action, prior_steps: list[WorkflowStep
         types[previous.step_id] = DependencyType.EXPLICIT_USER_ORDER.value
         return deps, reasons, types
 
-    # State dependency: an action that operates on the foreground application
-    # needs a preceding launch/open action for that same application.
-    if action.kind in {"browser_type", "browser_click", "browser_press_key", "open_file"} and prior_steps:
-        previous = prior_steps[-1]
-        if previous.action.kind == "launch_app":
-            app = str(previous.action.params.get("app", "")).casefold()
-            if app and (app in text or app in str(action.params).casefold()):
+    # Desktop/application target dependency. The child action must not run until
+    # its owning application has been launched and independently observed.
+    if (action.kind.startswith("browser_") or action.kind in {"type_text", "open_file"}) and prior_steps:
+        requested_app = str(action.params.get("app", "")).casefold().strip()
+        parent_resource = _semantic_target_parent(action)
+        if parent_resource and not requested_app:
+            requested_app = parent_resource
+        for previous in reversed(prior_steps):
+            if previous.action.kind != "launch_app":
+                continue
+            app = str(previous.action.params.get("app", "")).casefold().strip()
+            if requested_app and app == requested_app:
+                deps.append(previous.step_id)
+                reasons[previous.step_id] = "requires_target_application"
+                types[previous.step_id] = DependencyType.STATE_DEPENDENCY.value
+                break
+            # Browser semantic controls are children of the browser application.
+            # This relation is based on the action capability, not control-name
+            # string equality, so address bars/search boxes/etc. are handled alike.
+            if action.kind.startswith("browser_") and _is_browser_application(app):
+                deps.append(previous.step_id)
+                reasons[previous.step_id] = "requires_browser_application"
+                types[previous.step_id] = DependencyType.STATE_DEPENDENCY.value
+                break
+            if not requested_app and not action.kind.startswith("browser_") and app and (app in text or app in str(action.params).casefold()):
                 deps.append(previous.step_id)
                 reasons[previous.step_id] = "requires_foreground_application"
                 types[previous.step_id] = DependencyType.STATE_DEPENDENCY.value
+                break
 
-    # Data dependency: explicit planner references are represented as node IDs
-    # rather than hidden context injection.
+    if action.kind == "browser_play_song" and prior_steps:
+        for previous in reversed(prior_steps):
+            if previous.action.kind == "launch_app" and _is_browser_application(str(previous.action.params.get("app", ""))):
+                if previous.step_id not in deps:
+                    deps.append(previous.step_id)
+                reasons[previous.step_id] = "requires_browser_readiness"
+                types[previous.step_id] = DependencyType.STATE_DEPENDENCY.value
+                break
+
     source = action.params.get("depends_on") or action.params.get("input_from")
     if isinstance(source, str):
         for previous in prior_steps:
@@ -455,8 +537,6 @@ def infer_dependencies(goal: str, action: Action, prior_steps: list[WorkflowStep
                 reasons[previous.step_id] = "verified_output_required"
                 types[previous.step_id] = DependencyType.DATA_DEPENDENCY.value
 
-    # Authentication/session dependencies are explicit in capability naming;
-    # never infer them merely because two actions share a service.
     if prior_steps and any(token in action.kind.casefold() for token in ("authenticated", "account", "send", "delete", "apply")):
         previous = prior_steps[-1]
         if "login" in previous.action.kind.casefold() or "authenticate" in previous.action.kind.casefold():
@@ -471,7 +551,7 @@ def infer_dependencies(goal: str, action: Action, prior_steps: list[WorkflowStep
 TaskNode = WorkflowStep
 
 def resource_key_for_action(action: Action) -> str | None:
-    if action.kind == "launch_app":
+    if action.kind in {"launch_app", "type_text"}:
         app = str(action.params.get("app", "")).strip().casefold()
         if app:
             return app

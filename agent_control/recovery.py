@@ -18,15 +18,85 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .types import (
+    Action,
     ActionResult,
     FailureClass,
+    RetrySafety,
     VerificationResult,
     Verdict,
 )
 
 
+# Conservative defaults for actions whose outcome can be ambiguous.  Skills may
+# override these through Action metadata; the workflow engine never guesses that
+# a side effect is idempotent merely because the executor returned.
+_NON_IDEMPOTENT_KINDS = frozenset({
+    "gmail_send_email",
+    "whatsapp_send_message",
+    "delete_file",
+    "form_submit",
+    "payment",
+    # Text entry is inherently non-idempotent: replaying after UNKNOWN
+    # appends/duplicates user-visible content (e.g. ``hellohello``).
+    "type_text",
+})
+
+
+def retry_safety(action: Action) -> RetrySafety:
+    """Return the effective retry policy for an action.
+
+    Explicit metadata wins.  AUTO uses a conservative capability default:
+    consequential actions that can create an external side effect require a
+    fresh observation before any possible repeat; known non-idempotent actions
+    are never blindly replayed.
+    """
+    if action.retry_safety is not RetrySafety.AUTO:
+        return action.retry_safety
+    if action.kind in _NON_IDEMPOTENT_KINDS or action.idempotent is False:
+        return RetrySafety.REOBSERVE_FIRST
+    if action.idempotent is True or not action.consequential:
+        return RetrySafety.SAFE_TO_RETRY
+    if action.side_effect_level.lower() in {"high", "critical"}:
+        return RetrySafety.ASK_USER
+    return RetrySafety.SAFE_TO_RETRY
+
+
+def action_can_retry(action: Action, *, post_action_unknown: bool = False) -> bool:
+    """Whether a side-effect may be executed again at this point."""
+    safety = retry_safety(action)
+    if post_action_unknown:
+        return safety is RetrySafety.SAFE_TO_RETRY
+    return safety in {RetrySafety.SAFE_TO_RETRY, RetrySafety.REOBSERVE_FIRST}
+
+
+def classify_failure_name(value: object | None) -> FailureClass | None:
+    """Map executor/runtime strings into the P2.6 failure vocabulary."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    for item in FailureClass:
+        if text == item.value or text.upper() == item.name:
+            return item
+    aliases = {
+        "timeout": FailureClass.EXECUTION_TIMEOUT,
+        "browser_disconnected": FailureClass.BROWSER_CONNECTION_FAILED,
+        "browser_connection_failed": FailureClass.BROWSER_CONNECTION_FAILED,
+        "not_found": FailureClass.TARGET_NOT_FOUND,
+        "application_not_found": FailureClass.APPLICATION_NOT_FOUND,
+        "stale": FailureClass.STALE_OBSERVATION,
+        "unknown": FailureClass.VERIFICATION_UNKNOWN,
+        "verification_unknown": FailureClass.VERIFICATION_UNKNOWN,
+        "policy_denied": FailureClass.POLICY_DENIED,
+        "approval_required": FailureClass.APPROVAL_REQUIRED,
+    }
+    return aliases.get(text.lower())
+
+
 class RecoveryDecision(str, Enum):
     RETRY = "RETRY"
+    REOBSERVE = "REOBSERVE"
     REOBSERVE_THEN_RETRY = "REOBSERVE_THEN_RETRY"
     REPLAN = "REPLAN"
     ASK_USER = "ASK_USER"
@@ -40,10 +110,12 @@ class RecoveryBudget:
     max_retries: int = 1
     max_reobserves: int = 1
     max_replans: int = 1
+    max_recovery_attempts: int = 4
 
     retries_used: int = 0
     reobserves_used: int = 0
     replans_used: int = 0
+    recovery_attempts_used: int = 0
 
     def remaining(self) -> dict[str, int]:
         return {
@@ -62,10 +134,19 @@ class RecoveryBudget:
         making into a failure they did not cause.
         """
         left = self.remaining()
+        if decision in {RecoveryDecision.RETRY, RecoveryDecision.REOBSERVE, RecoveryDecision.REOBSERVE_THEN_RETRY, RecoveryDecision.REPLAN}:
+            if self.max_recovery_attempts - self.recovery_attempts_used <= 0:
+                return False
+            self.recovery_attempts_used += 1
         if decision is RecoveryDecision.RETRY:
             if left["retries"] <= 0:
                 return False
             self.retries_used += 1
+        elif decision is RecoveryDecision.REOBSERVE:
+            if left["reobserves"] <= 0:
+                self.recovery_attempts_used -= 1
+                return False
+            self.reobserves_used += 1
         elif decision is RecoveryDecision.REOBSERVE_THEN_RETRY:
             if left["reobserves"] <= 0 or left["retries"] <= 0:
                 return False
@@ -78,7 +159,7 @@ class RecoveryBudget:
         return True
 
     def exhausted(self) -> bool:
-        return all(v <= 0 for v in self.remaining().values())
+        return self.max_recovery_attempts - self.recovery_attempts_used <= 0
 
     def to_json(self) -> dict:
         return {
@@ -86,7 +167,7 @@ class RecoveryBudget:
                        "replans": self.max_replans},
             "used": {"retries": self.retries_used, "reobserves": self.reobserves_used,
                      "replans": self.replans_used},
-            "remaining": self.remaining(),
+            "remaining": {**self.remaining(), "recovery_attempts": max(0, self.max_recovery_attempts - self.recovery_attempts_used)},
         }
 
 
@@ -108,6 +189,19 @@ _STRATEGY: dict[FailureClass, RecoveryDecision] = {
     # preference -- so the only move that can change the answer is asking.
     FailureClass.AMBIGUOUS: RecoveryDecision.ASK_USER,
     FailureClass.UNKNOWN: RecoveryDecision.ABORT,
+    FailureClass.EXECUTION_EXCEPTION: RecoveryDecision.RETRY,
+    FailureClass.EXECUTION_TIMEOUT: RecoveryDecision.RETRY,
+    FailureClass.BROWSER_CONNECTION_FAILED: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    FailureClass.APPLICATION_NOT_FOUND: RecoveryDecision.REPLAN,
+    FailureClass.TARGET_NOT_FOUND: RecoveryDecision.REPLAN,
+    FailureClass.STALE_OBSERVATION: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    FailureClass.VERIFICATION_UNKNOWN: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    FailureClass.RESOURCE_UNAVAILABLE: RecoveryDecision.RETRY,
+    FailureClass.DEPENDENCY_FAILED: RecoveryDecision.ABORT,
+    FailureClass.ACTION_MAY_HAVE_SUCCEEDED: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    FailureClass.CANCELLATION_REQUESTED: RecoveryDecision.ABORT,
+    FailureClass.RECOVERY_EXHAUSTED: RecoveryDecision.ABORT,
+    FailureClass.UNRECOVERABLE_FAILURE: RecoveryDecision.ABORT,
 }
 
 
@@ -119,8 +213,12 @@ def classify(
     max_staleness_s: float | None = None,
 ) -> FailureClass:
     """Assign a failure class from evidence, most specific cause first."""
-    if result is not None and result.failure_class is FailureClass.PERMISSION_DENIED:
-        return FailureClass.PERMISSION_DENIED
+    if result is not None and result.failure_class is not None:
+        explicit = classify_failure_name(result.failure_class)
+        if explicit is not None and explicit is not FailureClass.UNKNOWN:
+            return explicit
+        if result.failure_class is FailureClass.PERMISSION_DENIED:
+            return FailureClass.PERMISSION_DENIED
 
     stale = (
         precondition_age_s is not None
@@ -131,6 +229,10 @@ def classify(
         return FailureClass.STALE_STATE
 
     if result is not None and not result.ok:
+        if isinstance(result.detail, dict):
+            underlying = classify_failure_name(result.detail.get("skill_failure_class") or result.detail.get("failure_class"))
+            if underlying is not None and underlying is not FailureClass.UNKNOWN:
+                return underlying
         return result.failure_class or FailureClass.ACTION_FAILED
 
     if verification is not None:

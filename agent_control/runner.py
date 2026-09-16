@@ -36,6 +36,8 @@ from .recovery import (
     RecoveryBudget,
     RecoveryDecision,
     classify,
+    action_can_retry,
+    classify_failure_name,
 )
 from .skills.registry import SkillRegistry
 from .task import Task, oldest_age_s, state_fingerprint
@@ -68,6 +70,7 @@ class RunConfig:
 
     condition: str = "structured_hybrid"
     max_steps: int = 8
+    max_step_retries: int = 2
     max_staleness_s: float = DEFAULT_MAX_STALENESS_S
     fresh_precondition: bool = True
     recovery_enabled: bool = True
@@ -80,6 +83,7 @@ class RunConfig:
         return {
             "condition": self.condition,
             "max_steps": self.max_steps,
+            "max_step_retries": self.max_step_retries,
             "max_staleness_s": self.max_staleness_s,
             "fresh_precondition": self.fresh_precondition,
             "recovery_enabled": self.recovery_enabled,
@@ -225,6 +229,7 @@ class _Loop:
 
     def refresh(self) -> float:
         """Observe the task and establish a fresh state fingerprint."""
+        started = time.perf_counter()
         self.observations = self.task.observe(
             self.policy,
             self.trace,
@@ -233,6 +238,8 @@ class _Loop:
         self.fingerprint = state_fingerprint(
             self.observations
         )
+        elapsed = time.perf_counter() - started
+        self.trace.phase("observation", elapsed)
 
         return oldest_age_s(
             self.observations
@@ -292,6 +299,7 @@ _MAX_ATTEMPTS_PER_ACTION = 4
 
 _DECISION_KIND = {
     RecoveryDecision.RETRY: DecisionKind.RECOVER,
+    RecoveryDecision.REOBSERVE: DecisionKind.OBSERVE,
     RecoveryDecision.REOBSERVE_THEN_RETRY: DecisionKind.OBSERVE,
     RecoveryDecision.REPLAN: DecisionKind.REPLAN,
     RecoveryDecision.ASK_USER: DecisionKind.ASK_USER,
@@ -339,12 +347,48 @@ def _dispatch(
     loop: _Loop,
     failure_class: FailureClass,
     attempt: int,
+    *,
+    action: Action | None = None,
 ) -> bool:
     """Apply the configured recovery policy.
 
     Returns ``True`` when the caller should retry the current action.
     Returns ``False`` when the caller should stop the current action.
     """
+
+    # Never replay an uncertain consequential side effect unless its capability
+    # metadata explicitly says that replay is safe.  We still allow one bounded
+    # re-observation so the verifier can establish that the side effect already
+    # happened.
+    if action is not None and failure_class in {FailureClass.INCONCLUSIVE, FailureClass.VERIFICATION_UNKNOWN, FailureClass.ACTION_MAY_HAVE_SUCCEEDED}:
+        # A successful executor result followed by UNKNOWN verification means
+        # the side effect may already exist.  Do one fresh observation and
+        # independent verification, but NEVER let the generic recovery policy
+        # turn that UNKNOWN into a blind second execution for a non-idempotent
+        # action such as type_text/send/delete/submit.
+        if not action_can_retry(action, post_action_unknown=True):
+            if (loop.recovery.budget.remaining().get("reobserves", 0) > 0 and
+                    loop.recovery.budget.max_recovery_attempts - loop.recovery.budget.recovery_attempts_used > 0 and
+                    loop.recovery.budget.spend(RecoveryDecision.REOBSERVE)):
+                loop.enter(AgentState.RECOVERING, failure_class=failure_class.value)
+                loop.trace.emit(
+                    "FRESH_OBSERVATION_REQUESTED",
+                    workflow_id=getattr(getattr(loop, "workflow", None), "workflow_id", None),
+                    step_id=(loop.workflow.steps[loop.workflow_step_index].step_id
+                             if getattr(loop, "workflow", None) is not None and loop.workflow_step_index >= 0
+                             else getattr(action, "kind", "")),
+                    attempt=attempt,
+                    failure_category=failure_class.value,
+                    recovery_strategy="REOBSERVE",
+                )
+                loop.refresh()
+                # The caller must perform verification against the fresh state;
+                # returning False here prevents the action loop from executing
+                # the same side effect again.
+                loop.extra_state["reobserve_only"] = True
+                return False
+            loop.abort_reason = f"{failure_class.value}: action is not safe to retry"
+            return False
 
     decision, reason = loop.recovery.decide(
         failure_class
@@ -395,6 +439,14 @@ def _dispatch(
         attempt=attempt,
         budget_left=loop.recovery.budget.remaining(),
     )
+    loop.trace.emit(
+        "WORKFLOW_RECOVERY_STARTED",
+        workflow_id=getattr(getattr(loop, "workflow", None), "workflow_id", None),
+        step_id=(loop.workflow.steps[loop.workflow_step_index].step_id if getattr(loop, "workflow", None) is not None and loop.workflow_step_index >= 0 else None),
+        attempt=attempt,
+        failure_category=failure_class.value,
+        recovery_strategy=decision.value,
+    )
 
     loop.decide(
         _DECISION_KIND[decision],
@@ -403,7 +455,14 @@ def _dispatch(
         attempt=attempt,
     )
 
+    if decision is RecoveryDecision.REOBSERVE:
+        loop.enter(AgentState.OBSERVING, purpose="recovery")
+        loop.trace.emit("FRESH_OBSERVATION_REQUESTED", attempt=attempt, failure_category=failure_class.value)
+        loop.refresh()
+        return False
+
     if decision is RecoveryDecision.REOBSERVE_THEN_RETRY:
+        loop.trace.emit("FRESH_OBSERVATION_REQUESTED", workflow_id=getattr(getattr(loop, "workflow", None), "workflow_id", None), attempt=attempt, failure_category=failure_class.value)
         loop.enter(
             AgentState.OBSERVING,
             purpose="recovery",
@@ -414,9 +473,12 @@ def _dispatch(
         return True
 
     if decision is RecoveryDecision.RETRY:
+        loop.trace.emit("STEP_RETRY_STARTED", workflow_id=getattr(getattr(loop, "workflow", None), "workflow_id", None), attempt=attempt + 1, failure_category=failure_class.value, recovery_strategy="RETRY_STEP")
         return True
 
     if decision is RecoveryDecision.REPLAN:
+        loop.trace.counters["replan_started"] += 1
+        loop.trace.emit("REPLAN_STARTED", workflow_id=getattr(getattr(loop, "workflow", None), "workflow_id", None), attempt=attempt, failure_category=failure_class.value, recovery_strategy="REPLAN")
         loop.enter(
             AgentState.OBSERVING,
             purpose="replan",
@@ -710,12 +772,30 @@ def _execute_skill_action(
                 "skill_executed": False,
                 "skill_verified": False,
             }
+            failure_code = getattr(execution, "failure_code", None) or execution_failure_class
+            classified = classify_failure_name(failure_code)
+            if classified is None:
+                code_map = {
+                    "browser_skill_unavailable": FailureClass.RESOURCE_UNAVAILABLE,
+                    "browser_daemon_unavailable": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_not_discovered": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_extension_not_connected": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_session_start_failed": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_session_expired": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_session_unhealthy": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_profile_mismatch": FailureClass.ENVIRONMENT,
+                    "browser_observation_failed": FailureClass.BROWSER_CONNECTION_FAILED,
+                    "browser_target_not_found": FailureClass.TARGET_NOT_FOUND,
+                    "browser_action_failed": FailureClass.ACTION_FAILED,
+                }
+                classified = code_map.get(str(failure_code or ""))
+            detail["skill_failure_code"] = str(failure_code) if failure_code else None
             return ActionResult(
                 action=action,
                 ok=False,
                 error=str(execution_error or execution_detail or "skill execution failed"),
                 detail=detail,
-                failure_class=FailureClass.UNKNOWN,
+                failure_class=classified or FailureClass.EXECUTION_EXCEPTION,
             )
 
         # ---------------------------------------------------------------
@@ -852,7 +932,7 @@ def _execute_skill_action(
                         "detail": verification_detail,
                     },
                 },
-                failure_class=FailureClass.UNKNOWN,
+                failure_class=FailureClass.VERIFICATION_FAILED,
             )
 
         # ---------------------------------------------------------------
@@ -902,7 +982,10 @@ def _execute_skill_action(
                 "skill_verified": False,
                 "exception_type": type(exc).__name__,
             },
-            failure_class=FailureClass.UNKNOWN,
+            failure_class=(
+                classify_failure_name(str(exc))
+                or (FailureClass.BROWSER_CONNECTION_FAILED if "browser" in str(exc).lower() and any(x in str(exc).lower() for x in ("disconnect", "connection", "closed", "transport")) else FailureClass.EXECUTION_EXCEPTION)
+            ),
         )
 
 
@@ -1000,9 +1083,11 @@ def _permit_and_execute(
                 _workflow_step(loop, loop.workflow_step_index, "WAITING_FOR_USER", reason=f"missing required field: {key}")
             raise NeedUserInput(Clarification(question="What should I search for?", context="WORKFLOW_INPUT:" + json.dumps({"action": action.to_json(), "field": key}, sort_keys=True)))
 
+    policy_started = time.perf_counter()
     decision, reason = loop.policy.check(
         action
     )
+    loop.trace.phase("policy", time.perf_counter() - policy_started, action=action.kind)
 
     loop.trace.policy(
         action,
@@ -1067,16 +1152,22 @@ def _permit_and_execute(
         )
 
         if skill is not None:
-            return _execute_skill_action(
+            execution_started = time.perf_counter()
+            result = _execute_skill_action(
                 loop,
                 action,
                 skill,
             )
+            loop.trace.phase("execution", time.perf_counter() - execution_started, action=action.kind)
+            return result
 
-    return os_tools.execute(
+    execution_started = time.perf_counter()
+    result = os_tools.execute(
         loop.policy,
         action,
     )
+    loop.trace.phase("execution", time.perf_counter() - execution_started, action=action.kind)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1097,9 +1188,8 @@ def _run_action(
     recovering: FailureClass | None = None
     checkpoint: VerificationResult | None = None
 
-    for attempt in range(
-        _MAX_ATTEMPTS_PER_ACTION
-    ):
+    max_attempts = max(1, min(_MAX_ATTEMPTS_PER_ACTION, int(loop.config.max_step_retries) + 1))
+    for attempt in range(max_attempts):
         # For fast semantic browser actions, the target must be resolved only
         # after the normal freshness gate has observed the current page. This
         # avoids creating an @eN target and then immediately invalidating it by
@@ -1118,6 +1208,7 @@ def _run_action(
                 loop,
                 stale,
                 attempt,
+                action=gate_action,
             ):
                 continue
 
@@ -1135,7 +1226,7 @@ def _run_action(
                 )
                 loop.trace.action(result, precondition_age_s=oldest_age_s(loop.observations))
                 recovering = FailureClass.STALE_STATE
-                if not _dispatch(loop, recovering, attempt):
+                if not _dispatch(loop, recovering, attempt, action=gate_action):
                     return None, checkpoint
                 continue
 
@@ -1165,11 +1256,13 @@ def _run_action(
             params=action.params,
         )
 
+        verification_started = time.perf_counter()
         checkpoint = loop.task.verify_checkpoint(
             loop.policy,
             action,
             loop.trace,
         )
+        loop.trace.phase("verification", time.perf_counter() - verification_started, checkpoint=True, action=action.kind)
 
         if checkpoint is not None:
             loop.trace.verification(
@@ -1229,12 +1322,35 @@ def _run_action(
             precondition_age_s=age,
             max_staleness_s=loop.config.max_staleness_s,
         )
+        if (
+            result is not None
+            and not result.ok
+            and action.consequential
+            and not action_can_retry(action)
+            and isinstance(result.detail, dict)
+            and result.detail.get("skill_executed")
+        ):
+            recovering = FailureClass.ACTION_MAY_HAVE_SUCCEEDED
 
         if not _dispatch(
             loop,
             recovering,
             attempt,
+            action=action,
         ):
+            if loop.extra_state.pop("reobserve_only", False):
+                try:
+                    fresh_checkpoint = loop.task.verify_checkpoint(loop.policy, action, loop.trace)
+                    if fresh_checkpoint is not None:
+                        loop.trace.verification(fresh_checkpoint, checkpoint=True)
+                        loop.checkpoints.append(fresh_checkpoint)
+                        checkpoint = fresh_checkpoint
+                        if fresh_checkpoint.verdict is Verdict.PASS:
+                            loop.question = None
+                            loop.refresh()
+                            return result, fresh_checkpoint
+                except Exception as exc:
+                    loop.trace.note("recovery_verification_exception", error=f"{type(exc).__name__}: {exc}")
             return None, checkpoint
 
     # The fixed per-action ceiling is reached regardless of the recovery
@@ -1242,13 +1358,13 @@ def _run_action(
     loop.abort_reason = (
         f"attempt ceiling reached for action "
         f"{action.kind!r} "
-        f"after {_MAX_ATTEMPTS_PER_ACTION} attempts"
+        f"after {max_attempts} attempts"
     )
 
     loop.trace.note(
         "action_attempt_ceiling",
         action=action.kind,
-        attempts=_MAX_ATTEMPTS_PER_ACTION,
+        attempts=max_attempts,
     )
 
     return None, checkpoint
@@ -1323,6 +1439,17 @@ def _plan(
 
     began = time.time()
 
+    # P2.5 children already carry an exact atomic action. Do not invoke the
+    # planner again for a child; keep the normal policy, execution, fresh
+    # observation, and verification pipeline intact.
+    if getattr(loop.task, "workflow_step", None) is not None:
+        reference = loop.task.reference_plan(loop.policy)
+        if reference:
+            loop.trace.note("planner_bypassed_for_atomic_workflow_step", action=reference[0].kind)
+            loop.trace.counters["planner_bypasses"] += 1
+            loop.trace.phase("decomposition", 0.0, mode="atomic_workflow_step")
+            return PlannerStep(actions=list(reference), done=True, reasoning="atomic workflow step supplied by P2.5 scheduler")
+
     state = summarize(
         loop.observations
     )
@@ -1381,6 +1508,8 @@ def _plan(
         latency_s=time.time() - began,
         error=step.error,
     )
+
+    loop.trace.phase("planner", time.time() - began)
 
     loop.trace.emit(
         "planner_step",
@@ -2187,10 +2316,12 @@ def run_task(
             # earlier action may nevertheless have achieved the goal.
             # Do not send this through the normal completion-verification
             # trace channel because the run has already aborted.
+            verification_started = time.perf_counter()
             final = task.verify_final(
                 policy,
                 trace,
             )
+            trace.phase("verification", time.perf_counter() - verification_started, checkpoint=False, final=True)
 
             trace.note(
                 "diagnostic_verification_after_abort",
@@ -2204,10 +2335,12 @@ def run_task(
                 purpose="final",
             )
 
+            verification_started = time.perf_counter()
             final = task.verify_final(
                 policy,
                 trace,
             )
+            trace.phase("verification", time.perf_counter() - verification_started, checkpoint=False, final=True)
 
             # GeneralTask deliberately has no native effect ledger for browser
             # actions. When the task-level result is UNKNOWN, give the skill
@@ -2444,6 +2577,10 @@ def run_task(
         ),
         workflow=(loop.workflow.to_json() if loop.workflow is not None else None),
     )
+
+    trace.phase("workflow_total", time.time() - started)
+    trace.counters["recovery_count"] = trace.counters.get("recovery_attempts", 0)
+    trace.counters["replan_count"] = trace.counters.get("replan_started", 0)
 
     trace.emit(
         "run_end",

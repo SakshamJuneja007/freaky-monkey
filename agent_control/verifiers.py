@@ -17,12 +17,16 @@ in the metrics table (plan S19).
 from __future__ import annotations
 
 from typing import Any, Iterable
+from collections import OrderedDict
+import re
+import unicodedata
 
 from . import observe
 from .os_tools import APP_REGISTRY
 from .policy import Policy
 from .trace import Trace
 from .types import Check, Observation, VerificationResult, Verdict
+from .text_observation import TextObservation
 
 
 def _record(
@@ -31,6 +35,14 @@ def _record(
     purpose: str,
 ) -> Observation:
     return trace.observation(obs, purpose=purpose) if trace else obs
+
+
+def _record_text(
+    trace: Trace | None,
+    obs: TextObservation,
+    purpose: str,
+) -> TextObservation:
+    return trace.text_observation(obs, purpose=purpose) if trace else obs
 
 
 def _unknown(
@@ -44,6 +56,161 @@ def _unknown(
         verdict=Verdict.UNKNOWN,
         evidence={"observation": obs.to_json()},
         reason=f"{reason}: {obs.error}",
+    )
+
+
+def _normalize_text_for_match(text: str) -> str:
+    """Normalize only Unicode form and line endings; preserve meaningful spaces."""
+    value = unicodedata.normalize("NFC", str(text))
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def verify_requested_text(
+    requested_text: str,
+    observation: TextObservation | None,
+    *,
+    exact: bool = False,
+    normalize_whitespace: bool = False,
+    max_age_s: float = 1.0,
+) -> Check:
+    """Verify requested text against independent, fresh text evidence."""
+    if observation is None or not observation.ok:
+        return Check(
+            name="requested_text",
+            verdict=Verdict.UNKNOWN,
+            evidence={"observation": observation.to_json() if observation else None},
+            reason="relevant application text could not be observed",
+        )
+    if not observation.is_fresh(max_age_s):
+        return Check(
+            name="requested_text",
+            verdict=Verdict.UNKNOWN,
+            evidence={"observation": observation.to_json()},
+            reason="text observation was stale",
+        )
+
+    expected = _normalize_text_for_match(requested_text)
+    actual = _normalize_text_for_match(observation.text)
+    if normalize_whitespace:
+        expected_cmp = re.sub(r"\s+", " ", expected).strip()
+        actual_cmp = re.sub(r"\s+", " ", actual).strip()
+    else:
+        expected_cmp, actual_cmp = expected, actual
+
+    matched = actual_cmp == expected_cmp if exact else expected_cmp in actual_cmp
+    return Check(
+        name="requested_text",
+        verdict=Verdict.PASS if matched else Verdict.FAIL,
+        evidence={
+            "source": observation.source,
+            "target": observation.target,
+            "fresh": observation.fresh,
+            "observed_length": len(observation.text),
+            "expected_length": len(requested_text),
+            "match": "exact" if exact else "contains",
+        },
+        reason="" if matched else "observed application text does not satisfy requested text",
+    )
+
+
+_TEXT_TARGET_CACHE: "OrderedDict[str, dict[str, Any]]" = OrderedDict()
+_TEXT_TARGET_CACHE_MAX = 16
+
+
+def _cached_text_window(app: str, title_contains: str, trace: Trace | None) -> dict[str, Any] | None:
+    """Return validated window metadata; dynamic text is never cached."""
+    key = str(app).casefold()
+    item = _TEXT_TARGET_CACHE.get(key)
+    if item is None:
+        if trace:
+            trace.counters["cache_miss_count"] += 1
+        return None
+    if not observe.validate_window_target(
+        int(item["handle"]),
+        pid=int(item["pid"]),
+        title_contains=title_contains,
+    ):
+        _TEXT_TARGET_CACHE.pop(key, None)
+        if trace:
+            trace.counters["cache_miss_count"] += 1
+        return None
+    _TEXT_TARGET_CACHE.move_to_end(key)
+    if trace:
+        trace.counters["cache_hit_count"] += 1
+    return dict(item)
+
+
+def _cache_text_window(app: str, selected: dict[str, Any]) -> None:
+    handle = selected.get("handle")
+    pid = selected.get("pid")
+    if handle is None or pid is None:
+        return
+    key = str(app).casefold()
+    _TEXT_TARGET_CACHE[key] = {
+        "handle": int(handle),
+        "pid": int(pid),
+        "title": selected.get("title"),
+        "focused": bool(selected.get("focused")),
+    }
+    _TEXT_TARGET_CACHE.move_to_end(key)
+    while len(_TEXT_TARGET_CACHE) > _TEXT_TARGET_CACHE_MAX:
+        _TEXT_TARGET_CACHE.popitem(last=False)
+
+
+def verify_text_in_app(
+    policy: Policy,
+    app: str,
+    expected_text: str,
+    *,
+    trace: Trace | None = None,
+) -> VerificationResult:
+    """Freshly observe the target application and verify its actual text."""
+    spec = APP_REGISTRY.get(str(app).casefold(), {})
+    needle = str(spec.get("window_title_contains") or app)
+    selected = _cached_text_window(app, needle, trace)
+
+    if selected is None:
+        window = _record(trace, observe.window_state(title_contains=needle), f"verify_text_in_app:window({app})")
+        if not window.ok:
+            return VerificationResult(
+                checks=[_unknown("text_window", window, "could not locate target application window")],
+                label=f"text:{app}",
+            )
+
+        visible = [w for w in (window.value or {}).get("windows", []) if w.get("visible")]
+        if not visible:
+            return VerificationResult(
+                checks=[Check("text_window", Verdict.FAIL, {"app": app}, "target application window is not visible")],
+                label=f"text:{app}",
+            )
+
+        focused = [w for w in visible if w.get("focused")]
+        selected = focused[0] if focused else visible[0]
+        _cache_text_window(app, selected)
+    elif trace:
+        trace.note("window_target_cache_hit", app=app, handle=selected.get("handle"), pid=selected.get("pid"))
+    handle = selected.get("handle")
+    if handle is None:
+        return VerificationResult(
+            checks=[Check("text_window", Verdict.UNKNOWN, {"app": app}, "target window handle unavailable")],
+            label=f"text:{app}",
+        )
+
+    text_obs = observe.window_text_observation(
+        int(handle),
+        target={
+            "kind": "window",
+            "app": app,
+            "handle": int(handle),
+            "window_title": selected.get("title"),
+            "pid": selected.get("pid"),
+            "focused": bool(selected.get("focused")),
+        },
+    )
+    text_obs = _record_text(trace, text_obs, f"verify_text_in_app:text({app})")
+    return VerificationResult(
+        checks=[verify_requested_text(expected_text, text_obs)],
+        label=f"text:{app}",
     )
 
 

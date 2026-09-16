@@ -48,6 +48,9 @@ class WindowBackend(Protocol):
     def type_text(self, text: str) -> bool: ...
     def press_keys(self, combo: str) -> bool: ...
     def accessibility_tree(self, handle: int) -> dict | None: ...
+    def read_text(self, handle: int) -> str | None: ...
+
+    def read_browser_text_observation(self) -> "TextObservation": ...
 
 
 class NullBackend:
@@ -79,6 +82,16 @@ class NullBackend:
 
     def accessibility_tree(self, handle: int) -> dict | None:
         return None
+
+    def read_text(self, handle: int) -> str | None:
+        return None
+
+    def read_browser_text_observation(self) -> "TextObservation":
+        from ..text_observation import TextObservation
+        return TextObservation(
+            text="", source="unavailable", target={"kind": "browser_global"},
+            fresh=True, ok=False, error=self.reason,
+        )
 
 
 _backend: WindowBackend | None = None

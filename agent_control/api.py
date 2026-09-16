@@ -1577,6 +1577,30 @@ def _status(
             outcome.aborted_reason or "verification failed",
         )
 
+    # A concrete execution/environment category is authoritative even when the
+    # final diagnostic read cannot establish a postcondition. Do not turn a known
+    # launch/application/browser failure into UNKNOWN merely because final
+    # verification itself is inconclusive.
+    hard_failure_categories = {
+        FailureClass.EXECUTION_EXCEPTION.value,
+        FailureClass.EXECUTION_TIMEOUT.value,
+        FailureClass.APPLICATION_NOT_FOUND.value,
+        FailureClass.BROWSER_CONNECTION_FAILED.value,
+        FailureClass.ENVIRONMENT.value,
+        FailureClass.PERMISSION_DENIED.value,
+        FailureClass.POLICY_DENIED.value,
+        FailureClass.TARGET_NOT_FOUND.value,
+        FailureClass.VERIFICATION_FAILED.value,
+        FailureClass.ACTION_FAILED.value,
+        FailureClass.RESOURCE_UNAVAILABLE.value,
+    }
+    concrete_failure = next(
+        (str(category) for category in outcome.failure_categories if str(category) in hard_failure_categories),
+        None,
+    )
+    if concrete_failure:
+        return TaskStatus.FAILED, outcome.aborted_reason or concrete_failure
+
     return (
         TaskStatus.UNKNOWN,
         outcome.aborted_reason
@@ -2273,6 +2297,18 @@ def run_agent_task(
     finally:
         if own_trace:
             active.close()
+
+        # LLMClient keeps a connection pool alive for repeated planner calls.
+        # Direct API runs own their planner, so close that pool at the run
+        # boundary; long-lived Session/Workflow planners remain alive with
+        # their owning session instead.
+        if engine is not None and task_obj is None and hasattr(engine, "client"):
+            close_client = getattr(engine.client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    pass
 
         if owns_browser_backend:
             try:

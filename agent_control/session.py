@@ -783,6 +783,10 @@ class Prepared:
     readable_roots: tuple[Path, ...] = ()
     workspace: Path | None = None
     approved_action: dict[str, Any] | None = None
+    # P2.5 atomic children are internal execution units. Their result is
+    # aggregated into one user-facing workflow reply instead of speaking once
+    # per child. Approval/input prompts remain user-facing.
+    suppress_presentation: bool = False
     fast_route: Any | None = None
     fast_latency_seconds: float = 0.0
     runtime_task_id: str | None = None
@@ -1106,6 +1110,8 @@ class Session:
         key = str(resource_key or task_id or "")
         if not key:
             raise ValueError("browser task id is required")
+        if key in {"browser", "youtube", "whatsapp", "gmail"}:
+            key = "browser"
         existing = self._browser_tasks.get(key)
         if existing is not None:
             return existing
@@ -1477,7 +1483,7 @@ class Session:
         workflow = Workflow.from_json(workflow_data) if isinstance(workflow_data, dict) else None
         if workflow is not None and workflow.state == "COMPLETED":
             result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.SUCCESS, verified=Verdict.PASS.value, completed=[s.step_id for s in workflow.steps], detail="workflow completed after independent verification")
-            reply = "The workflow is complete."
+            reply = self._workflow_completion_reply(workflow)
             self._emit_reply(reply, goal=goal, state="COMPLETED")
             return Turn(task=task, reply=reply, result=result)
         detail = workflow.status.value if workflow is not None else "workflow failed"
@@ -1581,6 +1587,39 @@ class Session:
             self._runtime.update_workflow(workflow_id, workflow.to_json(), event_type="APPROVAL_GRANTED_FALLBACK")
             return self._resume_workflow(workflow, source=source)
 
+    @staticmethod
+    def _workflow_completion_reply(workflow: Workflow) -> str:
+        """One deterministic spoken summary after every child is verified."""
+        parts: list[str] = []
+        for step in workflow.steps:
+            action = step.action
+            params = action.params
+            if action.kind == "launch_app":
+                app = str(params.get("app", "the application")).strip()
+                parts.append(f"{app.title()} is opened")
+            elif action.kind == "type_text":
+                text = str(params.get("text", "")).strip()
+                app = str(params.get("app", "the application")).strip()
+                parts.append(f"typed {text!r} in {app.title()}")
+            elif action.kind == "browser_play_song":
+                query = str(params.get("query", "the requested song")).strip()
+                parts.append(f"started playing {query}")
+            elif action.kind == "whatsapp_send_message":
+                message = str(params.get("message", "")).strip()
+                recipient = str(params.get("recipient", "the contact")).strip()
+                parts.append(f"sent {message!r} to {recipient}")
+            else:
+                parts.append(action.kind.replace("_", " "))
+        if not parts:
+            return "Done, sir. Anything else, sir?"
+        if len(parts) == 1:
+            summary = parts[0]
+        elif len(parts) == 2:
+            summary = f"{parts[0]} and {parts[1]}"
+        else:
+            summary = ", ".join(parts[:-1]) + f", and {parts[-1]}"
+        return f"Done, sir. {summary}. Anything else, sir?"
+
     def _resume_workflow(self, workflow: Workflow, *, source: str = "text", background: bool = False) -> Turn:
         """Run the next durable sequential step through the existing execution pipeline."""
         for step in workflow.steps:
@@ -1595,7 +1634,15 @@ class Session:
             step.state = "PENDING"
             prepared_task = WorkflowStepTask(workflow=workflow, step=step)
             task = UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted")
-            turn = self._run(Prepared(task=task, goal=workflow.goal, kind="workflow step", task_obj=prepared_task, workspace=self.workspace, runtime_task_id=workflow.workflow_id))
+            turn = self._run(Prepared(
+                task=task,
+                goal=workflow.goal,
+                kind="workflow step",
+                task_obj=prepared_task,
+                workspace=self.workspace,
+                runtime_task_id=workflow.workflow_id,
+                suppress_presentation=True,
+            ))
             result = turn.result
             if result is None:
                 return turn
@@ -1604,7 +1651,7 @@ class Session:
             continue
         workflow.state = "COMPLETED"
         self._runtime.update_workflow(workflow.workflow_id, workflow.to_json(), event_type="WORKFLOW_COMPLETED")
-        reply = "The workflow is complete."
+        reply = self._workflow_completion_reply(workflow)
         turn = Turn(task=UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted"), reply=reply, result=None)
         self._emit_reply(reply, goal=workflow.goal)
         return turn
@@ -1822,7 +1869,7 @@ class Session:
         runtime_task_id = approval.runtime_task_id
         if self.debug:
             self.narrator.note(f"APPROVAL: workflow={approval.workflow_id or 'none'} step={approval.step_id or 'none'} resolution={resolution or 'explicit_task_id'} response={'YES' if decision == 'APPROVE' else 'NO'} result={'APPROVED' if decision == 'APPROVE' else 'REJECTED'} resumed_workflow={approval.workflow_id or 'none'}")
-        resource_key = ("whatsapp" if action.kind == "whatsapp_send_message" else "gmail" if action.kind == "gmail_send_email" else None)
+        resource_key = ("browser" if action.kind.startswith("whatsapp_") or action.kind.startswith("gmail_") else None)
         if decision == "REJECT":
             if approval.workflow_id:
                 try:
@@ -2469,7 +2516,7 @@ class Session:
                     )
                     fast_task = FastMessagingTask(task.text, action)
                     fast_task.task_id = fast_task_id
-                    resource_key = "whatsapp"
+                    resource_key = "browser"
                     browser = self._browser_for_task(fast_task_id, resource_key=resource_key)
                     fast_task.browser = browser
                     self.narrator.note(f"  fast route: whatsapp_send_message ({fast.latency_seconds * 1000:.2f}ms classification)") if self.debug else None
@@ -2485,16 +2532,7 @@ class Session:
                         browser_resource_key=resource_key,
                         runtime_task_id=runtime_task_id,
                     ))
-                resource_key = (
-                    "youtube"
-                    if (
-                        "video" in task.text.casefold()
-                        or "youtube" in task.text.casefold()
-                        or fast.route.action_kind == "browser_play_song"
-                        or re.match(r"\s*play\s+", task.text.casefold())
-                    )
-                    else None
-                )
+                resource_key = "browser" if fast.route.action_kind.startswith("browser_") else None
                 browser = self._browser_for_task(fast_task_id, resource_key=resource_key)
                 fast_task = FastInteractionTask(task.text, browser, fast.route)
                 fast_task.task_id = fast_task_id
@@ -2687,14 +2725,17 @@ class Session:
     def _browser_resource_key(prepared: Prepared) -> str | None:
         """Choose the narrowest reusable browser resource class for a task."""
         if prepared.browser_resource_key:
+            # BrowserSkill is one real browser session/resource. Keep scheduler
+            # resource labels (youtube/whatsapp/gmail) for dependency semantics,
+            # but map them to the same live BrowserSkill backend so a later
+            # browser task reuses the healthy session instead of starting a new
+            # one.
+            if prepared.browser_resource_key in {"browser", "youtube", "whatsapp", "gmail"}:
+                return "browser"
             return prepared.browser_resource_key
         text = f"{prepared.task.text} {prepared.goal}".casefold()
-        if "whatsapp" in text:
-            return "whatsapp"
-        if "youtube" in text or re.search(r"\bplay\s+.+", text):
-            return "youtube"
-        if "gmail" in text or "mail.google.com" in text:
-            return "gmail"
+        if "whatsapp" in text or "youtube" in text or "gmail" in text or "mail.google.com" in text or re.search(r"\bplay\s+.+", text):
+            return "browser"
         return None
 
     def _run(self, prepared: Prepared) -> Turn:
@@ -2877,6 +2918,10 @@ class Session:
                 reply = approval_prompt(self.pending_approval.action, prepared.goal)
             else:
                 reply = result.question.question
+        elif prepared.suppress_presentation:
+            # Avoid a second conversation-model call for an internal atomic
+            # child. The workflow owner speaks once after all children pass.
+            reply = ""
         else:
             reply = self._action_reply(task, result)
         if result is not None and not result.needs_input and self._runtime is not None and runtime_task_id:
@@ -2889,7 +2934,7 @@ class Session:
                 goal=prepared.goal,
                 state="WAITING_FOR_APPROVAL" if self.pending_approval else "WAITING_FOR_USER",
             )
-        else:
+        elif not prepared.suppress_presentation:
             self._emit_reply(
                 turn.reply,
                 goal=prepared.goal,

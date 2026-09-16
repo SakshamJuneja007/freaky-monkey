@@ -13,9 +13,11 @@ from .backend import (
     canonical_url,
 )
 from .skill import BrowserSkill
+from .text_observer import BrowserTextObserver
 
 __all__ = [
     "BrowserSkill",
+    "BrowserTextObserver",
     "BrowserSkillAdapter",
     "BrowserSkillCLI",
     "BrowserSkillError",

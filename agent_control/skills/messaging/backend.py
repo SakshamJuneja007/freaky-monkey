@@ -26,7 +26,13 @@ class BrowserMessagingBackend:
     def __init__(self, browser: Any) -> None:
         self._browser = browser
 
+    def _ensure_browser_ready(self) -> None:
+        ensure = getattr(self._browser, "ensure_ready", None)
+        if callable(ensure):
+            ensure()
+
     def _find(self, labels: tuple[str, ...], *, role: str | None = None) -> str:
+        self._ensure_browser_ready()
         ref = self._browser.find_ref(labels)
         if ref:
             return ref
@@ -49,6 +55,7 @@ class BrowserMessagingBackend:
     def search_whatsapp(self, query: str) -> dict[str, Any]:
         if not query.strip():
             raise ValueError("search query is required")
+        self._ensure_browser_ready()
         self._browser.open_url("https://web.whatsapp.com/")
         search = self._find(("Search or start new chat", "Search"), role="textbox")
         self._browser.type_text(search, query)
@@ -58,6 +65,7 @@ class BrowserMessagingBackend:
     def send_gmail(self, recipient: str, subject: str, body: str, cc: str = "", bcc: str = "") -> dict[str, Any]:
         if not recipient.strip() or not subject.strip() or not body.strip():
             raise ValueError("recipient, subject, and body are required")
+        self._ensure_browser_ready()
         self._browser.open_url("https://mail.google.com/mail/u/0/#inbox")
         compose = self._find(("Compose",))
         self._browser.click(compose)

@@ -22,7 +22,12 @@ class Verdict(str, Enum):
 
 
 class FailureClass(str, Enum):
-    """Failure taxonomy driving recovery (plan S9)."""
+    """Failure taxonomy driving recovery (plan S9/P2.6).
+
+    The original coarse classes remain for compatibility.  P2.6 adds explicit
+    workflow-facing categories so a technical failure is never collapsed into
+    a generic "skill failed" result.
+    """
 
     TRANSIENT = "TRANSIENT"
     STALE_STATE = "STALE_STATE"
@@ -41,6 +46,31 @@ class FailureClass(str, Enum):
     #: cannot help, because what is missing is a preference.
     AMBIGUOUS = "AMBIGUOUS"
     UNKNOWN = "UNKNOWN"
+    EXECUTION_EXCEPTION = "execution_exception"
+    EXECUTION_TIMEOUT = "execution_timeout"
+    BROWSER_CONNECTION_FAILED = "browser_connection_failed"
+    APPLICATION_NOT_FOUND = "application_not_found"
+    TARGET_NOT_FOUND = "target_not_found"
+    STALE_OBSERVATION = "stale_observation"
+    VERIFICATION_UNKNOWN = "verification_unknown"
+    POLICY_DENIED = "policy_denied"
+    APPROVAL_REQUIRED = "approval_required"
+    RESOURCE_UNAVAILABLE = "resource_unavailable"
+    DEPENDENCY_FAILED = "dependency_failed"
+    ACTION_MAY_HAVE_SUCCEEDED = "action_may_have_succeeded"
+    CANCELLATION_REQUESTED = "cancellation_requested"
+    RECOVERY_EXHAUSTED = "recovery_exhausted"
+    UNRECOVERABLE_FAILURE = "unrecoverable_failure"
+
+
+class RetrySafety(str, Enum):
+    """Whether repeating an action is safe after uncertain execution."""
+
+    SAFE_TO_RETRY = "SAFE_TO_RETRY"
+    REOBSERVE_FIRST = "REOBSERVE_FIRST"
+    DO_NOT_RETRY = "DO_NOT_RETRY"
+    ASK_USER = "ASK_USER"
+    AUTO = "AUTO"
 
 
 class AgentState(str, Enum):
@@ -141,6 +171,14 @@ class Action:
     consequential: bool = True
     #: Free-text rationale from the planner. Recorded, never trusted.
     rationale: str = ""
+    #: P2.6 recovery metadata. AUTO lets the control plane apply conservative
+    #: capability defaults without embedding policy into the workflow engine.
+    retry_safety: RetrySafety = RetrySafety.AUTO
+    idempotent: bool | None = None
+    side_effect_level: str = "normal"
+    requires_fresh_observation: bool = True
+    verification_required: bool = True
+    recovery_strategy: str | None = None
 
     def to_json(self) -> dict:
         return {
@@ -148,6 +186,12 @@ class Action:
             "params": _jsonable(self.params),
             "consequential": self.consequential,
             "rationale": self.rationale,
+            "retry_safety": self.retry_safety.value,
+            "idempotent": self.idempotent,
+            "side_effect_level": self.side_effect_level,
+            "requires_fresh_observation": self.requires_fresh_observation,
+            "verification_required": self.verification_required,
+            "recovery_strategy": self.recovery_strategy,
         }
 
 

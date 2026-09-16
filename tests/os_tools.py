@@ -65,18 +65,6 @@ APP_REGISTRY: dict[str, dict[str, Any]] = {
         "process_names": ["chrome.exe", "chrome"],
         "window_title_contains": "Google Chrome",
     },
-    "word": {
-        "executables": ["WINWORD.EXE", "winword"],
-        "windows_candidates": [
-            r"%PROGRAMFILES%\Microsoft Office\root\Office16\WINWORD.EXE",
-            r"%PROGRAMFILES(X86)%\Microsoft Office\root\Office16\WINWORD.EXE",
-            r"%PROGRAMFILES%\Microsoft Office\Office16\WINWORD.EXE",
-            r"%PROGRAMFILES(X86)%\Microsoft Office\Office16\WINWORD.EXE",
-        ],
-        "real_binary_relative": [],
-        "process_names": ["WINWORD.EXE", "winword"],
-        "window_title_contains": "Microsoft Word",
-    },
 }
 
 
@@ -1419,10 +1407,12 @@ def _chrome_process_matches_configuration(config: dict[str, str]) -> bool:
                     if low.startswith("--profile-directory="):
                         explicit_profile = arg.split("=", 1)[1].strip().strip('"').casefold()
                         break
-                # A configured profile must be explicit on an existing process.
-                # A matching User Data root alone cannot prove which Chrome
-                # profile is active, so do not reuse an ambiguous process.
-                if explicit_profile != profile:
+                # When user-data-dir identifies the configured profile store,
+                # Chrome may omit the default profile switch. In that case the
+                # browser session selector remains authoritative.
+                if explicit_profile and explicit_profile != profile:
+                    continue
+                if not explicit_profile and not user_data:
                     continue
             if debug_port and f"--remote-debugging-port={debug_port}".casefold() not in folded:
                 continue

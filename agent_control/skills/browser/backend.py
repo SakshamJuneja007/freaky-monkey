@@ -281,9 +281,20 @@ class BrowserSkillCLI:
                 or f"exit code {completed.returncode}"
             )
 
+            lowered = message.casefold()
+            if any(token in lowered for token in ("session not found", "unknown session", "session expired", "no such session")):
+                code = "browser_session_expired"
+            elif any(token in lowered for token in ("extension", "agent window", "not connected")):
+                code = "browser_extension_not_connected"
+            elif any(token in lowered for token in ("daemon", "service unavailable", "connection refused")):
+                code = "browser_daemon_unavailable"
+            else:
+                code = "browser_action_failed"
             raise BrowserSkillError(
                 "BrowserSkill command failed "
-                f"(exit code {completed.returncode}): {message}"
+                f"(exit code {completed.returncode}): {message}",
+                code=code,
+                exit_code=completed.returncode,
             )
 
         if not stdout:
@@ -491,11 +502,52 @@ class BrowserSkillAdapter:
             return BrowserSkillResult(result)
         return BrowserSkillResult({"result": result})
 
+    def ensure_ready(self) -> BrowserObservation:
+        """Establish/reuse BrowserSkill and prove it can observe the browser.
+
+        Process/window existence is deliberately not treated as browser
+        readiness. A successful fresh BrowserSkill observation is the readiness
+        proof used by semantic browser actions.
+        """
+        if not self.session:
+            try:
+                self.session_start()
+            except BrowserSkillError:
+                raise
+            except Exception as exc:
+                raise BrowserSkillError(
+                    f"BrowserSkill session start failed: {type(exc).__name__}: {exc}",
+                    code="browser_session_start_failed",
+                ) from exc
+        try:
+            self.observe()
+        except BrowserSkillError as exc:
+            # A dead session may be recreated once, but only before an action is
+            # attempted. Never replay an unknown browser mutation here.
+            if exc.code in {"browser_session_expired", "browser_session_unhealthy", "session_not_found", "session_expired"} or not self.session:
+                self.session = None
+                self._invalidate_refs()
+                self.session_start()
+                self.observe()
+            else:
+                raise
+        except Exception as exc:
+            raise BrowserSkillError(
+                f"BrowserSkill observation failed: {type(exc).__name__}: {exc}",
+                code="browser_observation_failed",
+            ) from exc
+        if self._last_observation is None:
+            raise BrowserSkillError(
+                "BrowserSkill did not produce a usable browser observation",
+                code="browser_observation_failed",
+            )
+        return self._last_observation
+
     def _require_session(self) -> str:
         if not self.session:
             self.session_start()
         if not self.session:
-            raise BrowserSkillError("BrowserSkill session could not be established")
+            raise BrowserSkillError("BrowserSkill session could not be established", code="browser_session_start_failed")
         return self.session
 
     def _session_command(
@@ -601,6 +653,101 @@ class BrowserSkillAdapter:
             if isinstance(selected.get(key), str) and selected.get(key).strip()
         ), None)
 
+    @staticmethod
+    def _configured_chrome_profile() -> dict[str, str]:
+        """Return the existing Chrome deployment configuration from env."""
+        return {
+            key: value
+            for key, value in {
+                "user_data": os.getenv("DEIMOS_CHROME_USER_DATA", "").strip(),
+                "profile": os.getenv("DEIMOS_CHROME_PROFILE", "").strip(),
+                "debug_port": os.getenv("DEBUG_PORT", "").strip(),
+            }.items()
+            if value
+        }
+
+    @staticmethod
+    def _browser_record_matches_config(item: dict[str, Any], config: dict[str, str]) -> bool:
+        """Match configured Chrome identity using metadata exposed by BrowserSkill."""
+        raw = json.dumps(item, ensure_ascii=False)
+        folded = raw.casefold()
+        if "chrome" not in folded or "edge" in folded:
+            return False
+        profile = config.get("profile", "").casefold()
+        user_data = config.get("user_data", "")
+        if profile:
+            values = [
+                str(item.get(key) or "").strip().casefold()
+                for key in ("profile", "profile_name", "profileName", "profile_directory", "profileDirectory")
+            ]
+            if profile not in values:
+                return False
+        if user_data:
+            normalized = os.path.normcase(os.path.normpath(user_data)).casefold()
+            metadata_values = [
+                str(item.get(key) or "").strip()
+                for key in ("user_data", "user_data_dir", "userDataDir", "user-data-dir", "userData", "userDataPath")
+            ]
+            if not any(normalized == os.path.normcase(os.path.normpath(v)).casefold() for v in metadata_values if v):
+                # Some BrowserSkill versions only expose the path nested in a
+                # browser/session object. Search serialized metadata rather than
+                # constructing or probing profile paths ourselves.
+                if normalized.replace("\\", "/") not in folded.replace("\\", "/"):
+                    return False
+        return True
+
+    @classmethod
+    def _select_configured_chrome_browser(cls, result: BrowserSkillResult, config: dict[str, str]) -> str | None:
+        candidates: list[dict[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(key in value for key in ("id", "browser_id", "browserId")):
+                    candidates.append(value)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+
+        collect(result)
+        seen: set[str] = set()
+        unique: list[tuple[str, dict[str, Any]]] = []
+        explicit_chrome: list[tuple[str, dict[str, Any]]] = []
+        for item in candidates:
+            browser_id = next((item.get(key) for key in ("id", "browser_id", "browserId") if str(item.get(key) or "").strip()), None)
+            if not browser_id:
+                continue
+            browser_id = str(browser_id).strip()
+            if browser_id in seen:
+                continue
+            seen.add(browser_id)
+            unique.append((browser_id, item))
+            raw = json.dumps(item, ensure_ascii=False).casefold()
+            if "chrome" in raw and "edge" not in raw:
+                explicit_chrome.append((browser_id, item))
+            if cls._browser_record_matches_config(item, config):
+                return browser_id
+
+        # Some BrowserSkill builds expose a generic id such as ``discovered``
+        # and omit browser/profile metadata entirely. If exactly one browser is
+        # exposed, the local Chrome process is the only safe external identity
+        # source available to DEIMOS. Accept that browser only when the process
+        # matches the configured Chrome profile. Multiple candidates remain
+        # fail-closed because choosing one would be an arbitrary profile switch.
+        candidates_for_process_match = explicit_chrome if explicit_chrome else unique
+        if len(candidates_for_process_match) == 1:
+            browser_id, item = candidates_for_process_match[0]
+            raw = json.dumps(item, ensure_ascii=False).casefold()
+            if "edge" not in raw:
+                try:
+                    from ... import os_tools
+                    if os_tools._chrome_process_matches_configuration(config):
+                        return browser_id
+                except Exception:
+                    pass
+        return None
+
     def session_start(self) -> BrowserSkillResult:
         """Start a BrowserSkill session on the user's normal Chrome profile.
 
@@ -610,12 +757,38 @@ class BrowserSkillAdapter:
         boundary.
         """
         arguments = ["session", "start"]
+        config = self._configured_chrome_profile()
         try:
-            browsers = self.browsers()
-            browser_id = self._select_default_chrome_browser(browsers)
-        except Exception:
-            # Older BrowserSkill installations may not expose ``browsers``.
-            # Plain session start still uses the extension's normal browser.
+            # Preserve the existing BrowserSkill default path when no explicit
+            # Chrome configuration exists. Configured deployments require an
+            # explicit metadata match so they can never silently attach to an
+            # unrelated profile.
+            if config:
+                browsers = self.browsers()
+                browser_id = self._select_configured_chrome_browser(browsers, config)
+                if browser_id is None:
+                    raise BrowserSkillError(
+                        "configured Chrome profile/session is unavailable to BrowserSkill",
+                        code="configured_profile_unavailable",
+                        data={"configured_profile": config},
+                    )
+            else:
+                try:
+                    browsers = self.browsers()
+                    browser_id = self._select_default_chrome_browser(browsers)
+                except Exception:
+                    # Older BrowserSkill installations may not expose browser
+                    # discovery; retain the existing default session behavior.
+                    browser_id = None
+        except BrowserSkillError:
+            raise
+        except Exception as exc:
+            if config:
+                raise BrowserSkillError(
+                    "could not inspect BrowserSkill browser sessions for the configured Chrome profile",
+                    code="configured_profile_unavailable",
+                    data={"configured_profile": config, "error": str(exc)},
+                ) from exc
             browser_id = None
 
         if browser_id:
@@ -623,6 +796,12 @@ class BrowserSkillAdapter:
         arguments.append("--no-focus")
 
         result = self._run(arguments)
+        if config and not self._extract_session_id(result):
+            raise BrowserSkillError(
+                "BrowserSkill did not establish a session for the configured Chrome profile",
+                code="browser_session_not_ready",
+                data={"configured_profile": config},
+            )
 
         session_id = self._extract_session_id(result)
 
@@ -974,6 +1153,8 @@ class BrowserSkillAdapter:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         query = query.strip()
+        if observation is None and self._last_observation is None:
+            self.ensure_ready()
         if isinstance(observation, BrowserObservation):
             obs = observation
         else:

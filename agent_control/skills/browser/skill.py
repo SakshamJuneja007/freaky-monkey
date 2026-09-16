@@ -120,11 +120,34 @@ class BrowserSkill(Skill):
             or {}
         )
 
+        # Browser application/process readiness is not BrowserSkill readiness.
+        # Before resolving any semantic target, establish/reuse the real
+        # BrowserSkill session and obtain a fresh observation.
+        ensure_ready = getattr(self._backend, "ensure_ready", None)
+        if callable(ensure_ready):
+            ensure_ready()
+
         # Fast semantic actions may carry the existing BrowserTarget object
         # until this skill boundary. BrowserAction itself intentionally requires
         # plain JSON-compatible parameter values, so translate the target here
         # while preserving BrowserTarget's generation/staleness check.
         target = params.get("target")
+        # Deterministic compound decomposition may preserve a semantic target
+        # query (for example a textbox name) instead of inventing an @eN ref.
+        # Resolve it against the current BrowserSkill observation at the skill
+        # boundary; the resulting ref is still generation-bound.
+        target_query = params.get("target_query")
+        if target is None and isinstance(target_query, str) and target_query.strip():
+            preferred_roles = ()
+            semantic = params.get("target_semantic")
+            if isinstance(semantic, dict) and isinstance(semantic.get("role"), str):
+                preferred_roles = (semantic["role"],)
+            target = self._backend.resolve_target(
+                target_query,
+                preferred_roles=preferred_roles,
+            )
+            params["target"] = target
+            params.pop("target_query", None)
         if isinstance(target, BrowserTarget):
             params["target"] = target.ref
             if target.generation is not None:
@@ -153,6 +176,18 @@ class BrowserSkill(Skill):
                             code="youtube_short_rejected",
                             data={"semantic_target_category": "youtube_short"},
                         )
+
+        if kind == "browser_search" and not any(
+            key in params
+            for key in ("expected_url", "expected_url_contains", "expected_title", "expected_text")
+        ):
+            # Search is navigation-backed in BrowserSkill.  The query is a
+            # generic, engine-independent postcondition candidate: the
+            # resulting page should expose the submitted query in readable
+            # browser state.  The verifier still requires fresh observation.
+            query = params.get("query")
+            if isinstance(query, str) and query.strip():
+                params["expected_text"] = query.strip()
 
         if (
             kind == "browser_open_url"

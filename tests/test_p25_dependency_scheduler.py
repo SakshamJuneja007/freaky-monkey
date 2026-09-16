@@ -58,7 +58,7 @@ def test_independent_nodes_are_ready_together_and_overlap():
 def test_state_dependency_open_notepad_before_type():
     wf = _wf([
         Action("launch_app", {"app": "notepad"}),
-        Action("browser_type", {"text": "hello"}),
+        Action("type_text", {"app": "notepad", "text": "hello"}),
         Action("browser_play_song", {"query": "Do I Wanna Know"}),
     ], "open notepad, type hello, and play Do I Wanna Know")
     assert wf.steps[1].dependencies == [wf.steps[0].step_id]
@@ -323,3 +323,45 @@ def test_langgraph_batch_node_overlaps_independent_existing_execution_path():
     assert all(n.status is StepStatus.COMPLETED for n in result_wf.steps)
     a, b = intervals.values()
     assert a[0] < b[1] and b[0] < a[1]
+
+
+def test_browser_child_target_depends_on_chrome_launch():
+    from agent_control.types import Action
+    from agent_control.workflow.models import Workflow
+    wf = Workflow.from_actions(
+        "browser-child",
+        "open chrome and type hello world into address bar",
+        [
+            Action("launch_app", {"app": "chrome"}),
+            Action("browser_type", {"target": "address bar", "target_semantic": {"name": "address bar", "role": "textbox"}, "text": "hello world"}),
+        ],
+    )
+    assert wf.steps[1].dependencies == [wf.steps[0].step_id]
+    assert wf.steps[1].dependency_types[wf.steps[0].step_id] == DependencyType.STATE_DEPENDENCY.value
+
+
+def test_independent_chrome_and_notepad_launches_remain_parallel():
+    from agent_control.types import Action
+    from agent_control.workflow.models import Workflow
+    wf = Workflow.from_actions(
+        "independent-launches",
+        "open chrome and open notepad",
+        [Action("launch_app", {"app": "chrome"}), Action("launch_app", {"app": "notepad"})],
+    )
+    assert wf.steps[0].dependencies == []
+    assert wf.steps[1].dependencies == []
+
+
+def test_browser_child_is_never_ready_with_unlaunched_parent():
+    from agent_control.types import Action
+    from agent_control.workflow.models import Workflow
+    wf = Workflow.from_actions(
+        "browser-ready",
+        "open chrome and type hello world into address bar",
+        [
+            Action("launch_app", {"app": "chrome"}),
+            Action("browser_type", {"target": "address bar", "target_semantic": {"name": "address bar", "role": "textbox"}, "text": "hello world"}),
+        ],
+    )
+    ready = DependencyScheduler.ready_nodes(wf)
+    assert [n.step_id for n in ready] == [wf.steps[0].step_id]

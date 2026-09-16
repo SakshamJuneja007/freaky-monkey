@@ -67,6 +67,10 @@ class LLMClient:
     timeout_s: float = 20.0
 
     usage: Usage = field(default_factory=Usage)
+    #: Reuse one HTTP connection pool for the lifetime of this client. Workflow
+    #: decomposition/recovery can legitimately make several model calls; creating
+    #: a new httpx.Client for every call throws away keep-alive connections.
+    _http_client: httpx.Client | None = field(default=None, init=False, repr=False, compare=False)
 
     # Some OpenAI-compatible providers do not implement response_format.
     supports_json_mode: bool = True
@@ -152,6 +156,19 @@ class LLMClient:
             vision=vision,
         )
 
+    def _http(self) -> httpx.Client:
+        """Return the client-owned connection pool, creating it lazily."""
+        if self._http_client is None:
+            self._http_client = httpx.Client()
+        return self._http_client
+
+    def close(self) -> None:
+        """Close the reusable HTTP pool."""
+        client = self._http_client
+        self._http_client = None
+        if client is not None:
+            client.close()
+
     def _post(
         self,
         payload: dict,
@@ -177,35 +194,39 @@ class LLMClient:
             connect=min(5.0, self.timeout_s),
         )
 
-        with httpx.Client(timeout=timeout) as client:
+        client = self._http()
+        # The per-request timeout is applied to the request itself while the
+        # client/connection pool remains alive for subsequent calls.
+        response = client.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=timeout,
+        )
+
+        # Some providers reject response_format even though the rest
+        # of the OpenAI-compatible API works.
+        if (
+            response.status_code == 400
+            and "response_format" in response.text
+        ):
+            self.supports_json_mode = False
+
+            payload.pop(
+                "response_format",
+                None,
+            )
+
             response = client.post(
                 url,
                 headers=headers,
                 json=payload,
+                timeout=timeout,
             )
 
-            # Some providers reject response_format even though the rest
-            # of the OpenAI-compatible API works.
-            if (
-                response.status_code == 400
-                and "response_format" in response.text
-            ):
-                self.supports_json_mode = False
+        response.raise_for_status()
 
-                payload.pop(
-                    "response_format",
-                    None,
-                )
-
-                response = client.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                )
-
-            response.raise_for_status()
-
-            body = response.json()
+        body = response.json()
 
         raw_usage = body.get("usage") or {}
 
@@ -290,6 +311,7 @@ class LLMClient:
 
 ACTION_SCHEMA = """\
 launch_app            {"app": "vscode", "settle_s": 6}
+type_text             {"app": "notepad", "text": "<text>"}
 open_url              {"url": "https://...", "settle_s": 5}
 create_dir            {"path": "<abs path>"}
 write_file            {"path": "<abs path>", "content": "<text>"}
@@ -362,6 +384,7 @@ GENERAL RULES:
 - Never use shell operators.
 - Never use shell=True.
 - To open an application, use launch_app with the semantic application name.
+- To type into a desktop application, use type_text with the semantic app name and text.
 - Do not put a file path or URL into launch_app.
 - To open an existing local file or folder, use open_file.
 - To open a web address, use open_url.
