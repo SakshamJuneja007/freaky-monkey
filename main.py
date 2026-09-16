@@ -620,7 +620,10 @@ Type a message and press Enter -- or press Enter on an empty line to speak one.
 
   /planner [mock|llm]  select the execution planner (currently: {planner})
 
-  /memory <query>      look up remembered file locations; runs nothing
+  /memory              show agent + file-memory status; runs nothing
+  /memory recent       show recent structured agent memories
+  /memory forget <q>  invalidate matching structured memory
+  /memory <query>     look up remembered file locations; runs nothing
 
   /tasks               show current tasks and what they are waiting for
   /resume              resume a task that can safely continue
@@ -714,31 +717,50 @@ def _chat_memory(
     session,
     query: str,
 ) -> None:
-    """Query the file-location index without running anything."""
-
+    """Inspect structured agent memory while preserving legacy file-location lookup."""
     from agent_control import memory as mem
+    from agent_control.persistent_memory import PersistentMemory
 
-    if not query:
+    raw = (query or "").strip()
+    parts = raw.split(None, 1)
+    command = parts[0].casefold() if parts else "status"
+    argument = parts[1].strip() if len(parts) > 1 else ""
 
-        status = mem.shared().status()
+    agent = PersistentMemory()
+    try:
+        if command in {"status", ""} and not argument:
+            status = agent.status()
+            file_status = mem.shared().status()
+            print(f"  agent memory: {status['active']} active, {status['superseded']} superseded, {status['invalidated']} invalidated")
+            print(f"  file memory:  {file_status['indexed']} locations indexed" + (", STALE" if file_status.get("stale") else ""))
+            return
 
-        print(
-            f"  {status['indexed']} locations indexed"
-            f"{', STALE' if status.get('stale') else ''}"
-            f"{'' if status['exists'] else ' -- run: python main.py memory --refresh'}"
-        )
+        if command == "recent":
+            records = agent.recent(limit=8)
+            if not records:
+                print("  no persistent agent memories")
+                return
+            for item in records:
+                print(f"  [{item.memory_type}] {item.content} ({item.status.lower()})")
+            return
 
-        return
+        if command == "forget":
+            if not argument:
+                print("  usage: /memory forget <query>")
+                return
+            count = agent.invalidate_matching(argument)
+            print(f"  invalidated {count} matching agent memor{'y' if count == 1 else 'ies'}")
+            return
 
-    found = mem.recall(query)
-
-    for line in found.as_lines():
-        print(f"  {line}")
-
-    if not found.hits:
-        print(
-            "  nothing remembered matches that"
-        )
+        # Backward compatibility: /memory <query> remains the file-location
+        # command. Structured memory can be inspected explicitly with recent/forget.
+        found = mem.recall(raw)
+        for line in found.as_lines():
+            print(f"  {line}")
+        if not found.hits:
+            print("  nothing remembered matches that")
+    finally:
+        agent.close()
 
 
 def _chat_command(

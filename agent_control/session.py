@@ -28,11 +28,13 @@ true by construction rather than by a code path that happens to exist.
 from __future__ import annotations
 from .conversation import ConversationEngine, ConversationTransportError
 from .conversation_memory import ConversationMemory
+from .persistent_memory import MemoryExtractor, PersistentMemory
 from .planner.openai_compat import LLMUnavailable
 
 import re
 import os
 import json
+import sqlite3
 import time
 import threading
 import uuid
@@ -790,6 +792,9 @@ class Prepared:
     fast_route: Any | None = None
     fast_latency_seconds: float = 0.0
     runtime_task_id: str | None = None
+    #: Bounded structured persistent memories recalled at task/conversation entry.
+    #: They are context only and are explicitly fenced again by the API.
+    persistent_memories: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -937,6 +942,9 @@ class Session:
     #: an ``LLMClient`` has a real connection cost that a session which never
     #: needs it should not pay.
     _conversation_memory_store: ConversationMemory | None = field(
+        default=None, repr=False, compare=False,
+    )
+    _persistent_memory_store: PersistentMemory | None = field(
         default=None, repr=False, compare=False,
     )
     _conversation: ConversationEngine | None = field(
@@ -1175,6 +1183,12 @@ class Session:
                 pass
             try:
                 self._runtime.close()
+            except Exception:
+                pass
+            try:
+                if self._persistent_memory_store is not None:
+                    self._persistent_memory_store.close()
+                    self._persistent_memory_store = None
             except Exception:
                 pass
 
@@ -2415,6 +2429,8 @@ class Session:
             pending = None
 
         task = normalize(raw, source=source)
+        self._extract_user_memory(task.text)
+        persistent_memories = self._persistent_memory_records(task.text)
 
         # A fresh request always beats an unanswered question, in both
         # directions: a new task is never hijacked by a stale choice, and a
@@ -2484,7 +2500,7 @@ class Session:
             }:
                 
                 runtime_id = getattr(self._thread_state, "runtime_task_id", None)
-                return self._general_action(task, runtime_task_id=runtime_id) if runtime_id else self._general_action(task)
+                return self._general_action(task, runtime_task_id=runtime_id, persistent_memories=persistent_memories) if runtime_id else self._general_action(task, persistent_memories=persistent_memories)
 
             # ``resolve_request`` covers every request shape the assistant knows
             # -- a named file, a named project folder, and a project to create --
@@ -2531,6 +2547,7 @@ class Session:
                         fast_latency_seconds=fast.latency_seconds,
                         browser_resource_key=resource_key,
                         runtime_task_id=runtime_task_id,
+                        persistent_memories=persistent_memories,
                     ))
                 resource_key = "browser" if fast.route.action_kind.startswith("browser_") else None
                 browser = self._browser_for_task(fast_task_id, resource_key=resource_key)
@@ -2565,9 +2582,9 @@ class Session:
                 # live here, and which applies is decided by one lexical question.
                 if intent is IntentCategory.ACTION:
                     runtime_id = getattr(self._thread_state, "runtime_task_id", None)
-                    return self._general_action(task, runtime_task_id=runtime_id) if runtime_id else self._general_action(task)
+                    return self._general_action(task, runtime_task_id=runtime_id, persistent_memories=persistent_memories) if runtime_id else self._general_action(task, persistent_memories=persistent_memories)
 
-                return self._converse(task)
+                return self._converse(task, persistent_memories=persistent_memories)
 
             if resolved.ambiguous:
                 return self._ask(task, resolved)
@@ -2592,7 +2609,7 @@ class Session:
             )
 
         runtime_task_id = self._runtime_create(api.task_goal(task.task_id, **task.params), task.task_id, runtime_task_id=getattr(task, "runtime_task_id", None))
-        return self._run(Prepared(task=task, goal=api.task_goal(task.task_id, **task.params), runtime_task_id=runtime_task_id))
+        return self._run(Prepared(task=task, goal=api.task_goal(task.task_id, **task.params), runtime_task_id=runtime_task_id, persistent_memories=persistent_memories))
 
     def submit_capture(self, capture: Capture, *, background: bool = False) -> Turn | str:
         """Route one transcript exactly once, preserving approval ownership.
@@ -2689,7 +2706,7 @@ class Session:
             ),
         )
 
-    def _general_action(self, task: UserTask, *, runtime_task_id: str | None = None) -> Turn:
+    def _general_action(self, task: UserTask, *, runtime_task_id: str | None = None, persistent_memories: tuple[dict[str, Any], ...] = ()) -> Turn:
         """Route 2: no registered workflow, but the request needs the machine
         touched. Builds a :class:`~agent_control.general_task.GeneralTask` and
         runs it through the exact pipeline a registered task uses -- same
@@ -2719,6 +2736,7 @@ class Session:
             readable_roots=roots,
             workspace=self._general_workspace,
             runtime_task_id=runtime_task_id,
+            persistent_memories=persistent_memories,
         ))
 
     @staticmethod
@@ -2796,6 +2814,7 @@ class Session:
                 use_memory=self.use_memory,
                 interactive=True,
                 recent_context=self.recent_context.planner_state(),
+                persistent_memories=prepared.persistent_memories,
                 approved_action=prepared.approved_action,
                 fast_route=prepared.fast_route,
                 fast_latency_seconds=prepared.fast_latency_seconds,
@@ -2926,6 +2945,7 @@ class Session:
             reply = self._action_reply(task, result)
         if result is not None and not result.needs_input and self._runtime is not None and runtime_task_id:
             pass
+        self._remember_task_outcome(prepared, result)
         turn = Turn(task=task, reply=reply, result=result,
                     status_lines=lines)
         if result.needs_input and result.question is not None:
@@ -3472,7 +3492,7 @@ class Session:
         return None
 
 
-    def _converse(self, task: UserTask) -> Turn:
+    def _converse(self, task: UserTask, *, persistent_memories: tuple[dict[str, Any], ...] = ()) -> Turn:
         """Route 3: pure conversation. ``result`` stays ``None`` unconditionally
         here, so :attr:`Turn.executed` and :attr:`Turn.ok` read false no matter
         what the reply says -- this path must never be mistaken for one that
@@ -3497,9 +3517,10 @@ class Session:
             # persistent memory are opt-in for turns that actually need them.
             needs_runtime_context = _references_recent_context(task.text, self.recent_context)
             context = dict(self.recent_context.planner_state()) if needs_runtime_context else None
-            memories = None
+            memories = list(persistent_memories) if persistent_memories else None
             if self._conversation_needs_persistent_memory(task.text):
-                memories = self._conversation_memory().search(task.text, limit=4)
+                legacy = self._conversation_memory().search(task.text, limit=4)
+                memories = (memories or []) + legacy
 
             engine = self._conversation_engine()
             # Keep the known-good NVIDIA/OpenAI-compatible request path as the
@@ -3581,6 +3602,7 @@ class Session:
     def _action_reply(self, task: UserTask, result: AgentResult) -> str:
         memory = self._conversation_memory()
         memories = memory.search(task.text, limit=8)
+        memories = [record.to_dict() for record in self._persistent_memory_records(task.text, limit=6)] + memories
         context = dict(self.recent_context.planner_state())
         event = {
             "request": task.text,
@@ -3597,6 +3619,52 @@ class Session:
             )
         except (LLMUnavailable, RuntimeError):
             return self.narrator.presentation.result(result)
+
+    def _persistent_memory(self) -> PersistentMemory:
+        if self._persistent_memory_store is None:
+            self._persistent_memory_store = PersistentMemory()
+        return self._persistent_memory_store
+
+    def _persistent_memory_records(self, text: str, *, limit: int = 6) -> tuple[dict[str, Any], ...]:
+        if not self.use_memory or not text.strip() or len(text.strip()) < 3:
+            return ()
+        try:
+            records = self._persistent_memory().search(text, limit=limit)
+            return tuple(record.to_dict() for record in records)
+        except (OSError, sqlite3.Error):
+            if self.debug:
+                self.narrator.note("[memory] persistent recall unavailable")
+            return ()
+
+    def _extract_user_memory(self, text: str) -> None:
+        if not self.use_memory:
+            return
+        try:
+            for item in MemoryExtractor.extract_user(text, session_id=self._session_owner_id):
+                if item.get("op") == "invalidate":
+                    self._persistent_memory().invalidate_matching(str(item.get("query", "")))
+                elif item.get("op") == "store":
+                    self._persistent_memory().put(**{k: v for k, v in item.items() if k != "op"})
+            self._persistent_memory().maintain()
+        except (OSError, sqlite3.Error):
+            if self.debug:
+                self.narrator.note("[memory] could not persist extracted memory")
+
+    def _remember_task_outcome(self, prepared: Prepared, result: AgentResult) -> None:
+        if not self.use_memory or result.status in {TaskStatus.CANCELLED, TaskStatus.NEEDS_INPUT, TaskStatus.POLICY_BLOCKED}:
+            return
+        try:
+            item = MemoryExtractor.outcome(
+                goal=prepared.goal, task_id=result.task_id, status=result.status.value,
+                verified=result.verified, duration=result.duration_seconds,
+                failure=result.detail if not result.ok else None, session_id=self._session_owner_id,
+            )
+            if item:
+                self._persistent_memory().put(**{k: v for k, v in item.items() if k != "op"})
+                self._persistent_memory().maintain()
+        except (OSError, sqlite3.Error):
+            if self.debug:
+                self.narrator.note("[memory] could not persist task episode")
 
     def _conversation_memory(self) -> ConversationMemory:
         if self._conversation_memory_store is None:
