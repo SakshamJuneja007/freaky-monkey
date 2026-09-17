@@ -281,9 +281,20 @@ class BrowserSkillCLI:
                 or f"exit code {completed.returncode}"
             )
 
+            lowered = message.casefold()
+            if any(token in lowered for token in ("session not found", "unknown session", "session expired", "no such session")):
+                code = "browser_session_expired"
+            elif any(token in lowered for token in ("extension", "agent window", "not connected")):
+                code = "browser_extension_not_connected"
+            elif any(token in lowered for token in ("daemon", "service unavailable", "connection refused")):
+                code = "browser_daemon_unavailable"
+            else:
+                code = "browser_action_failed"
             raise BrowserSkillError(
                 "BrowserSkill command failed "
-                f"(exit code {completed.returncode}): {message}"
+                f"(exit code {completed.returncode}): {message}",
+                code=code,
+                exit_code=completed.returncode,
             )
 
         if not stdout:
@@ -491,11 +502,52 @@ class BrowserSkillAdapter:
             return BrowserSkillResult(result)
         return BrowserSkillResult({"result": result})
 
+    def ensure_ready(self) -> BrowserObservation:
+        """Establish/reuse BrowserSkill and prove it can observe the browser.
+
+        Process/window existence is deliberately not treated as browser
+        readiness. A successful fresh BrowserSkill observation is the readiness
+        proof used by semantic browser actions.
+        """
+        if not self.session:
+            try:
+                self.session_start()
+            except BrowserSkillError:
+                raise
+            except Exception as exc:
+                raise BrowserSkillError(
+                    f"BrowserSkill session start failed: {type(exc).__name__}: {exc}",
+                    code="browser_session_start_failed",
+                ) from exc
+        try:
+            self.observe()
+        except BrowserSkillError as exc:
+            # A dead session may be recreated once, but only before an action is
+            # attempted. Never replay an unknown browser mutation here.
+            if exc.code in {"browser_session_expired", "browser_session_unhealthy", "session_not_found", "session_expired"} or not self.session:
+                self.session = None
+                self._invalidate_refs()
+                self.session_start()
+                self.observe()
+            else:
+                raise
+        except Exception as exc:
+            raise BrowserSkillError(
+                f"BrowserSkill observation failed: {type(exc).__name__}: {exc}",
+                code="browser_observation_failed",
+            ) from exc
+        if self._last_observation is None:
+            raise BrowserSkillError(
+                "BrowserSkill did not produce a usable browser observation",
+                code="browser_observation_failed",
+            )
+        return self._last_observation
+
     def _require_session(self) -> str:
         if not self.session:
             self.session_start()
         if not self.session:
-            raise BrowserSkillError("BrowserSkill session could not be established")
+            raise BrowserSkillError("BrowserSkill session could not be established", code="browser_session_start_failed")
         return self.session
 
     def _session_command(
@@ -527,28 +579,229 @@ class BrowserSkillAdapter:
     # Session lifecycle
     # ------------------------------------------------------------------
 
-    def session_start(self) -> BrowserSkillResult:
-        """Start a BrowserSkill session on the user's preferred Chrome browser.
+    @staticmethod
+    def _browser_profile_score(item: dict[str, Any]) -> tuple[int, int, int]:
+        """Rank connected Chromium profiles for the normal user browser.
 
-        When more than one connected browser/profile is available, prefer a
-        Chrome connection whose metadata identifies the Default profile. This
-        keeps WhatsApp/Gmail/browser workflows on the user's real Chrome
-        profile instead of accidentally selecting another connected profile.
-        If the daemon exposes no usable browser metadata, fall back to the
-        BrowserSkill default selection.
+        BrowserSkill can see more than one connected Chrome profile.  DEIMOS
+        should prefer the user's normal ``Default`` profile, while still
+        falling back safely when an older BrowserSkill build does not expose
+        profile metadata.
         """
-        arguments = ["session", "start", "--no-focus"]
+        values = []
+        for key in ("profile", "profile_name", "profileName", "name", "label", "title"):
+            value = item.get(key)
+            if isinstance(value, str):
+                values.append(value.strip().casefold())
+        text = " ".join(values)
+        browser_text = " ".join(
+            str(item.get(key) or "").strip().casefold()
+            for key in ("browser", "browser_name", "browserName", "type", "name", "label")
+        )
+        is_chrome = int("chrome" in browser_text and "edge" not in browser_text)
+        is_default = int(any(v == "default" or "default" in v for v in values))
+        looks_user_profile = int(any(
+            marker in text for marker in ("default", "personal", "main")
+        ))
+        return (is_default, is_chrome, looks_user_profile)
+
+    @classmethod
+    def _select_default_chrome_browser(cls, result: BrowserSkillResult) -> str | None:
+        """Return the connected BrowserSkill browser id for Chrome Default."""
+        candidates: list[dict[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(key in value for key in ("id", "browser_id", "browserId")):
+                    candidates.append(value)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+
+        collect(result)
+        unique: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in candidates:
+            browser_id = next((
+                item.get(key) for key in ("id", "browser_id", "browserId")
+                if isinstance(item.get(key), str) and item.get(key).strip()
+            ), None)
+            if not browser_id or browser_id in seen:
+                continue
+            seen.add(browser_id)
+            unique.append(item)
+
+        chrome = [
+            item for item in unique
+            if "chrome" in " ".join(
+                str(item.get(key) or "").casefold()
+                for key in ("browser", "browser_name", "browserName", "type", "name", "label", "profile", "profile_name")
+            )
+            and "edge" not in " ".join(
+                str(item.get(key) or "").casefold()
+                for key in ("browser", "browser_name", "browserName", "type")
+            )
+        ]
+        if not chrome:
+            return None
+
+        selected = max(chrome, key=cls._browser_profile_score)
+        return next((
+            selected.get(key) for key in ("id", "browser_id", "browserId")
+            if isinstance(selected.get(key), str) and selected.get(key).strip()
+        ), None)
+
+    @staticmethod
+    def _configured_chrome_profile() -> dict[str, str]:
+        """Return the existing Chrome deployment configuration from env."""
+        return {
+            key: value
+            for key, value in {
+                "user_data": os.getenv("DEIMOS_CHROME_USER_DATA", "").strip(),
+                "profile": os.getenv("DEIMOS_CHROME_PROFILE", "").strip(),
+                "debug_port": os.getenv("DEBUG_PORT", "").strip(),
+            }.items()
+            if value
+        }
+
+    @staticmethod
+    def _browser_record_matches_config(item: dict[str, Any], config: dict[str, str]) -> bool:
+        """Match configured Chrome identity using metadata exposed by BrowserSkill."""
+        raw = json.dumps(item, ensure_ascii=False)
+        folded = raw.casefold()
+        if "chrome" not in folded or "edge" in folded:
+            return False
+        profile = config.get("profile", "").casefold()
+        user_data = config.get("user_data", "")
+        if profile:
+            values = [
+                str(item.get(key) or "").strip().casefold()
+                for key in ("profile", "profile_name", "profileName", "profile_directory", "profileDirectory")
+            ]
+            if profile not in values:
+                return False
+        if user_data:
+            normalized = os.path.normcase(os.path.normpath(user_data)).casefold()
+            metadata_values = [
+                str(item.get(key) or "").strip()
+                for key in ("user_data", "user_data_dir", "userDataDir", "user-data-dir", "userData", "userDataPath")
+            ]
+            if not any(normalized == os.path.normcase(os.path.normpath(v)).casefold() for v in metadata_values if v):
+                # Some BrowserSkill versions only expose the path nested in a
+                # browser/session object. Search serialized metadata rather than
+                # constructing or probing profile paths ourselves.
+                if normalized.replace("\\", "/") not in folded.replace("\\", "/"):
+                    return False
+        return True
+
+    @classmethod
+    def _select_configured_chrome_browser(cls, result: BrowserSkillResult, config: dict[str, str]) -> str | None:
+        candidates: list[dict[str, Any]] = []
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(key in value for key in ("id", "browser_id", "browserId")):
+                    candidates.append(value)
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+
+        collect(result)
+        seen: set[str] = set()
+        unique: list[tuple[str, dict[str, Any]]] = []
+        explicit_chrome: list[tuple[str, dict[str, Any]]] = []
+        for item in candidates:
+            browser_id = next((item.get(key) for key in ("id", "browser_id", "browserId") if str(item.get(key) or "").strip()), None)
+            if not browser_id:
+                continue
+            browser_id = str(browser_id).strip()
+            if browser_id in seen:
+                continue
+            seen.add(browser_id)
+            unique.append((browser_id, item))
+            raw = json.dumps(item, ensure_ascii=False).casefold()
+            if "chrome" in raw and "edge" not in raw:
+                explicit_chrome.append((browser_id, item))
+            if cls._browser_record_matches_config(item, config):
+                return browser_id
+
+        # Some BrowserSkill builds expose a generic id such as ``discovered``
+        # and omit browser/profile metadata entirely. If exactly one browser is
+        # exposed, the local Chrome process is the only safe external identity
+        # source available to DEIMOS. Accept that browser only when the process
+        # matches the configured Chrome profile. Multiple candidates remain
+        # fail-closed because choosing one would be an arbitrary profile switch.
+        candidates_for_process_match = explicit_chrome if explicit_chrome else unique
+        if len(candidates_for_process_match) == 1:
+            browser_id, item = candidates_for_process_match[0]
+            raw = json.dumps(item, ensure_ascii=False).casefold()
+            if "edge" not in raw:
+                try:
+                    from ... import os_tools
+                    if os_tools._chrome_process_matches_configuration(config):
+                        return browser_id
+                except Exception:
+                    pass
+        return None
+
+    def session_start(self) -> BrowserSkillResult:
+        """Start a BrowserSkill session on the user's normal Chrome profile.
+
+        BrowserSkill, rather than ``subprocess.Popen(chrome.exe)``, owns the
+        browser lifecycle.  This preserves the user's real Chrome cookies,
+        logins and tabs while keeping DEIMOS inside BrowserSkill's Agent Window
+        boundary.
+        """
+        arguments = ["session", "start"]
+        config = self._configured_chrome_profile()
         try:
-            browsers = self.browsers()
-            browser_id = self._preferred_browser_id(browsers)
-            if browser_id:
-                arguments.extend(["--browser", browser_id])
-        except Exception:
-            # Browser discovery is a preference, not a prerequisite. Let the
-            # official BrowserSkill default selection handle older daemons.
-            pass
+            # Preserve the existing BrowserSkill default path when no explicit
+            # Chrome configuration exists. Configured deployments require an
+            # explicit metadata match so they can never silently attach to an
+            # unrelated profile.
+            if config:
+                browsers = self.browsers()
+                browser_id = self._select_configured_chrome_browser(browsers, config)
+                if browser_id is None:
+                    raise BrowserSkillError(
+                        "configured Chrome profile/session is unavailable to BrowserSkill",
+                        code="configured_profile_unavailable",
+                        data={"configured_profile": config},
+                    )
+            else:
+                try:
+                    browsers = self.browsers()
+                    browser_id = self._select_default_chrome_browser(browsers)
+                except Exception:
+                    # Older BrowserSkill installations may not expose browser
+                    # discovery; retain the existing default session behavior.
+                    browser_id = None
+        except BrowserSkillError:
+            raise
+        except Exception as exc:
+            if config:
+                raise BrowserSkillError(
+                    "could not inspect BrowserSkill browser sessions for the configured Chrome profile",
+                    code="configured_profile_unavailable",
+                    data={"configured_profile": config, "error": str(exc)},
+                ) from exc
+            browser_id = None
+
+        if browser_id:
+            arguments.extend(["--browser", browser_id])
+        arguments.append("--no-focus")
 
         result = self._run(arguments)
+        if config and not self._extract_session_id(result):
+            raise BrowserSkillError(
+                "BrowserSkill did not establish a session for the configured Chrome profile",
+                code="browser_session_not_ready",
+                data={"configured_profile": config},
+            )
 
         session_id = self._extract_session_id(result)
 
@@ -556,40 +809,6 @@ class BrowserSkillAdapter:
             self.session = session_id
 
         return result
-
-    @staticmethod
-    def _preferred_browser_id(result: BrowserSkillResult) -> str | None:
-        """Pick Chrome/Default from a BrowserSkill ``browsers`` response."""
-        candidates: list[dict[str, Any]] = []
-
-        def collect(value: Any) -> None:
-            if isinstance(value, list):
-                for item in value:
-                    collect(item)
-            elif isinstance(value, dict):
-                # A browser record normally contains id/browser_id plus label/name
-                # and may nest profile metadata. Treat nested browser arrays too.
-                if any(k in value for k in ("id", "browser_id", "browserId")):
-                    candidates.append(value)
-                for key in ("browsers", "items", "data", "result"):
-                    if key in value:
-                        collect(value[key])
-
-        collect(result)
-        if not candidates:
-            return None
-
-        def text(item: dict[str, Any]) -> str:
-            return json.dumps(item, ensure_ascii=False).casefold()
-
-        chrome = [item for item in candidates if "chrome" in text(item)]
-        preferred = [item for item in chrome if "default" in text(item)] or chrome
-        item = preferred[0] if preferred else candidates[0]
-        for key in ("id", "browser_id", "browserId"):
-            value = item.get(key)
-            if isinstance(value, (str, int)) and str(value).strip():
-                return str(value).strip()
-        return None
 
     def session_stop(
         self,
@@ -934,6 +1153,8 @@ class BrowserSkillAdapter:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         query = query.strip()
+        if observation is None and self._last_observation is None:
+            self.ensure_ready()
         if isinstance(observation, BrowserObservation):
             obs = observation
         else:
@@ -2751,15 +2972,15 @@ class BrowserSkillAdapter:
         *,
         timeout_s: float = 15.0,
     ) -> BrowserSkillResult:
-        """Open the best non-Short result for the requested song and verify playback.
+        """Open a semantically selected YouTube result and verify playback.
 
-        The YouTube search always uses the user's original song query.
-        Selection is based only on the current semantic observation. Lyrics/
-        lyrics-video results are preferred, while normal non-Short videos remain
-        eligible as fallback. Shorts and speed variants are not selected.
-
-        BrowserSkill refs remain observation-scoped; no ``@eN`` reference is
-        guessed, persisted, or selected from a previous observation.
+        Navigation is treated as a post-click state transition, not as proof of
+        click success.  A live search page after a click gets a small,
+        observation-scoped recovery: wait for navigation, inspect all existing
+        agent tabs, then take a fresh semantic observation and re-resolve the
+        requested result before one bounded second click.  A dead BrowserSkill
+        session is never replayed through this path; it is surfaced to the
+        normal session-recovery machinery instead.
         """
         import time
 
@@ -2769,102 +2990,281 @@ class BrowserSkillAdapter:
         query = song.strip()
         timeout = max(1.0, float(timeout_s))
         deadline = time.monotonic() + timeout
-
-        # Search exactly what the user asked for. Do not append ``official``
-        # or perform a second official-specific search. Candidate selection
-        # happens from the fresh semantic results visible on this page.
+        # Normal "play <song>" requests are lyrics-video requests.  Search
+        # YouTube with an explicit lyrics intent and exclude Shorts at the
+        # search layer, rather than selecting a generic result and discovering
+        # after the click that YouTube redirected it to /shorts/.
         search_query = query
-
-        self.navigate(
+        if not self._song_request_explicitly_selects_variant(query):
+            search_query = f"{query} lyrics"
+        if not re.search(r"\b(?:short|shorts)\b", search_query, re.IGNORECASE):
+            search_query = f"{search_query} -shorts"
+        search_url = (
             "https://www.youtube.com/results?search_query="
             + quote_plus(search_query)
         )
 
+        self.navigate(search_url)
+        rejected_result_names: set[str] = set()
+        rejected_result_refs: set[str] = set()
+
         target = self._wait_for_first_video_result(
             query,
             timeout_s=max(0.5, deadline - time.monotonic()),
+            excluded_names=rejected_result_names,
+            excluded_refs=rejected_result_refs,
         )
 
-        # Final pre-click safety boundary. Candidate filtering can never be the
-        # only defense because a fresh observation/race may change what a ref
-        # resolves to. Never click a resolved Shorts target.
-        if self._youtube_target_is_short(target):
-            if self.debug:
-                self._debug_note(f"YOUTUBE_SELECTION: candidate={target.name!r} url={self.current_url()!r} shorts=true duration=unknown selected=false")
-            raise BrowserSkillError(
-                "YouTube Short target rejected immediately before execution",
-                code="youtube_short_rejected",
-                data={"target": target.ref, "url": self.current_url()},
-            )
-        duration = self._youtube_target_duration(target, self._last_observation)
-        if duration is None or duration <= 90.0:
-            if self.debug:
-                self._debug_note(f"YOUTUBE_SELECTION: candidate={target.name!r} url={self.current_url()!r} shorts=false duration={duration!r} selected=false")
-            raise BrowserSkillError(
-                "YouTube target has no verified duration greater than 90 seconds",
-                code="youtube_short_rejected",
-                data={"target": target.ref, "duration": duration},
-            )
-
-        click_result = self.click(target)
-        if not click_result.ok:
-            raise BrowserSkillError(
-                "YouTube video click was rejected",
-                code="media_click_failed",
-                data=click_result,
-            )
-
-        # A successful click is not evidence of navigation. Freshly observe the
-        # destination. A Shorts URL is never success; recover once by returning
-        # to the search and selecting the next valid long-form candidate.
-        recovered = False
-        while time.monotonic() < deadline:
-            current = self.current_url().casefold()
-            if "youtube.com/shorts/" in current or "youtube.com/shorts" in current:
-                if recovered:
-                    raise BrowserSkillError(
-                        "YouTube navigated to Shorts twice; playback rejected",
-                        code="youtube_short_rejected",
-                        data={"current_url": current},
-                    )
-                recovered = True
-                self.navigate(
-                    "https://www.youtube.com/results?search_query=" + quote_plus(search_query)
+        def validate_target(candidate: BrowserTarget) -> None:
+            if self._youtube_target_is_short(candidate):
+                raise BrowserSkillError(
+                    "YouTube Short target rejected immediately before execution",
+                    code="youtube_short_rejected",
+                    data={"target": candidate.ref, "url": self.current_url()},
                 )
-                target = self._wait_for_first_video_result(
-                    query, timeout_s=max(0.5, deadline - time.monotonic())
+            duration = self._youtube_target_duration(candidate, self._last_observation)
+            if duration is not None and duration <= 90.0:
+                raise BrowserSkillError(
+                    "YouTube target has verified duration at or below 90 seconds",
+                    code="youtube_short_rejected",
+                    data={"target": candidate.ref, "duration": duration},
                 )
-                if self._youtube_target_is_short(target):
-                    raise BrowserSkillError(
-                        "Recovered YouTube target is still a Short",
-                        code="youtube_short_rejected",
-                        data={"target": target.ref},
-                    )
-                click_result = self.click(target)
-                continue
-            if "youtube.com/watch" in current:
+
+        validate_target(target)
+        initial_ref = target.ref
+        last_url = self.current_url()
+        click_result: BrowserSkillResult | None = None
+
+        # This is deliberately local to the YouTube navigation transition.  It
+        # is not an increase to DEIMOS's global recovery/retry budget.
+        max_click_attempts = 2
+        for click_attempt in range(max_click_attempts):
+            if time.monotonic() >= deadline:
                 break
-            self.wait_ms(200)
+
+            try:
+                click_result = self.click(target)
+            except BrowserSkillError as exc:
+                if exc.code in {
+                    "browser_session_expired",
+                    "browser_session_unhealthy",
+                    "session_not_found",
+                    "session_expired",
+                    "browser_connection_failed",
+                    "browser_connection_closed",
+                }:
+                    raise BrowserSkillError(
+                        f"BrowserSkill session became unavailable during YouTube click: {exc}",
+                        code="browser_session_dead",
+                        data={"cause": exc.code},
+                    ) from exc
+                if exc.code in {
+                    "browser_target_stale",
+                    "stale_target",
+                    "stale_element",
+                    "stale_observation",
+                } and click_attempt + 1 < max_click_attempts:
+                    self.observe()
+                    target = self._wait_for_first_video_result(
+                        query,
+                        timeout_s=max(0.5, deadline - time.monotonic()),
+                        excluded_names=rejected_result_names,
+                        excluded_refs=rejected_result_refs,
+                    )
+                    validate_target(target)
+                    continue
+                raise
+
+            if not click_result.ok:
+                raise BrowserSkillError(
+                    "YouTube video click was rejected",
+                    code="media_click_failed",
+                    data=click_result,
+                )
+
+            # BrowserSkill's explicit navigation waiter is the first bounded
+            # confirmation. Some YouTube transitions are asynchronous and the
+            # URL can remain on the results page immediately after click.
+            remaining = max(0.1, deadline - time.monotonic())
+            try:
+                self.wait_for_navigation(
+                    timeout_ms=max(1, int(min(2.5, remaining) * 1000))
+                )
+            except BrowserSkillError as exc:
+                if exc.code in {
+                    "browser_session_expired",
+                    "browser_session_unhealthy",
+                    "session_not_found",
+                    "session_expired",
+                    "browser_connection_failed",
+                    "browser_connection_closed",
+                }:
+                    raise BrowserSkillError(
+                        f"BrowserSkill session became unavailable while waiting for YouTube navigation: {exc}",
+                        code="browser_session_dead",
+                        data={"cause": exc.code},
+                    ) from exc
+                # A navigation timeout is not itself a dead session. Continue
+                # with a fresh state read so a delayed/SPA transition can still
+                # be recognized.
+
+            # Check every existing agent tab before deciding the click failed.
+            # A result may legitimately have opened an existing/new tab while
+            # leaving the original search tab unchanged.
+            try:
+                tabs = self.list_tabs("agent")
+            except BrowserSkillError as exc:
+                if exc.code in {
+                    "browser_session_expired",
+                    "browser_session_unhealthy",
+                    "session_not_found",
+                    "session_expired",
+                    "browser_connection_failed",
+                    "browser_connection_closed",
+                }:
+                    raise BrowserSkillError(
+                        f"BrowserSkill session became unavailable while checking YouTube tabs: {exc}",
+                        code="browser_session_dead",
+                        data={"cause": exc.code},
+                    ) from exc
+                tabs = []
+
+            watch_tab = next(
+                (
+                    tab for tab in tabs
+                    if isinstance(tab, dict)
+                    and "youtube.com/watch" in str(tab.get("url") or "").casefold()
+                ),
+                None,
+            )
+            if watch_tab is not None:
+                tab_id = watch_tab.get("tab_id", watch_tab.get("id"))
+                if tab_id is not None:
+                    self.select_tab(int(tab_id))
+
+            # This is the authoritative fresh state check for navigation. It
+            # also refreshes the observation-scoped semantic refs.
+            try:
+                self.observe()
+            except BrowserSkillError as exc:
+                if exc.code in {
+                    "browser_session_expired",
+                    "browser_session_unhealthy",
+                    "session_not_found",
+                    "session_expired",
+                    "browser_connection_failed",
+                    "browser_connection_closed",
+                }:
+                    raise BrowserSkillError(
+                        f"BrowserSkill session became unavailable during YouTube observation: {exc}",
+                        code="browser_session_dead",
+                        data={"cause": exc.code},
+                    ) from exc
+                raise
+
+            current = self.current_url()
+            current_folded = current.casefold()
+            if "youtube.com/watch" in current_folded:
+                break
+
+            # A normal song request must never accept a Shorts destination.
+            # YouTube can expose a semantically ordinary-looking result whose
+            # actual click target redirects to /shorts/. That information is
+            # only knowable after the click, so reject the destination, return
+            # to the search state, and re-resolve a different semantic result.
+            # Never replay the result that just produced the Shorts URL.
+            if "/shorts/" in current_folded or "youtube.com/shorts" in current_folded:
+                rejected_result_refs.add(target.ref)
+                normalized_name = self._normalize_text(target.name)
+                if normalized_name:
+                    rejected_result_names.add(normalized_name)
+                self._debug_note(
+                    f"YOUTUBE_NAVIGATION: rejected Shorts destination url={current!r}; "
+                    f"ref={target.ref!r}; name={target.name!r}; re_resolve=true"
+                )
+                if click_attempt + 1 >= max_click_attempts:
+                    raise BrowserSkillError(
+                        "YouTube result click reached a Shorts page; normal song playback "
+                        "will not accept Shorts and no bounded alternate-result attempt remains",
+                        code="youtube_short_rejected",
+                        data={
+                            "current_url": current,
+                            "selected_ref": target.ref,
+                            "selected_name": target.name,
+                            "navigation_attempts": max_click_attempts,
+                        },
+                    )
+                try:
+                    self.go_back()
+                    self.wait_for_navigation(timeout_ms=1500)
+                except BrowserSkillError as exc:
+                    if exc.code in {
+                        "browser_session_expired", "browser_session_unhealthy",
+                        "session_not_found", "session_expired",
+                        "browser_connection_failed", "browser_connection_closed",
+                    }:
+                        raise BrowserSkillError(
+                            f"BrowserSkill session became unavailable while leaving YouTube Shorts: {exc}",
+                            code="browser_session_dead",
+                            data={"cause": exc.code},
+                        ) from exc
+                self.observe()
+                target = self._wait_for_first_video_result(
+                    query,
+                    timeout_s=max(0.5, deadline - time.monotonic()),
+                    excluded_names=rejected_result_names,
+                    excluded_refs=rejected_result_refs,
+                )
+                validate_target(target)
+                last_url = current
+                continue
+
+            last_url = current
+            if click_attempt + 1 >= max_click_attempts:
+                break
+
+            # The browser is alive and still exposes the search state. Do not
+            # replay the old @eN. Resolve a new semantic target from this fresh
+            # observation and make exactly one bounded second attempt.
+            target = self._wait_for_first_video_result(
+                query,
+                timeout_s=max(0.5, deadline - time.monotonic()),
+                excluded_names=rejected_result_names,
+                excluded_refs=rejected_result_refs,
+            )
+            validate_target(target)
+
         else:
             current = self.current_url()
+
+        current = self.current_url()
+        if "youtube.com/watch" not in current.casefold():
             raise BrowserSkillError(
-                "YouTube result click did not navigate to a watch page; "
-                f"current_url={current!r}; selected_ref={target.ref!r}; "
-                f"selected_name={target.name!r}",
-                code="media_navigation_failed",
+                "YouTube result click executed but expected watch-page state was not reached; "
+                f"current_url={current!r}; initial_ref={initial_ref!r}; "
+                f"last_selected_ref={target.ref!r}; selected_name={target.name!r}",
+                code="expected_state_not_reached",
                 data={
                     "current_url": current,
+                    "initial_ref": initial_ref,
                     "selected_ref": target.ref,
                     "selected_name": target.name,
+                    "last_url": last_url,
+                    "navigation_attempts": max_click_attempts,
                 },
             )
 
-        # Fresh observation before declaring success. This catches semantic Shorts
-        # evidence even when the URL was rewritten or redirected.
+        # Navigation is not verification. Take another fresh observation and
+        # retain the existing independent playback verifier as the authority.
         self.observe()
         fresh = self._last_observation
         if fresh is not None and self._song_result_is_short(
-            BrowserElement("@current", role="link", name=str(self.page_title()), raw={"url": self.current_url(), "title": self.page_title()}),
+            BrowserElement(
+                "@current",
+                role="link",
+                name=str(self.page_title()),
+                raw={"url": self.current_url(), "title": self.page_title()},
+            ),
             observation=fresh,
         ):
             raise BrowserSkillError(
@@ -2883,7 +3283,7 @@ class BrowserSkillAdapter:
         return BrowserSkillResult({
             "ok": True,
             "query": query,
-            "search_query": search_query,
+            "search_query": query,
             "selected_ref": target.ref,
             "selected_name": target.name,
             "playback": playback,
@@ -3138,12 +3538,15 @@ class BrowserSkillAdapter:
             if cls._song_result_is_short(element, observation=observation):
                 continue
 
-            # Music playback has a hard minimum duration. Unknown duration is
-            # also rejected here: without evidence that a result is longer than
-            # 90 seconds, the runtime must not select it and discover too late
-            # that it is effectively a Short/clip.
+            # Reject results only when current semantic observation provides
+            # explicit short-duration evidence. Older/limited observations may
+            # not expose duration metadata; unknown duration remains eligible
+            # so normal BrowserSkill result selection is not made dependent on
+            # an optional accessibility field. Shorts are still hard-rejected
+            # by the semantic URL/title checks above and the final pre-click
+            # guard below.
             duration = cls._song_duration_seconds(element, observation=observation)
-            if duration is None or duration <= 90.0:
+            if duration is not None and duration <= 90.0:
                 continue
 
             is_lyrics = bool(
@@ -3157,6 +3560,16 @@ class BrowserSkillAdapter:
                 r"\b(?:sped\s*up|speed\s*up|speeded\s*up|slowed(?:\s*down)?|slow\s*down|speed\s*down|nightcore)\b",
                 haystack,
                 re.IGNORECASE | re.VERBOSE,
+            ):
+                continue
+            # Titles such as "lyrics for status" and "follow for more
+            # lyrics" are commonly Shorts/short-form uploads even when the
+            # title never contains the literal word "Shorts".  They are not
+            # acceptable lyrics-video targets for normal playback.
+            if re.search(
+                r"\b(?:for\s+status|status\s+video|follow\s+for\s+more|watch\s+more\s+shorts?)\b",
+                haystack,
+                re.IGNORECASE,
             ):
                 continue
 
@@ -3179,12 +3592,18 @@ class BrowserSkillAdapter:
             if q_tokens and q_tokens <= name_tokens:
                 score += 120
 
-            # Lyrics are the primary music preference. Once Shorts and short
-            # clips are excluded, a valid lyrics video must beat every valid
-            # normal video, regardless of the normal title-match score.
-            if re.search(r"\bofficial\s+lyrics?\b|\blyric\s+video\b", haystack, re.IGNORECASE):
-                score += 100000
-            elif re.search(r"\blyrics?\b", haystack, re.IGNORECASE):
+            # A default song request is specifically looking for a lyrics
+            # video.  Do not fall back to an ordinary music video: doing so can
+            # make YouTube's Shorts-heavy result set win by title similarity.
+            # Explicit variants (remix, cover, live, etc.) retain the existing
+            # variant-selection behavior.
+            lyrics_requested = not cls._song_request_explicitly_selects_variant(query)
+            is_lyrics = bool(
+                re.search(r"\b(?:lyrics?|lyric\s+video)\b", haystack, re.IGNORECASE)
+            )
+            if lyrics_requested and not is_lyrics:
+                continue
+            if is_lyrics:
                 score += 100000
 
             # Keep normal videos eligible, but demote obvious alternate
@@ -3263,6 +3682,8 @@ class BrowserSkillAdapter:
         query: str,
         *,
         timeout_s: float,
+        excluded_names: set[str] | None = None,
+        excluded_refs: set[str] | None = None,
     ) -> BrowserTarget:
         """Wait for fresh semantic song candidates and choose the best one."""
         import time
@@ -3296,6 +3717,14 @@ class BrowserSkillAdapter:
                 continue
 
             ranked = self._rank_song_candidates(query, elements, observation=observation)
+            if excluded_names or excluded_refs:
+                excluded_name_set = excluded_names or set()
+                excluded_ref_set = excluded_refs or set()
+                ranked = [
+                    item for item in ranked
+                    if item[1].ref not in excluded_ref_set
+                    and self._normalize_text(item[1].name) not in excluded_name_set
+                ]
             if ranked:
                 _, best = ranked[0]
                 if self.debug:

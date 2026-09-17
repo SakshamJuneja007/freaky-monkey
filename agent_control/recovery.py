@@ -90,6 +90,10 @@ def classify_failure_name(value: object | None) -> FailureClass | None:
         "verification_unknown": FailureClass.VERIFICATION_UNKNOWN,
         "policy_denied": FailureClass.POLICY_DENIED,
         "approval_required": FailureClass.APPROVAL_REQUIRED,
+        "media_navigation_failed": FailureClass.EXPECTED_STATE_NOT_REACHED,
+        "expected_state_not_reached": FailureClass.EXPECTED_STATE_NOT_REACHED,
+        "navigation_timeout": FailureClass.NAVIGATION_TIMEOUT,
+        "browser_session_dead": FailureClass.BROWSER_CONNECTION_FAILED,
     }
     return aliases.get(text.lower())
 
@@ -179,6 +183,11 @@ _STRATEGY: dict[FailureClass, RecoveryDecision] = {
     # No alternate-action registry exists in V1, so ACTION_FAILED retries once
     # rather than pretending to know a second route (plan S23).
     FailureClass.ACTION_FAILED: RecoveryDecision.RETRY,
+    # BrowserSkill performs a bounded, observation-scoped navigation recovery
+    # before returning this class. Do not spend the generic retry budget again
+    # on the same unresolved destination-state failure.
+    FailureClass.EXPECTED_STATE_NOT_REACHED: RecoveryDecision.REOBSERVE_THEN_RETRY,
+    FailureClass.NAVIGATION_TIMEOUT: RecoveryDecision.ABORT,
     FailureClass.VERIFICATION_FAILED: RecoveryDecision.REOBSERVE_THEN_RETRY,
     FailureClass.PERMISSION_DENIED: RecoveryDecision.ASK_USER,
     FailureClass.ENVIRONMENT: RecoveryDecision.ABORT,

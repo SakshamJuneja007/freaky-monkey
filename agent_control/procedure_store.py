@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_STORE = ROOT / ".agent_memory" / "procedures.sqlite3"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class ProcedureStatus(str, Enum):
@@ -28,6 +28,38 @@ class ProcedureStatus(str, Enum):
     DEGRADED = "DEGRADED"
     INVALIDATED = "INVALIDATED"
     RETIRED = "RETIRED"
+
+
+class ProcedureValidationEventType(str, Enum):
+    VALIDATION_STARTED = "VALIDATION_STARTED"
+    VALIDATION_PASSED = "VALIDATION_PASSED"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    PROMOTION_GRANTED = "PROMOTION_GRANTED"
+    PROMOTION_REJECTED = "PROMOTION_REJECTED"
+    DEGRADATION_DETECTED = "DEGRADATION_DETECTED"
+    INVALIDATION_DETECTED = "INVALIDATION_DETECTED"
+    REVALIDATION_PASSED = "REVALIDATION_PASSED"
+    REVALIDATION_FAILED = "REVALIDATION_FAILED"
+
+
+@dataclass(frozen=True)
+class ProcedureValidationEvent:
+    event_id: str
+    procedure_id: str
+    event_type: ProcedureValidationEventType
+    result: str
+    reason: str
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    source_task_id: str | None = None
+    source_session_id: str | None = None
+    evidence: dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        _validate_text(self.event_id, "event_id", max_len=128)
+        _validate_text(self.procedure_id, "procedure_id", max_len=128)
+        _validate_text(self.result, "result", max_len=64)
+        _validate_text(self.reason, "reason", required=False, max_len=2000)
+        _clean_metadata(self.evidence, "validation evidence")
 
 
 class ProcedureSourceType(str, Enum):
@@ -287,6 +319,13 @@ class ProcedureStore:
             )""")
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_proc_name ON procedures(name)")
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_proc_status ON procedures(status)")
+            self._conn.execute("""CREATE TABLE IF NOT EXISTS procedure_validation_events (
+                event_id TEXT PRIMARY KEY, procedure_id TEXT NOT NULL REFERENCES procedures(procedure_id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL, result TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL,
+                source_task_id TEXT, source_session_id TEXT, evidence_json TEXT NOT NULL
+            )""")
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_proc_validation_events_proc ON procedure_validation_events(procedure_id, created_at)")
+            self._conn.execute("INSERT OR REPLACE INTO schema_meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),))
             self._conn.execute("""CREATE TABLE IF NOT EXISTS procedure_parameters (
                 procedure_id TEXT NOT NULL REFERENCES procedures(procedure_id) ON DELETE CASCADE,
                 name TEXT NOT NULL, description TEXT NOT NULL, type TEXT NOT NULL, required INTEGER NOT NULL,
@@ -427,6 +466,54 @@ class ProcedureStore:
     def record_failure(self, procedure_id: str) -> LearnedProcedure: return self._record(procedure_id,"failure_count")
     def record_unknown(self, procedure_id: str) -> LearnedProcedure: return self._record(procedure_id,"unknown_count")
 
+    def record_validation_event(
+        self,
+        procedure_id: str,
+        event_type: ProcedureValidationEventType,
+        *,
+        result: str,
+        reason: str = "",
+        source_task_id: str | None = None,
+        source_session_id: str | None = None,
+        evidence: dict[str, Any] | None = None,
+        event_id: str | None = None,
+    ) -> ProcedureValidationEvent:
+        if self.get_procedure(procedure_id) is None:
+            raise KeyError(procedure_id)
+        event = ProcedureValidationEvent(
+            event_id=event_id or f"pe-{os.urandom(10).hex()}",
+            procedure_id=procedure_id,
+            event_type=event_type,
+            result=result,
+            reason=reason,
+            source_task_id=source_task_id,
+            source_session_id=source_session_id,
+            evidence=dict(evidence or {}),
+        )
+        event.validate()
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO procedure_validation_events VALUES (?,?,?,?,?,?,?,?,?)",
+                (event.event_id, event.procedure_id, event.event_type.value, event.result, event.reason,
+                 event.created_at, event.source_task_id, event.source_session_id, _json(event.evidence)),
+            )
+        return event
+
+    def list_validation_events(self, procedure_id: str, *, limit: int = 100) -> list[ProcedureValidationEvent]:
+        if self.get_procedure(procedure_id) is None:
+            raise KeyError(procedure_id)
+        rows = self._conn.execute(
+            "SELECT * FROM procedure_validation_events WHERE procedure_id=? ORDER BY created_at DESC LIMIT ?",
+            (procedure_id, max(1, min(int(limit), 500))),
+        ).fetchall()
+        return [ProcedureValidationEvent(
+            event_id=r["event_id"], procedure_id=r["procedure_id"],
+            event_type=ProcedureValidationEventType(r["event_type"]), result=r["result"],
+            reason=r["reason"], created_at=r["created_at"],
+            source_task_id=r["source_task_id"], source_session_id=r["source_session_id"],
+            evidence=json.loads(r["evidence_json"]),
+        ) for r in rows]
+
     def create_new_version(self, procedure: LearnedProcedure, *, version: int) -> LearnedProcedure:
         procedure.validate()
         if version <= 1: raise ValueError("new version must be greater than 1")
@@ -461,4 +548,4 @@ class ProcedureStore:
         return p
 
 
-__all__ = ["ProcedureStatus", "ProcedureSourceType", "ProcedureParameter", "ProcedureStep", "ProcedureCondition", "ProcedureProvenance", "LearnedProcedure", "ProcedureStore", "DEFAULT_STORE"]
+__all__ = ["ProcedureStatus", "ProcedureValidationEventType", "ProcedureValidationEvent", "ProcedureSourceType", "ProcedureParameter", "ProcedureStep", "ProcedureCondition", "ProcedureProvenance", "LearnedProcedure", "ProcedureStore", "DEFAULT_STORE"]

@@ -33,6 +33,10 @@ class FailureClass(str, Enum):
     STALE_STATE = "STALE_STATE"
     PRECONDITION_FAILED = "PRECONDITION_FAILED"
     ACTION_FAILED = "ACTION_FAILED"
+    #: A consequential browser action executed, but its expected destination state was not reached.
+    #: This is distinct from stale observation and from a dead browser session.
+    EXPECTED_STATE_NOT_REACHED = "expected_state_not_reached"
+    NAVIGATION_TIMEOUT = "navigation_timeout"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
     PERMISSION_DENIED = "PERMISSION_DENIED"
     ENVIRONMENT = "ENVIRONMENT"

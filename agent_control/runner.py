@@ -787,6 +787,10 @@ def _execute_skill_action(
                     "browser_observation_failed": FailureClass.BROWSER_CONNECTION_FAILED,
                     "browser_target_not_found": FailureClass.TARGET_NOT_FOUND,
                     "browser_action_failed": FailureClass.ACTION_FAILED,
+                    "media_navigation_failed": FailureClass.EXPECTED_STATE_NOT_REACHED,
+                    "expected_state_not_reached": FailureClass.EXPECTED_STATE_NOT_REACHED,
+                    "navigation_timeout": FailureClass.NAVIGATION_TIMEOUT,
+                    "browser_session_dead": FailureClass.BROWSER_CONNECTION_FAILED,
                 }
                 classified = code_map.get(str(failure_code or ""))
             detail["skill_failure_code"] = str(failure_code) if failure_code else None

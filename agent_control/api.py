@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .policy import Policy
 from .memory import DEFAULT_STORE, FileMemory
@@ -1934,6 +1934,180 @@ def _decisions(answers: Sequence[str], approved_action: dict[str, Any] | None = 
     return result
 
 
+
+def _try_execute_procedure(
+    request: str,
+    task: Any,
+    params: Mapping[str, Any],
+    policy: Policy,
+    browser_backend: Any | None,
+    trace: Trace,
+    procedure_store: Any | None,
+    skills: Any,
+) -> AgentResult | None:
+    """Try one explicitly executable learned procedure before normal planning.
+
+    This is deliberately a narrow fast lane. Candidate procedures are never
+    executable, compound requests are left to the workflow/decomposition path,
+    and an execution attempt that actually starts is terminal for this request
+    so generic planning cannot accidentally replay a consequential side effect.
+    """
+    text = str(request or "").strip()
+    lowered = f" {text.casefold()} "
+    if not text or any(token in lowered for token in (" and ", " then ", " after ", " before ")):
+        return None
+
+    from .procedure_retrieval import find_executable_procedures
+    from .procedure_store import ProcedureStore
+    from .procedure_execution import ProcedureExecutionStatus, execute_procedure
+
+    owned_store = False
+    store = procedure_store
+    try:
+        if store is None:
+            store = ProcedureStore()
+            owned_store = True
+
+        context: dict[str, Any] = {
+            "text": text,
+            "goal": str(getattr(task, "goal", "") or text),
+            "parameters": dict(params),
+        }
+        action = getattr(task, "action", None)
+        if action is not None:
+            context["action_kind"] = getattr(action, "kind", None)
+            context["parameters"].update(getattr(action, "params", {}) or {})
+
+        # A browser procedure needs one fresh semantic observation before state
+        # validation. BrowserSkill remains the sole owner of observation state.
+        current_state: Any = {"capabilities": set(getattr(skills, "capabilities", lambda: ())())}
+        if browser_backend is not None:
+            # Session supplies a task-owned BrowserSkill backend for browser
+            # work. Observe it once here so P3.2-C validates against fresh state;
+            # the procedure itself is then identified from that single
+            # retrieval/match operation below. Non-browser API callers do not
+            # need to construct or touch a browser session.
+            ensure_ready = getattr(browser_backend, "ensure_ready", None)
+            if callable(ensure_ready):
+                ensure_ready()
+            observe = getattr(browser_backend, "observe", None)
+            if not callable(observe):
+                return None
+            observe()
+            snapshot = getattr(browser_backend, "_last_observation", None)
+            if snapshot is None:
+                return None
+            current_state = {
+                "observations": [snapshot],
+                "capabilities": {"browser"},
+            }
+
+        # P3.2-C owns retrieval, parameter binding, and current-state validation.
+        # Consume its ProcedureMatch directly; do not duplicate those decisions
+        # in the execution lane. The retrieval helper only returns ACTIVE
+        # procedures, and ambiguity is fail-closed here.
+        trace.emit("procedure_retrieval_start")
+        matches = find_executable_procedures(
+            context, store, current_state, limit=8, max_age_s=1.0
+        )
+        if not matches:
+            trace.emit(
+                "procedure_retrieval_result",
+                result="NO_MATCH",
+                reason="no_executable_ACTIVE_semantic_match",
+            )
+            return None
+        if len(matches) != 1:
+            trace.emit(
+                "procedure_retrieval_result",
+                result="AMBIGUOUS",
+                match_count=len(matches),
+            )
+            return None
+
+        match = matches[0]
+        trace.emit(
+            "procedure_retrieval_result",
+            result="MATCH",
+            procedure_name=match.procedure.name,
+            procedure_status=match.procedure.status.value,
+            binding_status=match.binding.status.value,
+            validation_status=match.validation.status.value,
+            execution_allowed=match.execution_allowed,
+        )
+
+        # These are gates already computed by P3.2-C.  The API only consumes the
+        # returned result; it does not re-bind or re-validate the procedure.
+        if not match.execution_allowed:
+            return None
+        if match.binding.status.value != "BOUND":
+            return None
+        if match.validation.status.value != "APPLICABLE":
+            return None
+
+        trace.emit(
+            "procedure_execution_selected",
+            procedure_id=match.procedure.procedure_id,
+            procedure_name=match.procedure.name,
+            version=match.procedure.version,
+            binding_status=match.binding.status.value,
+            validation_status=match.validation.status.value,
+            execution_allowed=match.execution_allowed,
+        )
+        result = execute_procedure(
+            match,
+            policy=policy,
+            skills=skills,
+            trace=trace,
+            max_steps=8,
+        )
+        if result.execution_status is ProcedureExecutionStatus.NOT_EXECUTED:
+            return None
+
+        if result.verified_success:
+            status = TaskStatus.SUCCESS
+            detail = f"procedure {match.procedure.name} completed and was independently verified"
+            completed = [match.procedure.name]
+        elif result.verification_status is Verdict.FAIL:
+            status = TaskStatus.FAILED
+            detail = result.failure_reason or f"procedure {match.procedure.name} failed independent verification"
+            completed = []
+        else:
+            status = TaskStatus.UNKNOWN
+            detail = result.failure_reason or f"procedure {match.procedure.name} could not be independently verified"
+            completed = []
+
+        checks: list[dict[str, Any]] = []
+        if result.verification_evidence is not None:
+            checks = [check.to_json() for check in result.verification_evidence.checks]
+        return AgentResult(
+            request=request,
+            task_id=str(getattr(task, "task_id", "")),
+            status=status,
+            completed=completed,
+            checks=checks,
+            false_success=False,
+            reported_success=result.execution_status is ProcedureExecutionStatus.EXECUTED,
+            verified=result.verification_status.value,
+            steps_used=len(result.action_results),
+            detail=detail,
+            workspace=str(policy.workspace),
+            target=str(getattr(task, "target", "") or ""),
+            app=str(getattr(task, "app", "") or ""),
+        )
+    except Exception as exc:
+        # Procedure lookup is optional infrastructure. A lookup/validation
+        # defect must not make ordinary planning unavailable.
+        trace.emit("procedure_execution_skipped", reason=f"{type(exc).__name__}")
+        return None
+    finally:
+        if owned_store and store is not None:
+            try:
+                store.close()
+            except Exception:
+                pass
+
+
 def run_agent_task(
     request: str,
     *,
@@ -1961,6 +2135,7 @@ def run_agent_task(
     fast_route: Any | None = None,
     fast_latency_seconds: float = 0.0,
     runtime_manager: Any | None = None,
+    procedure_store: Any | None = None,
 ) -> AgentResult:
     """Run a task through the single execution pipeline.
 
@@ -1984,6 +2159,10 @@ def run_agent_task(
     exact path it always has. ``readable_roots`` is meaningful only alongside
     ``task_obj``: it is what the constructed ``Policy`` grants, in place of
     ``readable_roots_for_task``, which only knows about registered task ids.
+
+    ``procedure_store`` optionally supplies the session-owned ProcedureStore. When
+    omitted, the normal durable learned-procedure store is opened for this run;
+    procedure execution still requires an ACTIVE, bound, applicable match.
 
     ``interactive`` says whether someone is present to answer a question. False --
     the default, and every benchmark trial -- means a run that finds an ambiguity
@@ -2160,6 +2339,34 @@ def run_agent_task(
             workspace=str(root) if root is not None else "",
         )
 
+    # Build the shared trace/skill registry before planner construction so an
+    # executable learned procedure can take the fast path without requiring an
+    # LLM client or paying planner setup cost.
+    own_trace = trace is None
+    active = trace or Trace(
+        task_id=task_id,
+        condition=condition,
+        trial=trial,
+        on_event=on_event,
+    )
+    from .skills.builtin import build_builtin_registry
+    skills = build_builtin_registry(policy, browser_backend=browser_backend)
+    owns_browser_backend = browser_backend is None
+
+    procedure_result = _try_execute_procedure(
+        request, task, params, policy, browser_backend, active, procedure_store, skills
+    )
+    if procedure_result is not None:
+        if own_trace:
+            active.close()
+        if owns_browser_backend:
+            try:
+                from .skills.builtin import close_builtin_browser_session
+                close_builtin_browser_session()
+            except Exception:
+                pass
+        return procedure_result
+
     try:
         # A resumed WorkflowStepTask already owns the exact structured action.
         # Do not re-plan from the user's parameter answer; replay the same step
@@ -2201,25 +2408,7 @@ def run_agent_task(
         runtime_task_id=task_id,
     )
 
-    own_trace = trace is None
-
-    active = trace or Trace(
-        task_id=task_id,
-        condition=condition,
-        trial=trial,
-        on_event=on_event,
-    )
-
     outcome: RunOutcome | None = None
-
-    # Conversational Session instances own a long-lived browser backend.
-    # Direct API callers omit it and receive a temporary legacy backend that
-    # this function owns and cleans up.
-    skills = build_builtin_registry(
-        policy,
-        browser_backend=browser_backend,
-    )
-    owns_browser_backend = browser_backend is None
 
     try:
         direct_action_factory = None

@@ -29,6 +29,8 @@ from __future__ import annotations
 from .conversation import ConversationEngine, ConversationTransportError
 from .conversation_memory import ConversationMemory
 from .persistent_memory import MemoryExtractor, PersistentMemory
+from .procedure_extractor import extract_procedure_candidate, is_learning_eligible, store_procedure_candidate
+from .procedure_store import ProcedureStore
 from .planner.openai_compat import LLMUnavailable
 
 import re
@@ -50,6 +52,7 @@ from .types import Action, Clarification, Verdict
 from .fast_interaction import classify_fast, FastInteractionTask, FastMessagingTask
 from .task import Task
 from .workflow import Workflow, WorkflowStepTask
+from .workflow.models import StepStatus, WorkflowStatus
 from .workflow.graph import WorkflowOrchestrator
 from .workflow.session_adapter import SessionWorkflowRuntime
 from .skills.browser import BrowserSkillAdapter
@@ -130,6 +133,15 @@ DEBUG_STATUS_EVENTS = (
     "recovery_resolved",
     "failure",
     "injection",
+    "procedure_retrieval_start",
+    "procedure_retrieval_result",
+    "procedure_execution_selected",
+    "procedure_policy",
+    "procedure_execution_action",
+    "procedure_fresh_observation_start",
+    "procedure_execution_observation",
+    "procedure_execution_verification",
+    "procedure_execution_skipped",
 )
 
 
@@ -749,6 +761,45 @@ def _debug_status_line(event: dict[str, Any]) -> str:
     if kind == "injection":
         return f"  external state change: {event.get('kind', '?')}"
 
+    if kind == "procedure_retrieval_start":
+        return "  [procedure] retrieval: START"
+
+    if kind == "procedure_retrieval_result":
+        result = event.get("result", "UNKNOWN")
+        if result == "MATCH":
+            return (f"  [procedure] retrieval: MATCH | name: {event.get('procedure_name', '?')} "
+                    f"| lifecycle: {event.get('procedure_status', '?')} "
+                    f"| binding: {event.get('binding_status', '?')} "
+                    f"| validation: {event.get('validation_status', '?')} "
+                    f"| execution_allowed: {event.get('execution_allowed', False)}")
+        if result == "AMBIGUOUS":
+            return f"  [procedure] retrieval: AMBIGUOUS | matches: {event.get('match_count', '?')}"
+        return f"  [procedure] retrieval: {result} | reason: {event.get('reason', '')}"
+
+    if kind == "procedure_policy":
+        return f"  [procedure] policy: {event.get('decision', 'UNKNOWN')}"
+
+    if kind == "procedure_execution_action":
+        return f"  [procedure] execution: {event.get('result', 'UNKNOWN')}"
+
+    if kind == "procedure_fresh_observation_start":
+        return "  [procedure] fresh observation: START"
+
+    if kind == "procedure_execution_selected":
+        return (f"  [procedure] retrieval: MATCH | name: {event.get('procedure_name', '?')} "
+                f"| lifecycle: ACTIVE | binding: {event.get('binding_status', 'UNKNOWN')} "
+                f"| validation: {event.get('validation_status', 'UNKNOWN')} "
+                f"| execution: START")
+
+    if kind == "procedure_execution_observation":
+        return f"  [procedure] observation: {event.get('freshness', 'UNKNOWN')}"
+
+    if kind == "procedure_execution_verification":
+        return f"  [procedure] verification: {event.get('verification', 'UNKNOWN')}"
+
+    if kind == "procedure_execution_skipped":
+        return "  [procedure] execution: NOT_EXECUTED | fallback: NORMAL_PLANNING"
+
     return ""
 
 
@@ -947,6 +998,12 @@ class Session:
     _persistent_memory_store: PersistentMemory | None = field(
         default=None, repr=False, compare=False,
     )
+    #: P3.2-B procedure storage is lazy and only opened at a terminal workflow
+    #: boundary that is eligible for deterministic learning. It is deliberately
+    #: separate from factual/episodic P3.1 memory.
+    _procedure_store: ProcedureStore | None = field(
+        default=None, repr=False, compare=False,
+    )
     _conversation: ConversationEngine | None = field(
         default=None, repr=False, compare=False,
     )
@@ -1115,11 +1172,16 @@ class Session:
         The legacy ``_browser_backend`` remains accepted for tests/embedding,
         but production task execution never shares it directly.
         """
-        key = str(resource_key or task_id or "")
+        # Resource classes describe capability/dependency semantics, but they
+        # must never become the identity of a live browser resource.  Each
+        # executable task owns one BrowserSkill session; otherwise concurrent
+        # tasks such as YouTube and WhatsApp can navigate the same active tab
+        # between another task's observe/act/verify boundaries.  Reusing the
+        # task id also preserves the same browser session when one task is
+        # resumed (for example after approval/recovery).
+        key = str(task_id or "")
         if not key:
             raise ValueError("browser task id is required")
-        if key in {"browser", "youtube", "whatsapp", "gmail"}:
-            key = "browser"
         existing = self._browser_tasks.get(key)
         if existing is not None:
             return existing
@@ -1189,6 +1251,12 @@ class Session:
                 if self._persistent_memory_store is not None:
                     self._persistent_memory_store.close()
                     self._persistent_memory_store = None
+            except Exception:
+                pass
+            try:
+                if self._procedure_store is not None:
+                    self._procedure_store.close()
+                    self._procedure_store = None
             except Exception:
                 pass
 
@@ -1474,6 +1542,90 @@ class Session:
     def _workflow_id_from_goal(prefix: str = "fast") -> str:
         return f"{prefix}-{uuid.uuid4().hex[:4]}"
 
+    def _learn_verified_workflow(self, workflow: Workflow) -> None:
+        """Persist a verified workflow as a P3.2-B candidate, never as execution logic."""
+        if self.debug:
+            self.narrator.note(f"[procedure-debug] learning hook entered workflow={workflow.workflow_id}")
+        eligibility = is_learning_eligible(workflow)
+        if self.debug:
+            self.narrator.note(
+                f"[procedure-debug] eligibility={eligibility.eligible} reason={eligibility.reason}"
+            )
+        if not eligibility.eligible:
+            self._runtime_event(workflow.workflow_id, "procedure_learning_skipped", {"reason": eligibility.reason})
+            if self.debug:
+                self.narrator.note(f"[procedure] learning skipped: {eligibility.reason}")
+            return
+        try:
+            candidate = extract_procedure_candidate(workflow, {"session_id": self._session_owner_id})
+            if self.debug:
+                self.narrator.note(
+                    f"[procedure-debug] extraction={'candidate' if candidate is not None else 'none'}"
+                )
+            if candidate is None:
+                self._runtime_event(workflow.workflow_id, "procedure_learning_skipped", {"reason": "extraction_failed"})
+                return
+            if self._procedure_store is None:
+                self._procedure_store = ProcedureStore()
+            if self.debug:
+                self.narrator.note(f"[procedure-debug] store_path={self._procedure_store.path}")
+            stored = store_procedure_candidate(candidate, self._procedure_store)
+            if self.debug:
+                self.narrator.note(
+                    f"[procedure-debug] persistence=committed procedure={stored.procedure_id}"
+                )
+            self._runtime_event(workflow.workflow_id, "procedure_candidate_created", {
+                "procedure_id": stored.procedure_id,
+                "procedure_name": stored.name,
+                "version": stored.version,
+                "source_workflow_id": workflow.workflow_id,
+            })
+            if self.debug:
+                self.narrator.note(f"[procedure] candidate created: {stored.name} v{stored.version} ({stored.procedure_id})")
+        except Exception as exc:
+            # Learning must never turn a completed user task into a failed task.
+            self._runtime_event(workflow.workflow_id, "procedure_learning_skipped", {
+                "reason": "persistence_error", "error": type(exc).__name__,
+            })
+            if self.debug:
+                self.narrator.note(f"[procedure] candidate persistence skipped: {type(exc).__name__}")
+
+    def _learn_verified_fast_interaction(self, prepared: Prepared, result: AgentResult) -> None:
+        """Promote a verified deterministic fast action into a one-step workflow.
+
+        FastInteractionTask intentionally bypasses LangGraph for latency, so it
+        does not produce a Workflow of its own. P3.2-B still requires the same
+        workflow-side completion and independent PASS evidence. Build that
+        semantic one-step projection only after the runner has independently
+        verified the completed action; never learn from execution success alone.
+        """
+        if result.status is not TaskStatus.SUCCESS or str(result.verified).upper() != Verdict.PASS.value:
+            return
+        outcome = result.outcome
+        final = outcome.final if outcome is not None else None
+        task_obj = prepared.task_obj
+        action_factory = getattr(task_obj, "action_template", None)
+        if not callable(action_factory) or final is None:
+            return
+        try:
+            action = action_factory()
+            workflow_id = result.task_id or prepared.task.task_id
+            workflow = Workflow.from_actions(workflow_id, prepared.goal, [action])
+            workflow.status = WorkflowStatus.COMPLETED
+            step = workflow.steps[0]
+            step.status = StepStatus.COMPLETED
+            step.verification = final.to_json()
+            self._learn_verified_workflow(workflow)
+        except Exception as exc:
+            # A learning projection must never change a successfully completed
+            # user task into a failed task. The authoritative workflow gate still
+            # owns whether anything reaches persistence.
+            self._runtime_event(result.task_id or prepared.task.task_id, "procedure_learning_skipped", {
+                "reason": "workflow_projection_error", "error": type(exc).__name__,
+            })
+            if self.debug:
+                self.narrator.note(f"[procedure] fast-interaction learning projection skipped: {type(exc).__name__}")
+
     def _workflow_turn(self, workflow_id: str, goal: str, graph_result: dict[str, Any], *, source: str) -> Turn:
         task = UserTask(raw=goal, text=goal, source=source, task_id=workflow_id, status="accepted")
         interrupts = graph_result.get("__interrupt__") if isinstance(graph_result, dict) else None
@@ -1497,9 +1649,12 @@ class Session:
         workflow = Workflow.from_json(workflow_data) if isinstance(workflow_data, dict) else None
         if workflow is not None and workflow.state == "COMPLETED":
             result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.SUCCESS, verified=Verdict.PASS.value, completed=[s.step_id for s in workflow.steps], detail="workflow completed after independent verification")
+            self._learn_verified_workflow(workflow)
             reply = self._workflow_completion_reply(workflow)
             self._emit_reply(reply, goal=goal, state="COMPLETED")
             return Turn(task=task, reply=reply, result=result)
+        if workflow is not None:
+            self._learn_verified_workflow(workflow)
         detail = workflow.status.value if workflow is not None else "workflow failed"
         result = AgentResult(request=goal, task_id=workflow_id, status=TaskStatus.UNKNOWN, verified=Verdict.UNKNOWN.value, detail=detail)
         reply = "The workflow did not complete."
@@ -1664,7 +1819,13 @@ class Session:
                 return turn
             continue
         workflow.state = "COMPLETED"
+        # This compatibility/background completion path reaches the same
+        # verified terminal boundary as the LangGraph path, but historically
+        # only the latter called the P3.2-B learning hook.  Keep the existing
+        # eligibility gate authoritative: setting COMPLETED here is not enough
+        # to learn unless the workflow still carries independent PASS evidence.
         self._runtime.update_workflow(workflow.workflow_id, workflow.to_json(), event_type="WORKFLOW_COMPLETED")
+        self._learn_verified_workflow(workflow)
         reply = self._workflow_completion_reply(workflow)
         turn = Turn(task=UserTask(raw=workflow.goal, text=workflow.goal, source=source, task_id=workflow.workflow_id, status="accepted"), reply=reply, result=None)
         self._emit_reply(reply, goal=workflow.goal)
@@ -2821,6 +2982,7 @@ class Session:
                 on_event=self._runtime_event_watcher(runtime_task_id, self._watcher(lines)),
                 browser_backend=browser_backend,
                 runtime_manager=self._runtime,
+                procedure_store=self._procedure_store,
             )
 
         except Exception as exc:
@@ -2865,6 +3027,9 @@ class Session:
         else:
             if runtime_state_after_run != "FAILED":
                 self._runtime_transition(runtime_task_id, "FAILED", event_type="TASK_FAILED", failure_state=result.detail, failure_category="EXECUTION", execution_state="FAILED", verification_state=result.verified, verification_summary=result.verified, result_summary=result.detail)
+
+        if prepared.kind == "fast interaction":
+            self._learn_verified_fast_interaction(prepared, result)
 
         if self.debug:
             for line in result.report_lines():
@@ -3602,7 +3767,7 @@ class Session:
     def _action_reply(self, task: UserTask, result: AgentResult) -> str:
         memory = self._conversation_memory()
         memories = memory.search(task.text, limit=8)
-        memories = [record.to_dict() for record in self._persistent_memory_records(task.text, limit=6)] + memories
+        memories = self._persistent_memory_records(task.text, limit=6) + tuple(memories)
         context = dict(self.recent_context.planner_state())
         event = {
             "request": task.text,

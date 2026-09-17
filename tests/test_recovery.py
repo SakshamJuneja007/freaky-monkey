@@ -163,6 +163,19 @@ def test_inconclusive_chooses_reobserve_then_retry() -> None:
     assert reason == "INCONCLUSIVE -> REOBSERVE_THEN_RETRY"
 
 
+def test_expected_state_not_reached_chooses_existing_reobserve_then_retry() -> None:
+    recovery = Recovery(budget=RecoveryBudget(), enabled=True)
+    decision, reason = recovery.decide(FailureClass.EXPECTED_STATE_NOT_REACHED)
+
+    assert decision is RecoveryDecision.REOBSERVE_THEN_RETRY
+    assert reason == "expected_state_not_reached -> REOBSERVE_THEN_RETRY"
+    assert recovery.budget.remaining() == {
+        "retries": 0,
+        "reobserves": 0,
+        "replans": 1,
+    }
+
+
 def test_the_runner_reobserves_and_runs_the_action_again(policy, trace) -> None:
     task = Undecided([Verdict.UNKNOWN, Verdict.PASS])
     loop = loop_for(task, policy, trace)
@@ -195,6 +208,22 @@ def test_an_undecided_checkpoint_without_an_executed_action_is_unknown() -> None
 def test_a_failed_action_is_not_promoted_to_inconclusive() -> None:
     failed = ActionResult(action=ACTION, ok=False, error="no")
     assert classify(failed, undecided()) is FailureClass.ACTION_FAILED
+
+
+def test_expected_state_recovery_preserves_other_strategy_mappings() -> None:
+    stale_decision, _ = Recovery(budget=RecoveryBudget(), enabled=True).decide(
+        FailureClass.STALE_STATE
+    )
+    exception_decision, _ = Recovery(budget=RecoveryBudget(), enabled=True).decide(
+        FailureClass.EXECUTION_EXCEPTION
+    )
+    dead_browser_decision, _ = Recovery(budget=RecoveryBudget(), enabled=True).decide(
+        FailureClass.BROWSER_CONNECTION_FAILED
+    )
+
+    assert stale_decision is RecoveryDecision.REOBSERVE_THEN_RETRY
+    assert exception_decision is RecoveryDecision.RETRY
+    assert dead_browser_decision is RecoveryDecision.REOBSERVE_THEN_RETRY
 
 
 def test_generic_unknown_still_aborts_without_spending_budget() -> None:
