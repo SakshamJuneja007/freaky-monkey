@@ -20,6 +20,12 @@ class RuntimeControlKind(str, Enum):
     RETRY = "RETRY"
     APPROVE = "APPROVE"
     CLEAR_HISTORY = "CLEAR_HISTORY"
+    WHATSAPP_INTELLIGENCE_ENABLE = "WHATSAPP_INTELLIGENCE_ENABLE"
+    WHATSAPP_INTELLIGENCE_DISABLE = "WHATSAPP_INTELLIGENCE_DISABLE"
+    WHATSAPP_HANDOFF = "WHATSAPP_HANDOFF"
+    WHATSAPP_TAKEOVER = "WHATSAPP_TAKEOVER"
+    WHATSAPP_INTELLIGENCE_AUTHORIZE = "WHATSAPP_INTELLIGENCE_AUTHORIZE"
+    WHATSAPP_INTELLIGENCE_REVOKE = "WHATSAPP_INTELLIGENCE_REVOKE"
 
 
 @dataclass(frozen=True)
@@ -54,6 +60,43 @@ def _classify_one(normalized: str, *, task_ref: int | None = None) -> RuntimeCon
     tokens = set(re.findall(r"[a-z0-9_-]+", normalized))
     task_id_match = _TASK_ID_RE.search(normalized)
     task_id = task_id_match.group(0) if task_id_match else None
+
+    # WhatsApp Intelligence is an explicit read-only control-plane operation.
+    if re.search(r"\b(?:enable|turn on|start)\s+(?:whatsapp\s+)?intelligence\b", normalized) or re.search(r"\bstart\s+intelligence\s+(?:on|for)\s+whatsapp\b", normalized):
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_INTELLIGENCE_ENABLE, scope="explicit")
+    if re.search(r"\b(?:disable|turn off|stop)\s+(?:whatsapp\s+)?intelligence\b", normalized) or re.search(r"\bstop\s+intelligence\s+(?:on|for)\s+whatsapp\b", normalized):
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_INTELLIGENCE_DISABLE, scope="explicit")
+
+    authorize = re.search(r"\b(?:allow|authorize|permit|give)\s+(?:whatsapp\s+)?intelligence\s+(?:to\s+)?(?:observe|monitor|read)\s+(?:the\s+)?(.+?)\s*$", normalized)
+    if authorize:
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_INTELLIGENCE_AUTHORIZE, scope=authorize.group(1).strip())
+    revoke = re.search(r"\b(?:stop|revoke|remove|deny)\s+(?:whatsapp\s+)?intelligence\s+(?:from\s+)?(?:observing|monitoring|reading)\s+(?:the\s+)?(.+?)\s*$", normalized)
+    if revoke:
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_INTELLIGENCE_REVOKE, scope=revoke.group(1).strip())
+
+    # WhatsApp ownership is an explicit control-plane intent, not a messaging
+    # action. Keep this semantic and deliberately narrow so ordinary WhatsApp
+    # requests continue through the existing planner/skill path.
+    if re.search(
+        r"\b(?:give|let|allow)\s+(?:me|the user)\s+(?:control|access)\s+(?:of|to)\s+(?:my\s+)?whatsapp\b",
+        normalized,
+    ) or re.search(
+        r"\b(?:give|hand|release)\s+(?:me\s+)?(?:control|control of|access to)\s+(?:whatsapp|whatsapp web)\b",
+        normalized,
+    ):
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_HANDOFF, scope="explicit")
+
+    if re.search(
+        r"\b(?:take|take back|regain|resume)\s+(?:control|control of|access to)\s+(?:whatsapp|whatsapp web)\b",
+        normalized,
+    ) or re.search(
+        r"\b(?:you|deimos)\s+(?:can|may|should|please)\s+take\s+over\s+(?:whatsapp|whatsapp web)\b",
+        normalized,
+    ) or re.search(
+        r"\b(?:take|take back)\s+over\s+(?:whatsapp|whatsapp web)\b",
+        normalized,
+    ):
+        return RuntimeControlCommand(RuntimeControlKind.WHATSAPP_TAKEOVER, scope="explicit")
 
     verbs = [_CONTROL_VERBS[token] for token in tokens if token in _CONTROL_VERBS]
     if re.search(r"\btry\s+(?:task\s+\d+\s+)?(?:it\s+)?again+n*\b", normalized):

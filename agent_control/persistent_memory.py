@@ -296,15 +296,36 @@ class PersistentMemory:
         counts = {str(r["status"]): int(r["n"]) for r in rows}
         return {"store": str(self.path), "schema": SCHEMA_VERSION, "total": sum(counts.values()), "active": counts.get("ACTIVE", 0), "superseded": counts.get("SUPERSEDED", 0), "invalidated": counts.get("INVALIDATED", 0)}
 
+    def purge_expired(self, *, now: float | None = None, limit: int = 256) -> int:
+        """Physically remove semantic records whose explicit TTL has elapsed.
+
+        TTLs are set by the producer of transient semantic knowledge. Active
+        records without an expiry (for example durable project facts) are never
+        removed by this maintenance operation. SQLite triggers keep FTS in sync.
+        """
+        cutoff = float(now if now is not None else time.time())
+        limit = max(1, min(int(limit), 1000))
+        rows = self._conn.execute(
+            "SELECT id FROM memories WHERE status='ACTIVE' AND expires_at IS NOT NULL AND expires_at < ? ORDER BY expires_at ASC LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        ids = [str(row["id"]) for row in rows]
+        if not ids:
+            return 0
+        with self._conn:
+            self._conn.executemany("DELETE FROM memories WHERE id=?", [(mid,) for mid in ids])
+        return len(ids)
+
     def maintain(self) -> int:
         """Bound episode growth while preserving current facts/history."""
+        expired = self.purge_expired()
         rows = self._conn.execute("SELECT id FROM memories WHERE memory_type IN ('TASK_EPISODE','FAILURE_EPISODE') AND status='ACTIVE' ORDER BY updated_at DESC").fetchall()
         if len(rows) <= self.max_episodes:
-            return 0
+            return expired
         ids = [str(row["id"]) for row in rows[self.max_episodes:]]
         with self._conn:
             self._conn.executemany("UPDATE memories SET status='EXPIRED', updated_at=? WHERE id=?", [(time.time(), mid) for mid in ids])
-        return len(ids)
+        return expired + len(ids)
 
 
 class MemoryExtractor:

@@ -2325,36 +2325,104 @@ class BrowserSkillAdapter:
         timeout_s: float = 3.0,
         poll_ms: int = 200,
     ) -> bool:
-        """Poll fresh WhatsApp observations for the requested chat to be open.
+        """Confirm that a WhatsApp Home-row click opened the intended chat.
 
-        WhatsApp Web exposes the active conversation's contact name as a
-        heading/button/link/text element near the top of the chat pane. This
-        uses the same semantic matching pattern as ``verify_whatsapp_message``
-        to confirm the correct chat is open, but is deliberately a polling
-        loop over several fresh observations (rather than a single
-        post-click observation) since WhatsApp can briefly rebuild its
-        semantic tree immediately after the contact-result click.
+        Normal chats expose the contact/group name in the conversation header.
+        WhatsApp self-chat can expose ``You`` as the active header even though
+        the Home row is named with the user's account display name.  In that
+        case, require both the ``You`` header and the original target name to
+        remain visible alongside the message composer.
         """
         import time
 
         wanted = self._whatsapp_normalize(contact)
         deadline = time.monotonic() + max(0.1, float(timeout_s))
-
         while time.monotonic() < deadline:
             obs = self._whatsapp_observation()
             elements = self._whatsapp_semantic_elements(obs)
-
-            if any(
+            names = [self._whatsapp_normalize(e.name) for e in elements if e.name]
+            header_matches = any(
                 e.role.casefold() in {"heading", "button", "link", "text"}
-                and self._whatsapp_normalize(e.name) == wanted
+                and (
+                    self._whatsapp_normalize(e.name) == wanted
+                    or re.fullmatch(
+                        rf"{re.escape(wanted)}\s*\(you\)",
+                        self._whatsapp_normalize(e.name),
+                    ) is not None
+                )
                 for e in elements
-            ):
+            )
+            composer_visible = any(
+                (e.role.casefold() in {"textbox", "combobox", "searchbox"})
+                or "type a message" in name
+                or "message input" in name
+                for e, name in ((e, self._whatsapp_normalize(e.name)) for e in elements)
+            )
+            # Self-chat may label the active header as ``You`` rather than the
+            # account name, or as ``<account> (You)``. The target must still be
+            # present in the same fresh observation and the composer must exist.
+            self_header = any(
+                e.role.casefold() in {"heading", "button", "link", "text"}
+                and self._whatsapp_normalize(e.name) == "you"
+                for e in elements
+            )
+            target_visible = any(
+                wanted and wanted in self._whatsapp_normalize(e.name)
+                for e in elements
+            )
+            if header_matches or (self_header and composer_visible and target_visible):
                 return True
 
             remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
             self.wait_ms(min(max(1, int(poll_ms)), remaining_ms))
 
         return False
+
+    def open_whatsapp_chat_row(
+        self,
+        target: BrowserTarget,
+        *,
+        timeout_s: float = 8.0,
+    ) -> BrowserSkillResult:
+        """Open an already-observed WhatsApp Home chat row.
+
+        This is deliberately separate from ``open_whatsapp_chat`` because the
+        latter is the normal explicit-recipient path and resolves a recipient
+        through WhatsApp search. Intelligence discovery must never use that
+        path: authorization only permits inspection of a target already found
+        on the Home chat list. The supplied ``BrowserTarget`` therefore comes
+        directly from the current Home observation and is consumed by the
+        existing semantic click primitive.
+        """
+        if not isinstance(target, BrowserTarget):
+            raise ValueError("target must be a BrowserTarget from the current observation")
+
+        click_result = self.click(target)
+        if not click_result.ok:
+            raise BrowserSkillError(
+                "WhatsApp Home chat row click was rejected",
+                code="whatsapp_home_row_click_failed",
+                data={"target": target.name, "ref": target.ref},
+            )
+
+        if not self._whatsapp_chat_header_matches(
+            target.name,
+            timeout_s=max(1.0, min(3.0, timeout_s / 2)),
+        ):
+            raise BrowserSkillError(
+                f"WhatsApp did not confirm that the {target.name!r} chat was open after selecting the Home row",
+                code="whatsapp_chat_not_verified",
+                data={"target": target.name, "ref": target.ref},
+            )
+
+        return BrowserSkillResult({
+            "ok": True,
+            "provider": "whatsapp",
+            "contact": target.name,
+            "state": "CHAT_OPEN",
+            "verification": "passed",
+            "telemetry": {"semantic_target_category": "home_chat_row", "ref": target.ref},
+        })
 
     def open_whatsapp_chat(
         self,
@@ -3717,6 +3785,14 @@ class BrowserSkillAdapter:
                             "aria-label", "ariaLabel", "title", "href",
                             "disabled", "checked", "expanded", "selected",
                             "visible", "enabled",
+                            # Message ownership metadata is semantic evidence
+                            # when the observation provider exposes it. Keep it
+                            # on the BrowserElement so downstream consumers do
+                            # not have to guess from UI presentation.
+                            "from_me", "fromMe", "is_from_me", "isFromMe",
+                            "outgoing", "is_outgoing", "isOutgoing", "sent_by_me",
+                            "direction", "message_direction", "message_type",
+                            "status", "sender", "author", "from",
                         )
                         if key in node
                     }

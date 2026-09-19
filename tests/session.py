@@ -66,6 +66,7 @@ from .presentation import (
     recovery_message,
     sanitize_tts_text,
     approval_prompt,
+    whatsapp_intelligence_message,
 )
 from .response import (
     DeimosPresentation,
@@ -1232,27 +1233,13 @@ class Session:
         return backend
 
     def _present_whatsapp_intelligence(self, event: Any) -> None:
-        """Present only derived, high-value WhatsApp intelligence.
-
-        This callback receives structured IntelligenceEvent data; it never
-        needs the underlying WhatsApp message body.
-        """
-        try:
-            event_type = getattr(getattr(event, "type", None), "value", str(getattr(event, "type", "EVENT")))
-            title = str(getattr(event, "title", "") or "").strip()
-            date = getattr(event, "date", None)
-            tm = getattr(event, "time", None)
-            status = str(getattr(event, "status", "") or "").upper()
-            if status in {"CANCELLED", "COMPLETED"}:
-                prefix = "❌" if status == "CANCELLED" else "✅"
-            else:
-                prefix = {"MEETING": "📅", "ASSIGNMENT": "📚", "DEADLINE": "⏰", "ACADEMIC_UPDATE": "🎓", "EXAM": "🎓", "COLLEGE_PLAN": "🏫", "DECISION": "✅", "IDEA": "💡", "ACTION_ITEM": "📌"}.get(event_type, "ℹ️")
-            detail = title or event_type.replace("_", " ").title()
-            if date or tm:
-                detail += " — " + " ".join(str(x) for x in (date, tm) if x)
-            self._emit_reply(f"WHATSAPP_INTELLIGENCE:\n{prefix} {detail}", goal="WhatsApp intelligence", state="meaningful intelligence")
-        except Exception as exc:
-            self.on_debug(f"WHATSAPP_INTELLIGENCE: presentation_failed error={type(exc).__name__}")
+        """Present only committed structured WhatsApp intelligence."""
+        message = whatsapp_intelligence_message(event)
+        self._emit_reply(
+            message,
+            goal="WhatsApp intelligence",
+            state="meaningful intelligence",
+        )
 
     def _whatsapp_intelligence_service(self) -> WhatsAppIntelligence:
         if self._whatsapp_intelligence is None:

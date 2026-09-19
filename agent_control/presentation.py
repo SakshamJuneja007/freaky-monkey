@@ -50,6 +50,42 @@ def user_response(text: str, *, allow_internal: bool = False) -> UserFacingRespo
     return UserFacingResponse(text=str(text), allow_internal=allow_internal)
 
 
+def whatsapp_intelligence_message(event: Any) -> str:
+    """Render committed WhatsApp intelligence without requiring raw messages."""
+    event_type = getattr(getattr(event, "type", None), "value", str(getattr(event, "type", "EVENT")))
+    event_type = str(event_type or "EVENT").upper()
+    title = str(getattr(event, "title", "") or "").strip()
+    date = getattr(event, "date", None)
+    tm = getattr(event, "time", None)
+    deadline = getattr(event, "deadline", None)
+    status = str(getattr(event, "status", "") or "").upper()
+    if status == "CANCELLED":
+        prefix = "❌"
+    elif status == "COMPLETED":
+        prefix = "✅"
+    else:
+        prefix = {
+            "MEETING": "📅",
+            "ASSIGNMENT": "📚",
+            "DEADLINE": "⏰",
+            "ACADEMIC_UPDATE": "🎓",
+            "EXAM": "🎓",
+            "COLLEGE_PLAN": "🏫",
+            "DECISION": "✅",
+            "IDEA": "💡",
+            "ACTION_ITEM": "📌",
+            "EVENT": "📌",
+            "IMPORTANT_CHANGE": "⚠️",
+        }.get(event_type, "ℹ️")
+    detail = title or event_type.replace("_", " ").title()
+    parts = [str(x).strip() for x in (date, tm) if x]
+    if not parts and deadline:
+        parts.append(str(deadline).strip())
+    if parts:
+        detail += " — " + " ".join(parts)
+    return f"WHATSAPP_INTELLIGENCE:\n{prefix} {detail}"
+
+
 def runtime_snapshot_for_user(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Project RuntimeManager truth into semantic, non-identifier data.
 
